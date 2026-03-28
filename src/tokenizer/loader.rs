@@ -1,4 +1,4 @@
-use crate::vocab::{TokenID, Vocab};
+use crate::tokenizer::vocab::{TokenID, Vocab};
 use serde_json::*;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -10,6 +10,8 @@ has one job: read a file from disk and produce a Vocab. It knows about file form
 pub type Result<T> = std::result::Result<T, TokenizerError>;
 
 // this is for not using unwrap() too much so that we handle the errors explicitely
+//
+#[derive(Debug)]
 pub enum TokenizerError {
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -161,7 +163,7 @@ mod tests {
             LoadedTokenizer::HfVocab(vocab, _) => {
                 assert!(vocab.bos_id().is_some());
                 assert!(vocab.eos_id().is_some());
-                // verify the actual known IDs for LLaMA 3
+                // verify the actual known IDs for LLamA 3
                 assert_eq!(vocab.bos_id(), Some(128000));
                 assert_eq!(vocab.eos_id(), Some(128001));
             }

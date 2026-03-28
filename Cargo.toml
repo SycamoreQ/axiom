@@ -1,0 +1,97 @@
+[package]
+name = "axiom"
+version = "0.1.0"
+edition = "2021"
+description = "A high-performance LLM inference server with MoE and FlashAttention support"
+license = "MIT"
+
+# ------------------------------------------------------------------------------
+# Core dependencies
+# ------------------------------------------------------------------------------
+[dependencies]
+
+# Serialization — tokenizer JSON loading
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime — server layer (Phase 9)
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server — OpenAI-compatible API (Phase 9)
+axum = "0.7"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Regex — GPT-2 style pre-tokenization (Phase 1)
+fancy-regex = "0.13"
+
+# Tensor backend — Candle (HuggingFace)
+# CPU-only for now, CUDA feature enabled in the cuda profile below
+candle-core = { version = "0.6", optional = true }
+candle-nn = { version = "0.6", optional = true }
+
+# CUDA low-level kernel management (Phase 3)
+cudarc = { version = "0.12", features = ["cuda-12050"], optional = true }
+
+# Memory-mapped weight files (Phase 8)
+memmap2 = "0.9"
+
+# Numeric utilities
+byteorder = "1"
+half = { version = "2", features = ["num-traits"] }    # f16/bf16 support
+
+# Parallelism
+rayon = "1"
+
+# Random sampling — top-k, top-p (Phase 7)
+rand = "0.8"
+once_cell = "1"
+
+# ------------------------------------------------------------------------------
+# Feature flags
+# ------------------------------------------------------------------------------
+[features]
+default = []
+
+# Enable Candle CPU backend
+candle = ["dep:candle-core", "dep:candle-nn"]
+
+# Enable full CUDA stack — Candle CUDA + cudarc
+cuda = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:cudarc",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+]
+
+# ------------------------------------------------------------------------------
+# Dev dependencies — tests and benchmarks only
+# ------------------------------------------------------------------------------
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ------------------------------------------------------------------------------
+# Build profiles
+# ------------------------------------------------------------------------------
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false
