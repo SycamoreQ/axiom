@@ -25,7 +25,7 @@ pub enum PreToken {
     Special(TokenID), // bypass BPE entirely
 }
 
-fn byte_to_unicode_table() -> [char; 256] {
+pub fn byte_to_unicode_table() -> [char; 256] {
     let mut table = [' '; 256];
 
     let printable: Vec<u8> = (b'!'..=b'~') // 33–126
