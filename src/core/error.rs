@@ -1,6 +1,8 @@
 use candle_core;
 use thiserror::Error;
 
+use crate::core::dtype::DType;
+
 /*
 Errors that might pop up during tensor ops
 */
@@ -24,8 +26,8 @@ pub enum CoreError {
     #[error("dtype mismatch in {op}: lhs {lhs:?} incompatible with rhs {rhs:?}")]
     DTypeMismatch {
         op: &'static str,
-        lhs: String,
-        rhs: String,
+        lhs: DType,
+        rhs: DType,
     }, // String until dtype.rs exists
 
     #[error("device mismatch in {op}: lhs {lhs} incompatible with rhs {rhs}")]
