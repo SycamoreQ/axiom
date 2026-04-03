@@ -1,7 +1,7 @@
 use candle_core;
 use thiserror::Error;
 
-use crate::core::dtype::DType;
+use crate::core::{device::Device, dtype::DType};
 
 /*
 Errors that might pop up during tensor ops
