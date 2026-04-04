@@ -2,6 +2,7 @@ use crate::core::device::Device;
 use crate::core::dtype::DType;
 use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
+use crate::core::tensor::TensorOps;
 use candle_core;
 
 /*
@@ -32,7 +33,7 @@ impl Backend for CudarcBackend {
 }
 
 pub trait Backend: Clone + Send + Sync + 'static {
-    type Tensor: Clone + Send + Sync;
+    type Tensor: TensorOps + Clone + Send + Sync;
     type Device: Into<Device> + Clone + Send + Sync;
     type Error: std::error::Error + Send + Sync + From<CoreError>;
 }

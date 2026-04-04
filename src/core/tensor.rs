@@ -26,6 +26,7 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
 
     // creation
     fn zeros(shape: &Shape, dtype: DType, device: &Device) -> crate::core::error::Result<Self>;
+    fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self>;
     fn ones(shape: &Shape, dtype: DType, device: &Device) -> crate::core::error::Result<Self>;
     fn from_slice<E: Element + candle_core::WithDType>(
         data: &[E],
@@ -66,6 +67,9 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
 
     // model ops — backends can fuse these
     fn rms_norm(&self, weight: &Self, eps: f32) -> crate::core::error::Result<Self>;
+    fn broadcast_add(&self, other: &Self) -> Result<Self>;
+    fn broadcast_matmul(&self, other: &Self) -> Result<Self>;
+    fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self>;
 }
 
 impl TensorOps for CandleTensor {
@@ -120,6 +124,17 @@ impl TensorOps for CandleTensor {
         Ok(CandleTensor {
             shape: shape.clone(),
             dtype: E::dtype(),
+            device: device.clone(),
+            inner,
+        })
+    }
+
+    fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self> {
+        let candle_device = candle_device_from(device)?;
+        let inner = candle_core::Tensor::from_slice(data, shape.dims(), &candle_device)?;
+        Ok(CandleTensor {
+            shape: shape.clone(),
+            dtype: DType::F32, // u32 stored but we mark F32 — fix in Phase 4
             device: device.clone(),
             inner,
         })
@@ -354,6 +369,141 @@ impl TensorOps for CandleTensor {
             dtype: self.dtype,
             device: self.device.clone(),
         })
+    }
+
+    fn broadcast_add(&self, other: &Self) -> Result<Self> {
+        let inner = self.inner.broadcast_add(&other.inner)?;
+        Ok(CandleTensor {
+            inner,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
+        let inner = self.inner.broadcast_matmul(&other.inner)?;
+        let new_shape = Shape::new(&inner.dims());
+        Ok(CandleTensor {
+            inner,
+            shape: new_shape,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
+        let inner = self.inner.index_select(&indexes.inner, dim)?;
+        let new_shape = Shape::new(&inner.dims());
+        Ok(CandleTensor {
+            inner,
+            shape: new_shape,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+}
+
+// todo component as Cudarc tensors yet to implemented in itslf for kernel logic
+// will write after phase 4 or 5
+impl TensorOps for CudarcTensor {
+    fn shape(&self) -> &Shape {
+        &self.shape
+    }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn zeros(_: &Shape, _: DType, _: &Device) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn ones(_: &Shape, _: DType, _: &Device) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn from_slice<E: Element + candle_core::WithDType>(
+        _: &[E],
+        _: &Shape,
+        _: &Device,
+    ) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn from_u32_slice(_: &[u32], _: &Shape, _: &Device) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn to_device(&self, _: &Device) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn to_dtype(&self, _: DType) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn contiguous(&self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn reshape(&self, _: &Shape) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn transpose(&self, _: usize, _: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn squeeze(&self, _: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn unsqueeze(&self, _: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn add(&self, _: &Self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn sub(&self, _: &Self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn mul(&self, _: &Self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn div(&self, _: &Self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn scale(&self, _: f64) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn matmul(&self, _: &Self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn broadcast_add(&self, _: &Self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn sum(&self, _: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn mean(&self, _: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn silu(&self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn gelu(&self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn softmax(&self, _: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn sqrt(&self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn rms_norm(&self, _: &Self, _: f32) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn broadcast_matmul(&self, _: &Self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
+        todo!("phase 4")
     }
 }
 
