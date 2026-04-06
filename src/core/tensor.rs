@@ -70,6 +70,15 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn broadcast_add(&self, other: &Self) -> Result<Self>;
     fn broadcast_matmul(&self, other: &Self) -> Result<Self>;
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self>;
+
+    fn cos(&self) -> Result<Self>;
+    fn sin(&self) -> Result<Self>;
+    fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self>; // candle name
+    fn chunk(&self, chunks: usize, dim: usize) -> Result<Vec<Self>>; // split into N equal parts
+    fn cat(tensors: &[&Self], dim: usize) -> Result<Self>; // concatenate — note: associated fn
+    fn neg(&self) -> Result<Self>; // negate — needed for rotation
+    fn broadcast_mul(&self, other: &Self) -> Result<Self>;
+    fn repeat(&self, shape: &Shape) -> Result<Self>;
 }
 
 impl TensorOps for CandleTensor {
@@ -402,6 +411,98 @@ impl TensorOps for CandleTensor {
             device: self.device.clone(),
         })
     }
+
+    fn cos(&self) -> Result<Self> {
+        let inner = self.inner.cos()?;
+        Ok(CandleTensor {
+            inner,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn sin(&self) -> Result<Self> {
+        let inner = self.inner.sin()?;
+        Ok(CandleTensor {
+            inner,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
+        let inner = self.inner.narrow(dim, start, len)?;
+        let new_shape = Shape::new(&inner.dims());
+        Ok(CandleTensor {
+            inner,
+            shape: new_shape,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn chunk(&self, chunks: usize, dim: usize) -> Result<Vec<Self>> {
+        let chunks_inner = self.inner.chunk(chunks, dim)?;
+        chunks_inner
+            .into_iter()
+            .map(|c| {
+                let shape = Shape::new(&c.dims());
+                Ok(CandleTensor {
+                    shape,
+                    dtype: self.dtype,
+                    device: self.device.clone(),
+                    inner: c,
+                })
+            })
+            .collect()
+    }
+
+    fn cat(tensors: &[&Self], dim: usize) -> Result<Self> {
+        let inners: Vec<&candle_core::Tensor> = tensors.iter().map(|t| &t.inner).collect();
+        let inner = candle_core::Tensor::cat(&inners, dim)?;
+        let shape = Shape::new(&inner.dims());
+        Ok(CandleTensor {
+            inner,
+            shape,
+            dtype: tensors[0].dtype,
+            device: tensors[0].device.clone(),
+        })
+    }
+
+    fn neg(&self) -> Result<Self> {
+        let inner = self.inner.neg()?;
+
+        Ok(CandleTensor {
+            inner,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn broadcast_mul(&self, other: &Self) -> Result<Self> {
+        let inner = self.inner.broadcast_mul(&other.inner)?;
+        let shape = Shape::new(&inner.dims());
+        Ok(CandleTensor {
+            inner,
+            shape,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn repeat(&self, shape: &Shape) -> Result<Self> {
+        let inner = self.inner.repeat(shape.dims())?;
+        let new_shape = Shape::new(&inner.dims());
+        Ok(CandleTensor {
+            inner,
+            shape: new_shape,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
 }
 
 // todo component as Cudarc tensors yet to implemented in itslf for kernel logic
@@ -504,6 +605,37 @@ impl TensorOps for CudarcTensor {
     }
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
         todo!("phase 4")
+    }
+
+    fn cos(&self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn sin(&self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn chunk(&self, _: usize, _: usize) -> Result<Vec<Self>> {
+        todo!("Phase 4")
+    }
+
+    fn cat(_: &[&Self], _: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn neg(&self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn broadcast_mul(&self, _: &Self) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn repeat(&self, _: &Shape) -> Result<Self> {
+        todo!("Phase 4")
     }
 }
 
