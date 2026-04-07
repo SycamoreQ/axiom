@@ -79,6 +79,7 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn neg(&self) -> Result<Self>; // negate — needed for rotation
     fn broadcast_mul(&self, other: &Self) -> Result<Self>;
     fn repeat(&self, shape: &Shape) -> Result<Self>;
+    fn sigmoid(&self, other: &Self) -> Result<Self>;
 }
 
 impl TensorOps for CandleTensor {
@@ -503,6 +504,16 @@ impl TensorOps for CandleTensor {
             device: self.device.clone(),
         })
     }
+
+    fn sigmoid(&self, other: &Self) -> Result<Self> {
+        let value = candle_nn::ops::sigmoid(&other.inner)?;
+        Ok(CandleTensor {
+            inner: value,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
 }
 
 // todo component as Cudarc tensors yet to implemented in itslf for kernel logic
@@ -636,6 +647,10 @@ impl TensorOps for CudarcTensor {
 
     fn repeat(&self, _: &Shape) -> Result<Self> {
         todo!("Phase 4")
+    }
+
+    fn sigmoid(&self, other: &Self) -> Result<Self> {
+        todo!("Phase 4 ")
     }
 }
 

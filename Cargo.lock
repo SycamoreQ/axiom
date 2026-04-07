@@ -70,6 +70,7 @@ dependencies = [
  "byteorder",
  "candle-core",
  "candle-nn",
+ "circular-buffer",
  "criterion",
  "cudarc 0.12.1",
  "fancy-regex",
@@ -304,6 +305,12 @@ dependencies = [
  "ciborium-io",
  "half",
 ]
+
+[[package]]
+name = "circular-buffer"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14c638459986b83c2b885179bd4ea6a2cbb05697b001501a56adb3a3d230803b"
 
 [[package]]
 name = "clap"

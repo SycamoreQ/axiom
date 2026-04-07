@@ -33,7 +33,7 @@ impl Backend for CudarcBackend {
 }
 
 pub trait Backend: Clone + Send + Sync + 'static {
-    type Tensor: TensorOps + Clone + Send + Sync;
+    type Tensor: TensorOps + TopKLastDimOp + Clone + Send + Sync;
     type Device: Into<Device> + Clone + Send + Sync;
     type Error: std::error::Error + Send + Sync + From<CoreError>;
 }
