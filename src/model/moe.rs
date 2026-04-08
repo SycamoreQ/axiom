@@ -25,6 +25,12 @@ pub enum ScoreFunction {
     Sigmoid,
 }
 
+pub struct ExpertParallelConfig {
+    pub ep_size: usize,      // 1 for single GPU
+    pub ep_rank: usize,      // 0 for single GPU
+    pub experts_per_rank: usize,
+}
+
 // taken from mistral.rs
 // https://github.com/EricLBuehler/mistral.rs/blob/6aec940499be1cf72c628f7ddaa8b3e59bcb4fda/mistralrs-core/src/ops.rs#L482-L504
 // Define this to be generic over the Tensor type
@@ -297,11 +303,44 @@ impl<B: Backend> Router<B> {
     pub fn speculative_correction(
         actual: &RoutingOutput<B>,
         buffer: &PreGateBuffer,
-        num_tokens: usize,
         device: &Device,
     ) -> Result<B::Tensor> {
-        todo!()
+        let t = actual.expert_indices.shape().dim(0)?;
+        let k = actual.expert_indices.shape().dim(1)?;
+
+        let actual_indices_flat: Vec<u32> = actual.expert_indices.to_vec1()?;
+        let mut mask_data = vec![0.0_f32; t * k];
+
+        for token_pos in 0..t {
+            //Check if we made a prediction for this token
+            if let Some(rec) = buffer.read(TokenPos(token_pos)) {
+                for k_slot in 0..k {
+                    let flat_idx = token_pos * k + k_slot;
+
+                    //Get the actual expert chosen by the router
+                    let actual_expert = ExpertIndex(actual_indices_flat[flat_idx] as usize);
+
+                    //Get the predicted expert from the buffer
+                    if let Some(&predicted_expert) = rec.expert_indices.get(k_slot) {
+                        if predicted_expert == actual_expert {
+                            mask_data[flat_idx] = 1.0;
+                        }
+                    }
+                }
+            }
+        }
+
+        //Wrap back into a [T, K] tensor on the target device
+        B::Tensor::from_slice(&mask_data, &Shape::new(&[t, k]), device)
     }
+
+    pub fn load_balance_loss(
+        router_logits: &B::Tensor,    // [T, E]
+        expert_indices: &B::Tensor,   // [T, K]
+        num_experts: usize,
+    ) -> Result<B::Tensor>       {
+        todo!()
+    }     // scalar loss
 }
 
 /* Expert  (single routed expert)
@@ -316,12 +355,12 @@ pub struct Expert<B: Backend> {
     gate_proj: Linear<B>, // [intermediate, d]
     up_proj: Linear<B>,   // [intermediate, d]
     down_proj: Linear<B>, // [d, intermediate]
-    /// Cached expert identity — used in dispatch bookkeeping.
+    //Cached expert identity — used in dispatch bookkeeping.
     pub index: ExpertIndex,
 }
 
 impl<B: Backend> Expert<B> {
-    /// `in_dim` is hidden_size for standard MoE, latent_dim for LatentMoE.
+    //`in_dim` is hidden_size for standard MoE, latent_dim for LatentMoE.
     pub fn new(
         index: ExpertIndex,
         in_dim: usize,
@@ -329,29 +368,48 @@ impl<B: Backend> Expert<B> {
         device: &Device,
     ) -> Result<Self> {
         // your body
-        todo!()
+        let make_linear = |out: usize, inp: usize| -> Result<Linear<B>> {
+            let w = B::Tensor::zeros(&Shape::new(&[out, inp]), DType::F32, device)?;
+            Ok(Linear::new(w, None))
+        };
+
+        let gate_proj = make_linear(intermediate_size, in_dim)?;
+        let up_proj = make_linear(intermediate_size, in_dim)?;
+        let down_proj = make_linear(in_dim, intermediate_size)?;
+
+        Ok(Self {
+            gate_proj: gate_proj,
+            up_proj: up_proj,
+            down_proj: down_proj,
+            index: index,
+        })
     }
 
-    /// SwiGLU forward:  down(silu(gate(x)) ⊙ up(x))
-    /// `x` shape: [n_assigned_tokens, in_dim]
-    /// returns:   [n_assigned_tokens, in_dim]
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
-        // your body
-        todo!()
+        let x_proj_gate = self.gate_proj.forward(x)?;
+        let silu_x = x_proj_gate.silu();
+
+        let x_proj_up = self.up_proj.forward(x)?;
+        let inner = x_proj_gate.matmul(&x_proj_up)?;
+
+        let x_proj_down = self.down_proj.forward(&inner)?;
+
+        Ok(x_proj_down)
     }
 }
 
-// ─────────────────────────────────────────────
-// § 6  SHARED EXPERT
-// ─────────────────────────────────────────────
+/*
+ Shared Expert
 
-/// Processes *all* tokens regardless of routing.
-/// Architecture identical to Expert but always receives the full token
-/// stream. Megatron overlaps this with the dispatch-compute-combine
-/// pipeline (§7.2); we model the computation only, not the overlap.
-///
-/// The shared expert always operates on hidden_size, not latent_dim,
-/// because it runs before the down-projection in LatentMoE.
+Processes *all* tokens regardless of routing.
+Architecture identical to Expert but always receives the full token
+stream
+
+The shared expert always operates on hidden_size, not latent_dim,
+because it runs before the down-projection in LatentMoE.
+
+Did not implement dispatch-compute-combine on top of this
+*/
 pub struct SharedExpert<B: Backend> {
     gate_proj: Linear<B>,
     up_proj: Linear<B>,
@@ -360,36 +418,44 @@ pub struct SharedExpert<B: Backend> {
 }
 
 impl<B: Backend> SharedExpert<B> {
-    /// `num_shared` shared experts are averaged at the end.
-    /// Each is built with the same dims; their outputs are summed.
-    ///
-    /// For simplicity we represent all shared experts as a single
-    /// wider linear (intermediate_size * num_shared) and split on output.
-    /// This matches weight-layout conventions in DeepSeek checkpoints.
     pub fn new(
         hidden_size: usize,
         intermediate_size: usize,
         num_shared: usize,
         device: &Device,
     ) -> Result<Self> {
-        // your body
-        todo!()
+        let make_linear = |out: usize, inp: usize| -> Result<Linear<B>> {
+            let w = B::Tensor::zeros(&Shape::new(&[out, inp]), DType::F32, device)?;
+            Ok(Linear::new(w, None))
+        };
+
+        let gate_proj = make_linear(intermediate_size * num_shared, hidden_size)?;
+        let up_proj = make_linear(intermediate_size * num_shared, hidden_size)?;
+        let down_proj = make_linear(hidden_size, intermediate_size * num_shared)?;
+
+        Ok(Self {
+            gate_proj: gate_proj,
+            up_proj: up_proj,
+            down_proj: down_proj,
+            num_shared: num_shared,
+        })
     }
 
-    /// Returns [T, hidden_size].
-    /// The shared expert output is *added* to the routed expert output
-    /// in MoeLayer::forward — not gated.
+    //Returns [T, hidden_size].
+    //The shared expert output is *added* to the routed expert output
+    //in MoeLayer::forward — not gated.
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
-        // your body
-        todo!()
-    }
+        pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
+            let gate = self.gate_proj.forward(x)?.silu()?;
+            let up = self.up_proj.forward(x)?;
+            let fused = gate.mul(&up)?;
+            self.down_proj.forward(&fused)
+        }
 }
 
-// ─────────────────────────────────────────────
-// § 7  LATENT PROJECTIONS
-// ─────────────────────────────────────────────
+/*Latent Projections
 
-/// Implements the LatentMoE shared projections (Megatron §7.3).
+/// Implements the LatentMoE shared projections
 ///
 ///   forward flow:
 ///     x [T, hidden]
@@ -400,6 +466,7 @@ impl<B: Backend> SharedExpert<B> {
 ///       → up_proj    [T, hidden]      ← shared across all routed experts
 ///
 ///   shared expert path bypasses both projections (runs on hidden_size).
+*/
 pub struct LatentProjection<B: Backend> {
     /// W↓ ∈ ℝ^{latent × hidden}  stored as [latent, hidden].
     pub down_proj: Linear<B>,
@@ -427,20 +494,15 @@ impl<B: Backend> LatentProjection<B> {
     }
 }
 
-// ─────────────────────────────────────────────
-// § 8  DISPATCH / COMBINE  (CPU-side, single device)
-// ─────────────────────────────────────────────
+// dispatch/combine(CPU-side, single device)
 
-/// Gather the tokens assigned to one expert from the full token stream.
-///
-/// `token_features`  shape: [T, d]
-/// `expert_idx`      which expert we are gathering for
-/// `routing_output`  contains expert_indices [T, K]
-///
-/// Returns (gathered_tokens [n, d],  original_positions Vec<TokenPos>)
-/// where n ≤ T is the number of tokens routed to this expert.
-///
-/// `original_positions` is required by `combine` to scatter results back.
+/*
+ Gather the tokens assigned to one expert from the full token stream.
+`token_features`  shape: [T, d]
+`expert_idx`      which expert we are gathering for
+`routing_output`  contains expert_indices [T, K]
+*/
+
 pub fn dispatch(
     token_features: &impl TensorOps,
     expert_idx: ExpertIndex,
@@ -453,15 +515,16 @@ pub fn dispatch(
     todo!()
 }
 
-/// Scatter expert outputs back into the full output buffer and accumulate
-/// weighted. This is the inverse of dispatch.
-///
-/// `expert_out`          shape: [n, d] — output of Expert::forward
-/// `routing_weights`     shape: [T, K] — from RoutingOutput
-/// `positions`           which token rows these n outputs came from
-/// `expert_k_slot`       which k-slot (0..K) this expert occupies per token
-/// `output_accumulator`  mutable [T, d] buffer — accumulated in place
-///                       (represented as a Vec of row tensors for now)
+/*
+Scatter expert outputs back into the full output buffer and accumulate
+weighted. This is the inverse of dispatch.
+`expert_out`          shape: [n, d] — output of Expert::forward
+`routing_weights`     shape: [T, K] — from RoutingOutput
+`positions`           which token rows these n outputs came from
+`expert_k_slot`       which k-slot (0..K) this expert occupies per token
+`output_accumulator`  mutable [T, d] buffer — accumulated in place
+                       (represented as a Vec of row tensors for now)
+*/
 pub fn combine(
     expert_out: &impl TensorOps,
     routing_weights: &impl TensorOps,
@@ -476,17 +539,14 @@ pub fn combine(
     todo!()
 }
 
-// ─────────────────────────────────────────────
-// § 9  MOE LAYER  (top-level)
-// ─────────────────────────────────────────────
+// Moe Top layer
 
-/// What MoeLayer::forward returns.
 #[derive(Debug)]
 pub struct MoeOutput<B: Backend> {
-    /// The transformed hidden states. Shape matches input x.
+    //The transformed hidden states. Shape matches input x.
     pub hidden_states: B::Tensor,
-    /// Placeholder for auxiliary loss — filled in when you wire the
-    /// load-balancing file. None until then.
+    //Placeholder for auxiliary loss — filled in when you wire the
+    //load-balancing file. None until then.
     pub aux_loss: Option<B::Tensor>,
 }
 
@@ -528,24 +588,46 @@ pub struct MoeLayer<B: Backend> {
 }
 
 impl<B: Backend> MoeLayer<B> {
-    /// Construct from ModelConfig.
-    ///
-    /// Reads: hidden_size, intermediate_size, num_local_experts,
-    ///        num_experts_per_tok, num_shared_experts,
-    ///        prefetch_threshold.
-    ///
-    /// `latent_dim` is None for standard MoE, Some(ℓ) for LatentMoE.
     pub fn new(config: &ModelConfig, latent_dim: Option<usize>, device: &Device) -> Result<Self> {
-        // your body:
-        //   1. build RouterConfig
-        //   2. expert_dim = latent_dim.unwrap_or(hidden_size)
-        //   3. build Router
-        //   4. build Vec<Expert> of length num_local_experts
-        //   5. build SharedExpert if num_shared_experts > 0
-        //   6. build LatentProjection if latent_dim.is_some()
-        //   7. build PreGateBuffer if prefetch_threshold.is_some()
-        //      capacity = 1 * max_position_embeddings (batch=1 assumption)
-        todo!()
+        let router_config = RouterConfig::from_model_config(config);
+        let hidden_size = config.hidden_size;
+        let intermediate_size = config.intermediate_size;
+        let num_experts = config.num_local_experts.unwrap_or(1);
+        let num_shared = config.num_shared_experts.unwrap_or(0);
+        let expert_dim = latent_dim.unwrap_or(hidden_size);
+
+        let router = Router::new(hidden_size, router_config.clone(), device)?;
+
+        let experts = (0..num_experts)
+            .map(|i| Expert::new(ExpertIndex(i), expert_dim, intermediate_size, device))
+            .collect::<Result<Vec<_>>>()?;
+
+        let shared_expert = if num_shared > 0 {
+            Some(SharedExpert::new(hidden_size, intermediate_size, num_shared, device)?)
+        } else {
+            None
+        };
+
+        let latent = if let Some(ldim) = latent_dim {
+            Some(LatentProjection::new(LatentConfig::new(hidden_size, ldim), device)?)
+        } else {
+            None
+        };
+
+        let pregate_buffer = config.prefetch_threshold.map(|_| {
+            PreGateBuffer::new(config.max_position_embeddings)
+        });
+
+        Ok(Self {
+            router,
+            experts,
+            shared_expert,
+            latent,
+            pregate_buffer,
+            config: router_config,
+            hidden_size,
+            expert_dim,
+        })
     }
 
     /// Full forward pass. See struct-level doc for the flow.
