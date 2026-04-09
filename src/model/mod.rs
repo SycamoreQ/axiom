@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod block;
 pub mod config;
 pub mod embedding;
 pub mod feedforward;

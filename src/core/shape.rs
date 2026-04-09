@@ -154,6 +154,12 @@ impl From<(usize, usize, usize, usize)> for Shape {
     }
 }
 
+impl From<&[usize]> for Shape {
+    fn from(dims: &[usize]) -> Self {
+        Self::new(dims)
+    }
+}
+
 impl std::fmt::Display for Shape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.0.as_slice())

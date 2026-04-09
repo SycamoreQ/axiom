@@ -13,6 +13,17 @@ fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
     }
 }
 
+pub struct TopKOutput<T> {
+    pub values: T,
+    pub indices: T,
+}
+
+pub trait TopKLastDimOp {
+    fn topk(&self, k: usize) -> Result<TopKOutput<Self>>
+    where
+        Self: Sized;
+}
+
 pub trait TensorOps: Clone + Send + Sync + Sized {
     fn shape(&self) -> &Shape;
     fn dtype(&self) -> DType;
@@ -79,7 +90,12 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn neg(&self) -> Result<Self>; // negate — needed for rotation
     fn broadcast_mul(&self, other: &Self) -> Result<Self>;
     fn repeat(&self, shape: &Shape) -> Result<Self>;
-    fn sigmoid(&self, other: &Self) -> Result<Self>;
+    fn sigmoid(&self) -> Result<Self>;
+    fn to_vec_u32(&self) -> Result<Vec<u32>>;
+    fn zeros_like(&self) -> Result<Self>;
+    fn sum_keepdim(&self, dim: usize) -> Result<Self>;
+    fn broadcast_div(&self, other: &Self) -> Result<Self>;
+    fn to_vec_f32(&self) -> Result<Vec<f32>>;
 }
 
 impl TensorOps for CandleTensor {
@@ -505,14 +521,58 @@ impl TensorOps for CandleTensor {
         })
     }
 
-    fn sigmoid(&self, other: &Self) -> Result<Self> {
-        let value = candle_nn::ops::sigmoid(&other.inner)?;
+    fn sigmoid(&self) -> Result<Self> {
+        let inner = candle_nn::ops::sigmoid(&self.inner)?;
         Ok(CandleTensor {
-            inner: value,
+            inner,
             shape: self.shape.clone(),
             dtype: self.dtype,
             device: self.device.clone(),
         })
+    }
+
+    fn to_vec_u32(&self) -> Result<Vec<u32>> {
+        self.inner
+            .flatten_all()?
+            .to_vec1::<u32>()
+            .map_err(|e| CoreError::Candle(e))
+    }
+    fn zeros_like(&self) -> Result<Self> {
+        let inner = self.inner.zeros_like()?;
+        Ok(CandleTensor {
+            inner,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn sum_keepdim(&self, dim: usize) -> Result<Self> {
+        let inner = self.inner.sum_keepdim(dim)?;
+        Ok(CandleTensor {
+            inner,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn broadcast_div(&self, other: &Self) -> Result<Self> {
+        let inner = self.inner.broadcast_div(&other.inner)?;
+        let shape = Shape::new(&inner.dims());
+        Ok(CandleTensor {
+            inner,
+            shape,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        self.inner
+            .flatten_all()?
+            .to_vec1::<f32>()
+            .map_err(|e| CoreError::Candle(e))
     }
 }
 
@@ -649,8 +709,27 @@ impl TensorOps for CudarcTensor {
         todo!("Phase 4")
     }
 
-    fn sigmoid(&self, other: &Self) -> Result<Self> {
+    fn sigmoid(&self) -> Result<Self> {
         todo!("Phase 4 ")
+    }
+
+    fn to_vec_u32(&self) -> Result<Vec<u32>> {
+        todo!("phase 4")
+    }
+
+    fn zeros_like(&self) -> Result<Self> {
+        todo!("phase 4")
+    }
+
+    fn sum_keepdim(&self, dim: usize) -> Result<Self> {
+        todo!("Phase 4")
+    }
+    fn broadcast_div(&self, other: &Self) -> Result<Self> {
+        todo!("phase 4")
+    }
+
+    fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        todo!("phase 4")
     }
 }
 

@@ -8,6 +8,7 @@ Types of quantizations and their implementations
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
+    U32,
     F32,
     F16,
     BF16,
@@ -22,6 +23,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
+            DType::U32 => 4,
         }
     }
 
@@ -35,6 +37,7 @@ impl DType {
             DType::F32 => "f32",
             DType::F16 => "f16",
             DType::BF16 => "bf16",
+            DType::U32 => "u32",
         }
     }
 }
@@ -61,6 +64,7 @@ impl From<DType> for candle_core::DType {
             DType::F32 => candle_core::DType::F32,
             DType::F16 => candle_core::DType::F16,
             DType::BF16 => candle_core::DType::BF16,
+            DType::U32 => candle_core::DType::U32,
         }
     }
 }
@@ -72,6 +76,7 @@ impl TryFrom<candle_core::DType> for DType {
             candle_core::DType::F32 => Ok(DType::F32),
             candle_core::DType::F16 => Ok(DType::F16),
             candle_core::DType::BF16 => Ok(DType::BF16),
+            candle_core::DType::U32 => Ok(DType::U32),
             other => Err(CoreError::Internal(format!(
                 "unsupported candle dtype: {:?}",
                 other

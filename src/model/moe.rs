@@ -4,11 +4,9 @@ use crate::core::dtype::DType;
 use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
+use crate::core::tensor::{TopKLastDimOp, TopKOutput};
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
-use candle_core::shape::D::Minus1;
-use candle_core::{IndexOp, Tensor};
-use candle_nn;
 
 //Opaque index into the expert array. Prevents mixing expert indices
 //with arbitrary usizes at the type level.
@@ -26,51 +24,14 @@ pub enum ScoreFunction {
 }
 
 pub struct ExpertParallelConfig {
-    pub ep_size: usize,      // 1 for single GPU
-    pub ep_rank: usize,      // 0 for single GPU
+    pub ep_size: usize, // 1 for single GPU
+    pub ep_rank: usize, // 0 for single GPU
     pub experts_per_rank: usize,
 }
 
 // taken from mistral.rs
 // https://github.com/EricLBuehler/mistral.rs/blob/6aec940499be1cf72c628f7ddaa8b3e59bcb4fda/mistralrs-core/src/ops.rs#L482-L504
 // Define this to be generic over the Tensor type
-
-pub struct TopKOutput<T> {
-    pub values: T,
-    pub indices: T,
-}
-
-pub trait TopKLastDimOp {
-    // Return the generic TopKOutput
-    fn topk(&self, k: usize) -> Result<TopKOutput<Self>>
-    where
-        Self: Sized;
-}
-
-impl TopKLastDimOp for CandleTensor {
-    fn topk(&self, k: usize) -> Result<TopKOutput<Self>> {
-        let sorted_indices = self.inner.arg_sort_last_dim(false)?;
-        let topk_indices = sorted_indices
-            .narrow(candle_core::D::Minus1, 0, k)?
-            .contiguous()?;
-        let values = self.inner.gather(&topk_indices, candle_core::D::Minus1)?;
-
-        Ok(TopKOutput {
-            values: CandleTensor {
-                inner: values,
-                shape: Shape::from(values.dims()),
-                dtype: self.dtype,
-                device: self.device.clone(),
-            },
-            indices: CandleTensor {
-                inner: topk_indices,
-                shape: Shape::from(topk_indices.dims()),
-                dtype: DType::U32,
-                device: self.device.clone(),
-            },
-        })
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -267,8 +228,8 @@ impl<B: Backend> Router<B> {
         }
 
         let scores = match self.config.score_fn {
-            ScoreFunction::Sigmoid => logits.sigmoid(&x_flattened)?,
-            ScoreFunction::Softmax => logits.softmax(Minus1 as usize)?, // not sure how to get -1
+            ScoreFunction::Sigmoid => logits.sigmoid()?,
+            ScoreFunction::Softmax => logits.softmax(logits.rank() - 1)?, // not sure how to get -1
         };
 
         let topk_out = TopKLastDimOp::topk(&scores, self.config.experts_per_token)?;
@@ -277,7 +238,7 @@ impl<B: Backend> Router<B> {
 
         //Renormalize (if using Softmax)
         let final_weights = if let ScoreFunction::Softmax = self.config.score_fn {
-            let sum = routing_weights.sum_keepdim(Minus1)?;
+            let sum = routing_weights.sum_keepdim(routing_weights.rank() - 1)?;
             routing_weights.broadcast_div(&sum)?
         } else {
             routing_weights
@@ -308,7 +269,7 @@ impl<B: Backend> Router<B> {
         let t = actual.expert_indices.shape().dim(0)?;
         let k = actual.expert_indices.shape().dim(1)?;
 
-        let actual_indices_flat: Vec<u32> = actual.expert_indices.to_vec1()?;
+        let actual_indices_flat: Vec<u32> = actual.expert_indices.to_vec_u32()?;
         let mut mask_data = vec![0.0_f32; t * k];
 
         for token_pos in 0..t {
@@ -335,12 +296,12 @@ impl<B: Backend> Router<B> {
     }
 
     pub fn load_balance_loss(
-        router_logits: &B::Tensor,    // [T, E]
-        expert_indices: &B::Tensor,   // [T, K]
+        router_logits: &B::Tensor,  // [T, E]
+        expert_indices: &B::Tensor, // [T, K]
         num_experts: usize,
-    ) -> Result<B::Tensor>       {
+    ) -> Result<B::Tensor> {
         todo!()
-    }     // scalar loss
+    } // scalar loss
 }
 
 /* Expert  (single routed expert)
@@ -386,15 +347,9 @@ impl<B: Backend> Expert<B> {
     }
 
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
-        let x_proj_gate = self.gate_proj.forward(x)?;
-        let silu_x = x_proj_gate.silu();
-
-        let x_proj_up = self.up_proj.forward(x)?;
-        let inner = x_proj_gate.matmul(&x_proj_up)?;
-
-        let x_proj_down = self.down_proj.forward(&inner)?;
-
-        Ok(x_proj_down)
+        let gate = self.gate_proj.forward(x)?.silu()?;
+        let up = self.up_proj.forward(x)?;
+        self.down_proj.forward(&gate.mul(&up)?)
     }
 }
 
@@ -445,52 +400,45 @@ impl<B: Backend> SharedExpert<B> {
     //The shared expert output is *added* to the routed expert output
     //in MoeLayer::forward — not gated.
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
-        pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
-            let gate = self.gate_proj.forward(x)?.silu()?;
-            let up = self.up_proj.forward(x)?;
-            let fused = gate.mul(&up)?;
-            self.down_proj.forward(&fused)
-        }
+        let gate = self.gate_proj.forward(x)?.silu()?;
+        let up = self.up_proj.forward(x)?;
+        let fused = gate.mul(&up)?;
+        self.down_proj.forward(&fused)
+    }
 }
 
-/*Latent Projections
+//Latent Projections
 
-/// Implements the LatentMoE shared projections
-///
-///   forward flow:
-///     x [T, hidden]
-///       → down_proj  [T, latent]      ← shared across all routed experts
-///       → dispatch to assigned experts
-///       → each Expert operates on [n, latent]
-///       → combine weighted sum        [T, latent]
-///       → up_proj    [T, hidden]      ← shared across all routed experts
-///
-///   shared expert path bypasses both projections (runs on hidden_size).
-*/
 pub struct LatentProjection<B: Backend> {
-    /// W↓ ∈ ℝ^{latent × hidden}  stored as [latent, hidden].
+    //stored as [latent, hidden].
     pub down_proj: Linear<B>,
-    /// W↑ ∈ ℝ^{hidden × latent}  stored as [hidden, latent].
     pub up_proj: Linear<B>,
     pub config: LatentConfig,
 }
 
 impl<B: Backend> LatentProjection<B> {
-    pub fn new(config: LatentConfig, device: &Device) -> Result<Self> {
-        // your body: build down [latent, hidden], up [hidden, latent]
-        todo!()
+    pub fn new(config: LatentConfig, device: &Device, hidden_size: usize) -> Result<Self> {
+        let make_linear = |out: usize, inp: usize| -> Result<Linear<B>> {
+            let w = B::Tensor::zeros(&Shape::new(&[out, inp]), DType::F32, device)?;
+            Ok(Linear::new(w, None))
+        };
+
+        let down_proj = make_linear(config.latent_dim, hidden_size)?;
+        let up_proj = make_linear(hidden_size, config.latent_dim)?;
+
+        Ok(Self {
+            down_proj,
+            up_proj,
+            config,
+        })
     }
 
-    /// Project hidden → latent.  [T, hidden] → [T, latent].
     pub fn project_down(&self, x: &B::Tensor) -> Result<B::Tensor> {
-        // your body
-        todo!()
+        self.down_proj.forward(x)
     }
 
-    /// Project latent → hidden.  [T, latent] → [T, hidden].
     pub fn project_up(&self, x: &B::Tensor) -> Result<B::Tensor> {
-        // your body
-        todo!()
+        self.up_proj.forward(x)
     }
 }
 
@@ -503,16 +451,48 @@ impl<B: Backend> LatentProjection<B> {
 `routing_output`  contains expert_indices [T, K]
 */
 
-pub fn dispatch(
-    token_features: &impl TensorOps,
+pub fn dispatch<B: Backend>(
+    token_features: &B::Tensor,
     expert_idx: ExpertIndex,
-    routing_output: &RoutingOutput<impl Backend>,
-) -> Result<(impl TensorOps, Vec<TokenPos>)> {
-    // your body:
-    //   walk routing_output.expert_indices [T, K],
-    //   collect rows where any k matches expert_idx,
-    //   narrow / index_select those rows from token_features
-    todo!()
+    routing_output: &RoutingOutput<B>,
+) -> Result<(B::Tensor, Vec<TokenPos>, Vec<usize>)> {
+    let indices_flat: Vec<u32> = routing_output.expert_indices.to_vec_u32()?;
+    let t_total = routing_output.expert_indices.shape().dim(0)?;
+    let k = routing_output.expert_indices.shape().dim(1)?;
+
+    let mut selected_indices = Vec::new();
+    let mut original_positions = Vec::new();
+    let mut k_slots = Vec::new();
+
+    let device = token_features.device();
+
+    for t in 0..t_total {
+        for k_slot in 0..k {
+            let flat_idx = t * k + k_slot;
+            let assigned_expert = indices_flat[flat_idx] as usize;
+            if assigned_expert == expert_idx.0 {
+                // token t is dispatched to this expert at slot k_slot
+                selected_indices.push(t as usize);
+                original_positions.push(TokenPos(t));
+                k_slots.push(k_slot);
+            }
+        }
+    }
+
+    //If no tokens were assigned to this expert, handle the empty case
+    if selected_indices.is_empty() {
+        let hidden_dim = token_features.shape().dims().last().unwrap_or(&0);
+        // Return an empty tensor with shape [0, hidden_dim]
+        let empty_tensor = B::Tensor::zeros(&Shape::new(&[0, *hidden_dim]), DType::F32, device)?;
+        return Ok((empty_tensor, original_positions, k_slots));
+    }
+
+    let indices_u32: Vec<u32> = selected_indices.iter().map(|&i| i as u32).collect();
+    let indices_tensor =
+        B::Tensor::from_u32_slice(&indices_u32, &Shape::new(&[indices_u32.len()]), device)?;
+    let dispatched_features = token_features.index_select(&indices_tensor, 0)?;
+
+    Ok((dispatched_features, original_positions, k_slots))
 }
 
 /*
@@ -525,65 +505,64 @@ weighted. This is the inverse of dispatch.
 `output_accumulator`  mutable [T, d] buffer — accumulated in place
                        (represented as a Vec of row tensors for now)
 */
-pub fn combine(
-    expert_out: &impl TensorOps,
-    routing_weights: &impl TensorOps,
+
+pub fn combine<B: Backend>(
+    expert_out: &B::Tensor,
+    routing_weights: &B::Tensor,
     positions: &[TokenPos],
     expert_k_slot: &[usize],
-    output_accumulator: &mut Vec<Option<impl TensorOps>>,
+    output_accumulator: &mut Vec<Option<B::Tensor>>,
 ) -> Result<()> {
-    // your body:
-    //   for each (i, pos) in positions:
-    //     weight = routing_weights[pos.0, expert_k_slot[i]]
-    //     accumulator[pos.0] += weight * expert_out[i]
-    todo!()
+    let n = expert_out.shape().dim(0)?;
+    let d = expert_out.shape().dim(1)?;
+
+    for i in 0..n {
+        let t = positions[i].0;
+        let k = expert_k_slot[i];
+        let weight = routing_weights
+            .narrow(0, t, 1)? // Row t
+            .narrow(1, k, 1)?;
+
+        //Get the specific row from the expert's output
+        let expert_row = expert_out.narrow(0, i, 1)?;
+
+        //Scale the row by the weight
+        let scaled_row = expert_row.broadcast_mul(&weight)?;
+
+        if let Some(existing_tensor) = &output_accumulator[t] {
+            // If another expert already contributed to this token, add to it
+            output_accumulator[t] = Some(existing_tensor.add(&scaled_row)?);
+        } else {
+            // First expert contributing to this token
+            output_accumulator[t] = Some(scaled_row);
+        }
+    }
+
+    Ok(())
 }
 
 // Moe Top layer
 
 #[derive(Debug)]
 pub struct MoeOutput<B: Backend> {
-    //The transformed hidden states. Shape matches input x.
+    //The transformed hidden states
     pub hidden_states: B::Tensor,
-    //Placeholder for auxiliary loss — filled in when you wire the
-    //load-balancing file. None until then.
+    //Placeholder for auxiliary loss — filled in when wire the
+    //load-balancing file is made
     pub aux_loss: Option<B::Tensor>,
 }
 
-/// Full Megatron-style MoE layer (§2.1, §7.2, §7.3).
-///
-/// Forward pass (LatentMoE path, Megatron figure 1 + §7.3):
-///
-///  x [B,S,H]
-///   ├─ shared_expert(x)                       → shared_out [T, H]
-///   ├─ router(x)                              → RoutingOutput
-///   ├─ latent.project_down(x)                 → x_latent [T, ℓ]
-///   ├─ for each expert e in 0..E:
-///   │     (gathered, positions) = dispatch(x_latent, e, routing)
-///   │     expert_out = experts[e].forward(gathered)
-///   │     combine(expert_out, routing_weights, positions, …, accumulator)
-///   ├─ routed_out = stack accumulator         → [T, ℓ]
-///   ├─ routed_out = latent.project_up(routed_out) → [T, H]
-///   └─ output = routed_out + shared_out       → [T, H]  reshape → [B,S,H]
-///
-/// Speculative pre-gating sits *before* router(x):
-///   1. read PreGateBuffer for current token positions
-///   2. run router(x) to get actual routing
-///   3. run speculative_correction → correction_mask
-///   4. zero-out mis-predicted slots; schedule re-computation
-///      (in this single-device implementation we simply recompute all
-///       mis-predicted tokens — the structure is there for future EP)
 pub struct MoeLayer<B: Backend> {
     pub router: Router<B>,
     pub experts: Vec<Expert<B>>,
     pub shared_expert: Option<SharedExpert<B>>,
     pub latent: Option<LatentProjection<B>>,
-    /// Lives on the layer; reset between unrelated sequences.
+    //Lives on the layer; reset between unrelated sequences.
     pub pregate_buffer: Option<PreGateBuffer>,
     pub config: RouterConfig,
     pub hidden_size: usize,
-    /// The dimension experts actually compute over.
-    /// = latent_dim if LatentMoE, else hidden_size.
+    //The dimension experts actually compute over.
+    //latent_dim if LatentMoE, else hidden_size.
     pub expert_dim: usize,
 }
 
@@ -603,20 +582,29 @@ impl<B: Backend> MoeLayer<B> {
             .collect::<Result<Vec<_>>>()?;
 
         let shared_expert = if num_shared > 0 {
-            Some(SharedExpert::new(hidden_size, intermediate_size, num_shared, device)?)
+            Some(SharedExpert::new(
+                hidden_size,
+                intermediate_size,
+                num_shared,
+                device,
+            )?)
         } else {
             None
         };
 
         let latent = if let Some(ldim) = latent_dim {
-            Some(LatentProjection::new(LatentConfig::new(hidden_size, ldim), device)?)
+            Some(LatentProjection::new(
+                LatentConfig::new(hidden_size, ldim),
+                device,
+                hidden_size,
+            )?)
         } else {
             None
         };
 
-        let pregate_buffer = config.prefetch_threshold.map(|_| {
-            PreGateBuffer::new(config.max_position_embeddings)
-        });
+        let pregate_buffer = config
+            .prefetch_threshold
+            .map(|_| PreGateBuffer::new(config.max_position_embeddings));
 
         Ok(Self {
             router,
@@ -630,35 +618,500 @@ impl<B: Backend> MoeLayer<B> {
         })
     }
 
-    /// Full forward pass. See struct-level doc for the flow.
-    ///
-    /// `token_offset` — starting position in the sequence; used to index
-    /// into pregate_buffer correctly for KV-cache generation steps.
+    /*
+     Full forward pass. See struct-level doc for the flow.
+
+    `token_offset` — starting position in the sequence; used to index
+    into pregate_buffer correctly for KV-cache generation steps.
+    */
+
     pub fn forward(&mut self, x: &B::Tensor, token_offset: usize) -> Result<MoeOutput<B>> {
-        // your body — implement the 9-step flow described above
-        todo!()
+        let batch = x.shape().dim(0)?;
+        let seq_len = x.shape().dim(1)?;
+        let hidden_dim = x.shape().dim(2)?;
+        let t = batch * seq_len;
+
+        let x_flat = x.reshape(&Shape::new(&[t, hidden_dim]))?;
+
+        let shared_out = if let Some(shared) = &self.shared_expert {
+            Some(shared.forward(&x_flat)?)
+        } else {
+            None
+        };
+
+        let routed_input = if let Some(proj) = &self.latent {
+            proj.project_down(&x_flat)?
+        } else {
+            x_flat.clone()
+        };
+
+        // route tokens
+        let routing_output = self.router.forward(x)?;
+
+        // dispatch to expert to combine
+        let mut accumulator: Vec<Option<B::Tensor>> = vec![None; t];
+
+        for e in 0..self.experts.len() {
+            let (gathered, positions, k_slots) =
+                dispatch::<B>(&routed_input, ExpertIndex(e), &routing_output)?;
+            if positions.is_empty() {
+                continue;
+            }
+            let expert_out = self.experts[e].forward(&gathered)?;
+            combine::<B>(
+                &expert_out,
+                &routing_output.routing_weights,
+                &positions,
+                &k_slots,
+                &mut accumulator,
+            )?;
+        }
+
+        // stack accumulator rows into [T, expert_dim]
+        let routed_refs: Vec<&B::Tensor> = accumulator
+            .iter()
+            .map(|opt| {
+                opt.as_ref()
+                    .expect("every token must have at least one expert")
+            })
+            .collect();
+        let mut routed_out = B::Tensor::cat(&routed_refs, 0)?;
+
+        // project back to hidden if latent
+        if let Some(proj) = &self.latent {
+            routed_out = proj.project_up(&routed_out)?;
+        }
+
+        // add shared expert output
+        let mut hidden_states = if let Some(s) = shared_out {
+            routed_out.add(&s)?
+        } else {
+            routed_out
+        };
+
+        // update pregate buffer
+        self.update_pregate_buffer(&routing_output, token_offset, t)?;
+
+        // reshape back to [batch, seq_len, hidden]
+        hidden_states = hidden_states.reshape(&Shape::new(&[batch, seq_len, hidden_dim]))?;
+
+        Ok(MoeOutput {
+            hidden_states,
+            aux_loss: None,
+        })
     }
 
-    /// Write routing decisions into PreGateBuffer after a forward pass.
-    /// Call this at the *end* of forward so the next step can read it.
-    ///
-    /// Converts routing_output.routing_weights to host scalars to build
-    /// SpeculativeRecord per token.
+    /*
+    Write routing decisions into PreGateBuffer after a forward pass.
+    Call this at the *end* of forward so the next step can read it.
+    Converts routing_output.routing_weights to host scalars to build
+    SpeculativeRecord per token.
+    */
+
     fn update_pregate_buffer(
         &mut self,
         routing_output: &RoutingOutput<B>,
         token_offset: usize,
         num_tokens: usize,
     ) -> Result<()> {
-        // your body
-        todo!()
+        let buf = match &mut self.pregate_buffer {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let weights_flat = routing_output.routing_weights.to_vec_f32()?;
+        let indices_flat = routing_output.expert_indices.to_vec_u32()?;
+        let k = routing_output.routing_weights.shape().dim(1)?;
+
+        for t in 0..num_tokens {
+            let max_score = (0..k)
+                .map(|ki| weights_flat[t * k + ki])
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            let expert_indices: Vec<ExpertIndex> = (0..k)
+                .map(|ki| ExpertIndex(indices_flat[t * k + ki] as usize))
+                .collect();
+
+            buf.write(
+                TokenPos(token_offset + t),
+                SpeculativeRecord {
+                    token_pos: TokenPos(token_offset + t),
+                    expert_indices,
+                    max_score,
+                },
+            );
+        }
+        Ok(())
     }
 
-    /// Reset the pre-gate buffer. Call between unrelated sequences
+    /*
+     Reset the pre-gate buffer. Call between unrelated sequences
     /// (e.g. a new prompt when batch_size > 1 sequences share a layer).
+    */
+
     pub fn reset_speculation(&mut self) {
         if let Some(buf) = &mut self.pregate_buffer {
             buf.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::backend::{CandleBackend, CandleTensor};
+    use crate::core::device::Device;
+    use crate::core::dtype::DType;
+    use crate::core::shape::Shape;
+    use crate::core::tensor::TensorOps;
+    use crate::model::config::ModelConfig;
+
+    fn cpu() -> Device {
+        Device::Cpu
+    }
+
+    fn make_moe_config() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 32,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            intermediate_size: 64,
+            vocab_size: 1000,
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            hidden_act: "silu".to_string(),
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            num_local_experts: Some(4),
+            num_experts_per_tok: Some(2),
+            num_shared_experts: Some(1),
+            expert_interval: Some(1),
+            prefetch_threshold: Some(0.3),
+            torch_dtype: "float32".to_string(),
+            architectures: None,
+            model_type: Some("deepseek".to_string()),
+        }
+    }
+
+    // --- PreGateBuffer ---
+
+    #[test]
+    fn test_pregate_buffer_write_read() {
+        let mut buf = PreGateBuffer::new(16);
+        let record = SpeculativeRecord {
+            token_pos: TokenPos(3),
+            expert_indices: vec![ExpertIndex(0), ExpertIndex(2)],
+            max_score: 0.8,
+        };
+        buf.write(TokenPos(3), record);
+        let read = buf.read(TokenPos(3));
+        assert!(read.is_some());
+        assert_eq!(read.unwrap().max_score, 0.8);
+    }
+
+    #[test]
+    fn test_pregate_buffer_miss() {
+        let buf = PreGateBuffer::new(16);
+        assert!(buf.read(TokenPos(5)).is_none());
+    }
+
+    #[test]
+    fn test_pregate_buffer_wraparound() {
+        let mut buf = PreGateBuffer::new(4);
+        let record = SpeculativeRecord {
+            token_pos: TokenPos(0),
+            expert_indices: vec![ExpertIndex(1)],
+            max_score: 0.5,
+        };
+        buf.write(TokenPos(0), record.clone());
+        // position 4 wraps to slot 0 — should NOT return old record
+        let read = buf.read(TokenPos(4));
+        assert!(read.is_none());
+    }
+
+    #[test]
+    fn test_pregate_buffer_clear() {
+        let mut buf = PreGateBuffer::new(16);
+        buf.write(
+            TokenPos(0),
+            SpeculativeRecord {
+                token_pos: TokenPos(0),
+                expert_indices: vec![ExpertIndex(0)],
+                max_score: 0.9,
+            },
+        );
+        buf.clear();
+        assert!(buf.read(TokenPos(0)).is_none());
+    }
+
+    #[test]
+    fn test_pregate_buffer_prefetch_candidates() {
+        let mut buf = PreGateBuffer::new(16);
+        buf.write(
+            TokenPos(0),
+            SpeculativeRecord {
+                token_pos: TokenPos(0),
+                expert_indices: vec![ExpertIndex(1), ExpertIndex(3)],
+                max_score: 0.9, // above threshold
+            },
+        );
+        buf.write(
+            TokenPos(1),
+            SpeculativeRecord {
+                token_pos: TokenPos(1),
+                expert_indices: vec![ExpertIndex(0)],
+                max_score: 0.1, // below threshold
+            },
+        );
+        let candidates = buf.prefetch_candidates(0.5);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.contains(&ExpertIndex(1)));
+        assert!(candidates.contains(&ExpertIndex(3)));
+    }
+
+    // --- RouterConfig ---
+
+    #[test]
+    fn test_router_config_from_model_config() {
+        let config = make_moe_config();
+        let rc = RouterConfig::from_model_config(&config);
+        assert_eq!(rc.num_experts, 4);
+        assert_eq!(rc.experts_per_token, 2);
+        assert_eq!(rc.score_scale_factor, 1.0);
+        assert!(rc.prefetch_threshold.is_some());
+    }
+
+    // --- Expert ---
+
+    #[test]
+    fn test_expert_forward_shape() {
+        let expert = Expert::<CandleBackend>::new(ExpertIndex(0), 32, 64, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[4, 32]), DType::F32, &cpu()).unwrap();
+        let out = expert.forward(&x).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[4, 32]));
+    }
+
+    #[test]
+    fn test_expert_index_stored() {
+        let expert = Expert::<CandleBackend>::new(ExpertIndex(3), 32, 64, &cpu()).unwrap();
+        assert_eq!(expert.index, ExpertIndex(3));
+    }
+
+    // --- SharedExpert ---
+
+    #[test]
+    fn test_shared_expert_forward_shape() {
+        let shared = SharedExpert::<CandleBackend>::new(32, 64, 2, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[8, 32]), DType::F32, &cpu()).unwrap();
+        let out = shared.forward(&x).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[8, 32]));
+    }
+
+    // --- LatentProjection ---
+
+    #[test]
+    fn test_latent_projection_down() {
+        let config = LatentConfig::new(32, 16);
+        let proj = LatentProjection::<CandleBackend>::new(config, &cpu(), 32).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[4, 32]), DType::F32, &cpu()).unwrap();
+        let out = proj.project_down(&x).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[4, 16]));
+    }
+
+    #[test]
+    fn test_latent_projection_up() {
+        let config = LatentConfig::new(32, 16);
+        let proj = LatentProjection::<CandleBackend>::new(config, &cpu(), 32).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[4, 16]), DType::F32, &cpu()).unwrap();
+        let out = proj.project_up(&x).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[4, 32]));
+    }
+
+    #[test]
+    fn test_latent_config_compression_ratio() {
+        let config = LatentConfig::new(32, 8);
+        assert_eq!(config.compression_ratio, 4);
+    }
+
+    // --- Router ---
+
+    #[test]
+    fn test_router_forward_output_shapes() {
+        let config = make_moe_config();
+        let rc = RouterConfig::from_model_config(&config);
+        let router = Router::<CandleBackend>::new(32, rc, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = router.forward(&x).unwrap();
+        // T = 1 * 4 = 4 tokens, K = 2 experts per token
+        assert_eq!(out.routing_weights.shape(), &Shape::new(&[4, 2]));
+        assert_eq!(out.expert_indices.shape(), &Shape::new(&[4, 2]));
+        assert_eq!(out.router_logits.shape(), &Shape::new(&[4, 4]));
+    }
+
+    #[test]
+    fn test_router_indices_in_range() {
+        let config = make_moe_config();
+        let rc = RouterConfig::from_model_config(&config);
+        let router = Router::<CandleBackend>::new(32, rc, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = router.forward(&x).unwrap();
+        let indices = out.expert_indices.to_vec_u32().unwrap();
+        for idx in indices {
+            assert!(idx < 4, "expert index out of range: {}", idx);
+        }
+    }
+
+    // --- dispatch ---
+
+    #[test]
+    fn test_dispatch_returns_correct_tokens() {
+        let config = make_moe_config();
+        let rc = RouterConfig::from_model_config(&config);
+        let router = Router::<CandleBackend>::new(32, rc, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let routing = router.forward(&x).unwrap();
+        let token_features =
+            CandleTensor::zeros(&Shape::new(&[4, 32]), DType::F32, &cpu()).unwrap();
+
+        // at least one expert should get some tokens across all 4 tokens with k=2
+        let mut total_dispatched = 0;
+        for e in 0..4 {
+            let (gathered, positions, k_slots) =
+                dispatch::<CandleBackend>(&token_features, ExpertIndex(e), &routing).unwrap();
+            assert_eq!(positions.len(), k_slots.len());
+            total_dispatched += positions.len();
+        }
+        // with 4 tokens and k=2, total dispatches must equal 4*2=8
+        assert_eq!(total_dispatched, 8);
+    }
+
+    #[test]
+    fn test_dispatch_empty_expert() {
+        // create routing that assigns all tokens to experts 0 and 1 only
+        let indices_data: Vec<u32> = vec![0, 1, 0, 1, 0, 1, 0, 1]; // T=4, K=2
+        let weights_data: Vec<f32> = vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let logits_data: Vec<f32> = vec![0.0; 16]; // T=4, E=4
+
+        let routing = RoutingOutput::<CandleBackend> {
+            expert_indices: CandleTensor::from_u32_slice(
+                &indices_data,
+                &Shape::new(&[4, 2]),
+                &cpu(),
+            )
+            .unwrap(),
+            routing_weights: CandleTensor::from_slice(&weights_data, &Shape::new(&[4, 2]), &cpu())
+                .unwrap(),
+            router_logits: CandleTensor::from_slice(&logits_data, &Shape::new(&[4, 4]), &cpu())
+                .unwrap(),
+        };
+
+        let token_features =
+            CandleTensor::zeros(&Shape::new(&[4, 32]), DType::F32, &cpu()).unwrap();
+
+        // expert 2 and 3 should get no tokens
+        let (_, positions, _) =
+            dispatch::<CandleBackend>(&token_features, ExpertIndex(2), &routing).unwrap();
+        assert!(positions.is_empty());
+    }
+
+    // --- MoeLayer ---
+
+    #[test]
+    fn test_moe_layer_new() {
+        let config = make_moe_config();
+        let layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu());
+        assert!(layer.is_ok());
+    }
+
+    #[test]
+    fn test_moe_layer_expert_count() {
+        let config = make_moe_config();
+        let layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        assert_eq!(layer.experts.len(), 4);
+    }
+
+    #[test]
+    fn test_moe_layer_shared_expert_present() {
+        let config = make_moe_config();
+        let layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        assert!(layer.shared_expert.is_some());
+    }
+
+    #[test]
+    fn test_moe_layer_pregate_buffer_present() {
+        let config = make_moe_config();
+        let layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        assert!(layer.pregate_buffer.is_some());
+    }
+
+    #[test]
+    fn test_moe_layer_forward_shape() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        assert_eq!(out.hidden_states.shape(), &Shape::new(&[1, 4, 32]));
+    }
+
+    #[test]
+    fn test_moe_layer_forward_single_token() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 1, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        assert_eq!(out.hidden_states.shape(), &Shape::new(&[1, 1, 32]));
+    }
+
+    #[test]
+    fn test_moe_layer_aux_loss_none() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        assert!(out.aux_loss.is_none());
+    }
+
+    #[test]
+    fn test_moe_layer_pregate_buffer_updated_after_forward() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        layer.forward(&x, 0).unwrap();
+        // after forward, token 0 should have a record
+        let buf = layer.pregate_buffer.as_ref().unwrap();
+        assert!(buf.read(TokenPos(0)).is_some());
+    }
+
+    #[test]
+    fn test_moe_layer_reset_speculation() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        layer.forward(&x, 0).unwrap();
+        layer.reset_speculation();
+        let buf = layer.pregate_buffer.as_ref().unwrap();
+        assert!(buf.read(TokenPos(0)).is_none());
+    }
+
+    #[test]
+    fn test_moe_layer_with_latent() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, Some(16), &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        assert_eq!(out.hidden_states.shape(), &Shape::new(&[1, 4, 32]));
+    }
+
+    #[test]
+    fn test_moe_layer_forward_with_offset() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 1, 32]), DType::F32, &cpu()).unwrap();
+        // simulate generation step at position 10
+        let out = layer.forward(&x, 10).unwrap();
+        assert_eq!(out.hidden_states.shape(), &Shape::new(&[1, 1, 32]));
+        let buf = layer.pregate_buffer.as_ref().unwrap();
+        assert!(buf.read(TokenPos(10)).is_some());
     }
 }
