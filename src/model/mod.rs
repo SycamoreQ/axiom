@@ -4,6 +4,7 @@ pub mod config;
 pub mod embedding;
 pub mod feedforward;
 pub mod linear;
+pub mod model;
 pub mod moe;
 pub mod norm;
 pub mod rope;

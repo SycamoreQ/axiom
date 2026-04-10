@@ -79,3 +79,168 @@ impl<B: Backend> Block<B> {
         Ok((x, new_k, new_v))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::backend::{CandleBackend, CandleTensor};
+    use crate::core::device::Device;
+    use crate::core::dtype::DType;
+    use crate::core::shape::Shape;
+    use crate::core::tensor::TensorOps;
+    use crate::model::config::ModelConfig;
+
+    fn cpu() -> Device {
+        Device::Cpu
+    }
+
+    fn make_dense_config() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            intermediate_size: 128,
+            vocab_size: 1000,
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            hidden_act: "silu".to_string(),
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            num_local_experts: None,
+            num_experts_per_tok: None,
+            num_shared_experts: None,
+            expert_interval: None,
+            prefetch_threshold: None,
+            torch_dtype: "float32".to_string(),
+            architectures: None,
+            model_type: Some("llama".to_string()),
+        }
+    }
+
+    fn make_moe_config() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            intermediate_size: 128,
+            vocab_size: 1000,
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            hidden_act: "silu".to_string(),
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            num_local_experts: Some(4),
+            num_experts_per_tok: Some(2),
+            num_shared_experts: Some(1),
+            expert_interval: Some(1),
+            prefetch_threshold: Some(0.3),
+            torch_dtype: "float32".to_string(),
+            architectures: None,
+            model_type: Some("deepseek".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_dense_block_construction() {
+        let config = make_dense_config();
+        let block = Block::<CandleBackend>::new(&config, 0, &cpu());
+        assert!(block.is_ok());
+    }
+
+    #[test]
+    fn test_moe_block_construction() {
+        let config = make_moe_config();
+        let block = Block::<CandleBackend>::new(&config, 0, &cpu());
+        assert!(block.is_ok());
+    }
+
+    #[test]
+    fn test_dense_block_is_dense() {
+        let config = make_dense_config();
+        let block = Block::<CandleBackend>::new(&config, 0, &cpu()).unwrap();
+        assert!(matches!(block.ffn, FeedForwardLayer::Dense(_)));
+    }
+
+    #[test]
+    fn test_moe_block_is_moe() {
+        let config = make_moe_config();
+        let block = Block::<CandleBackend>::new(&config, 0, &cpu()).unwrap();
+        assert!(matches!(block.ffn, FeedForwardLayer::Moe(_)));
+    }
+
+    #[test]
+    fn test_layer_idx_stored() {
+        let config = make_dense_config();
+        let block = Block::<CandleBackend>::new(&config, 3, &cpu()).unwrap();
+        assert_eq!(block.layer_idx, 3);
+    }
+
+    #[test]
+    fn test_dense_forward_output_shape() {
+        let config = make_dense_config();
+        let mut block = Block::<CandleBackend>::new(&config, 0, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &cpu()).unwrap();
+        let (out, k, v) = block.forward(&x, None, None, 0).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[1, 4, 64]));
+        assert_eq!(k.shape().dim(0).unwrap(), 1);
+        assert_eq!(v.shape().dim(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_moe_forward_output_shape() {
+        let config = make_moe_config();
+        let mut block = Block::<CandleBackend>::new(&config, 0, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &cpu()).unwrap();
+        let (out, _, _) = block.forward(&x, None, None, 0).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[1, 4, 64]));
+    }
+
+    #[test]
+    fn test_forward_with_mask() {
+        let config = make_dense_config();
+        let mut block = Block::<CandleBackend>::new(&config, 0, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &cpu()).unwrap();
+        let mask = CandleTensor::zeros(&Shape::new(&[1, 1, 4, 4]), DType::F32, &cpu()).unwrap();
+        let (out, _, _) = block.forward(&x, Some(&mask), None, 0).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[1, 4, 64]));
+    }
+
+    #[test]
+    fn test_forward_with_kv_cache() {
+        let config = make_dense_config();
+        let mut block = Block::<CandleBackend>::new(&config, 0, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &cpu()).unwrap();
+        let (_, k, v) = block.forward(&x, None, None, 0).unwrap();
+
+        let x2 = CandleTensor::zeros(&Shape::new(&[1, 1, 64]), DType::F32, &cpu()).unwrap();
+        let (out2, k2, _) = block.forward(&x2, None, Some((&k, &v)), 4).unwrap();
+        assert_eq!(out2.shape(), &Shape::new(&[1, 1, 64]));
+        assert_eq!(k2.shape().dim(1).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_forward_single_token() {
+        let config = make_dense_config();
+        let mut block = Block::<CandleBackend>::new(&config, 0, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 1, 64]), DType::F32, &cpu()).unwrap();
+        let (out, _, _) = block.forward(&x, None, None, 0).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[1, 1, 64]));
+    }
+
+    #[test]
+    fn test_expert_interval_alternates() {
+        // with expert_interval=2, even layers are MoE, odd are dense
+        let mut config = make_moe_config();
+        config.expert_interval = Some(2);
+
+        let block_0 = Block::<CandleBackend>::new(&config, 0, &cpu()).unwrap();
+        let block_1 = Block::<CandleBackend>::new(&config, 1, &cpu()).unwrap();
+        let block_2 = Block::<CandleBackend>::new(&config, 2, &cpu()).unwrap();
+
+        assert!(matches!(block_0.ffn, FeedForwardLayer::Moe(_)));
+        assert!(matches!(block_1.ffn, FeedForwardLayer::Dense(_)));
+        assert!(matches!(block_2.ffn, FeedForwardLayer::Moe(_)));
+    }
+}
