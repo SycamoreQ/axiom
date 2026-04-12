@@ -109,7 +109,9 @@ impl Vocab {
     }
 
     pub fn size(&self) -> usize {
-        self.tokens.len()
+        //include special tokens
+        let max_special = self.special_tokens.values().copied().max().unwrap_or(0);
+        self.tokens.len().max(max_special + 1)
     }
 
     pub fn special_token_strings(&self) -> &[String] {

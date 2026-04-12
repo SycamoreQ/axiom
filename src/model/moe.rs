@@ -29,10 +29,6 @@ pub struct ExpertParallelConfig {
     pub experts_per_rank: usize,
 }
 
-// taken from mistral.rs
-// https://github.com/EricLBuehler/mistral.rs/blob/6aec940499be1cf72c628f7ddaa8b3e59bcb4fda/mistralrs-core/src/ops.rs#L482-L504
-// Define this to be generic over the Tensor type
-
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     //Total number of routed experts E.
