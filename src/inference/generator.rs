@@ -58,6 +58,10 @@ impl<B: Backend> Generator<B> {
         Ok(next_token)
     }
 
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
     pub fn run(
         &mut self,
         session: &mut Session<B>,
