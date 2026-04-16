@@ -140,6 +140,19 @@ impl<B: Backend> Attention<B> {
 
         Ok((out, k_cache, v_cache)) // (output, new_k, new_v)
     }
+
+    pub fn set_q_proj(&mut self, l: Linear<B>) {
+        self.q_proj = l;
+    }
+    pub fn set_k_proj(&mut self, l: Linear<B>) {
+        self.k_proj = l;
+    }
+    pub fn set_v_proj(&mut self, l: Linear<B>) {
+        self.v_proj = l;
+    }
+    pub fn set_o_proj(&mut self, l: Linear<B>) {
+        self.o_proj = l;
+    }
 }
 
 #[cfg(test)]

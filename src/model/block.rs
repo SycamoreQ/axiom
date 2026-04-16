@@ -78,6 +78,45 @@ impl<B: Backend> Block<B> {
 
         Ok((x, new_k, new_v))
     }
+
+    pub fn set_attn_norm(&mut self, w: B::Tensor) {
+        let eps = self.attn_norm.eps();
+        self.attn_norm = RmsNorm::new(w, eps);
+    }
+    pub fn set_ffn_norm(&mut self, w: B::Tensor) {
+        let eps = self.ffn_norm.eps();
+        self.ffn_norm = RmsNorm::new(w, eps);
+    }
+    pub fn set_attn_q(&mut self, w: B::Tensor) {
+        self.attn.set_q_proj(Linear::new(w, None));
+    }
+    pub fn set_attn_k(&mut self, w: B::Tensor) {
+        self.attn.set_k_proj(Linear::new(w, None));
+    }
+    pub fn set_attn_v(&mut self, w: B::Tensor) {
+        self.attn.set_v_proj(Linear::new(w, None));
+    }
+    pub fn set_attn_o(&mut self, w: B::Tensor) {
+        self.attn.set_o_proj(Linear::new(w, None));
+    }
+    pub fn set_ffn_gate(&mut self, w: B::Tensor) {
+        match &mut self.ffn {
+            FeedForwardLayer::Dense(ff) => ff.set_gate(Linear::new(w, None)),
+            FeedForwardLayer::Moe(_) => {}
+        }
+    }
+    pub fn set_ffn_up(&mut self, w: B::Tensor) {
+        match &mut self.ffn {
+            FeedForwardLayer::Dense(ff) => ff.set_up(Linear::new(w, None)),
+            FeedForwardLayer::Moe(_) => {}
+        }
+    }
+    pub fn set_ffn_down(&mut self, w: B::Tensor) {
+        match &mut self.ffn {
+            FeedForwardLayer::Dense(ff) => ff.set_down(Linear::new(w, None)),
+            FeedForwardLayer::Moe(_) => {}
+        }
+    }
 }
 
 #[cfg(test)]

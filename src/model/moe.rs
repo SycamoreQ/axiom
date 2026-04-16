@@ -8,6 +8,11 @@ use crate::core::tensor::{TopKLastDimOp, TopKOutput};
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
 
+/*
+The Mixture Of Expert Backend. Very derivative from what vLLM did and the LLM seriving stratergies for the Megatron Core
+of NVIDIA. Needs a lot more changes and additions but this is the basic working MoE for now.
+*/
+
 //Opaque index into the expert array. Prevents mixing expert indices
 //with arbitrary usizes at the type level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -41,6 +41,16 @@ impl<B: Backend> FeedForward<B> {
         let fused = gate.mul(&up)?;
         self.down_proj.forward(&fused)
     }
+
+    pub fn set_gate(&mut self, l: Linear<B>) {
+        self.gate_proj = l;
+    }
+    pub fn set_up(&mut self, l: Linear<B>) {
+        self.up_proj = l;
+    }
+    pub fn set_down(&mut self, l: Linear<B>) {
+        self.down_proj = l;
+    }
 }
 
 #[cfg(test)]

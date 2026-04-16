@@ -98,6 +98,51 @@ impl<B: Backend> LlamaModel<B> {
         let logits = self.lm_head.forward(&x)?;
         Ok(logits)
     }
+
+    pub fn set_tensor(
+        &mut self,
+        kind: &crate::weights::loader::LlamaTensor,
+        tensor: B::Tensor,
+    ) -> crate::core::error::Result<()> {
+        use crate::model::embedding::Embedding;
+        use crate::model::linear::Linear;
+        use crate::model::norm::RmsNorm;
+        use crate::weights::loader::{BlockLayer, LlamaTensor};
+
+        match kind {
+            LlamaTensor::TokenEmbd => {
+                self.embedding = Embedding::new(tensor);
+            }
+            LlamaTensor::OutputNorm => {
+                // RmsNorm::new takes (weight, eps) — keep existing eps
+                let eps = self.norm.eps();
+                self.norm = RmsNorm::new(tensor, eps);
+            }
+            LlamaTensor::Output => {
+                self.lm_head = Linear::new(tensor, None);
+            }
+            LlamaTensor::Block(i, layer) => {
+                let block = self.blocks.get_mut(*i).ok_or_else(|| {
+                    crate::core::error::CoreError::Internal(format!(
+                        "block index {} out of range",
+                        i
+                    ))
+                })?;
+                match layer {
+                    BlockLayer::AttnNorm => block.set_attn_norm(tensor),
+                    BlockLayer::AttnQ => block.set_attn_q(tensor),
+                    BlockLayer::AttnK => block.set_attn_k(tensor),
+                    BlockLayer::AttnV => block.set_attn_v(tensor),
+                    BlockLayer::AttnOutput => block.set_attn_o(tensor),
+                    BlockLayer::FfnNorm => block.set_ffn_norm(tensor),
+                    BlockLayer::FfnGate => block.set_ffn_gate(tensor),
+                    BlockLayer::FfnUp => block.set_ffn_up(tensor),
+                    BlockLayer::FfnDown => block.set_ffn_down(tensor),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
