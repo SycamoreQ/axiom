@@ -14,6 +14,9 @@ use axum::{
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
+use crate::server::middleware;
+use axum::middleware as axum_mw;
+
 pub struct AppState<B: Backend> {
     pub engine: Arc<Mutex<Engine<B>>>,
     pub model_id: String,
@@ -34,6 +37,9 @@ pub fn create_router<B: Backend + 'static>(state: AppState<B>) -> Router {
         .route("/v1/models", get(list_models::<B>))
         .route("/v1/completions", post(completion::<B>))
         .route("/v1/chat/completions", post(chat_completion::<B>))
+        .layer(axum_mw::from_fn(middleware::log_request))
+        .layer(axum_mw::from_fn(middleware::request_id))
+        .layer(middleware::cors_layer())
         .with_state(shared)
 }
 
@@ -48,8 +54,6 @@ pub async fn serve<B: Backend + 'static>(
         .await
         .map_err(|e| ServerError::Bind(std::io::Error::new(std::io::ErrorKind::Other, e)))
 }
-
-// ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn health() -> impl IntoResponse {
     (
@@ -194,8 +198,6 @@ fn uuid() -> String {
         .as_nanos();
     format!("cmpl-{:x}", t)
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
