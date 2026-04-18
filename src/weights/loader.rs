@@ -195,7 +195,7 @@ fn bytes_f16_to_f32_tensor<B: Backend>(
 
 //Load raw bytes from GGUF and produce a F32 backend tensor.
 //Quantized types are stubbed with TODO — they need dequantization kernels.
-fn load_bytes_as_tensor<B: Backend>(
+pub fn load_bytes_as_tensor<B: Backend>(
     data: &[u8],
     info: &crate::weights::gguf::GgufTensorInfo,
     device: &Device,

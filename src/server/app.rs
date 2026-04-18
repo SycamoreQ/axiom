@@ -33,13 +33,19 @@ pub enum ServerError {
 pub fn create_router<B: Backend + 'static>(state: AppState<B>) -> Router {
     let shared = Arc::new(state);
     Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(list_models::<B>))
-        .route("/v1/completions", post(completion::<B>))
-        .route("/v1/chat/completions", post(chat_completion::<B>))
-        .layer(axum_mw::from_fn(middleware::log_request))
-        .layer(axum_mw::from_fn(middleware::request_id))
-        .layer(middleware::cors_layer())
+        .route("/health", get(crate::server::routes::health))
+        .route("/v1/models", get(crate::server::routes::list_models::<B>))
+        .route(
+            "/v1/completions",
+            post(crate::server::routes::completion::<B>),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(crate::server::routes::chat_completion::<B>),
+        )
+        .layer(axum_mw::from_fn(crate::server::middleware::log_request))
+        .layer(axum_mw::from_fn(crate::server::middleware::request_id))
+        .layer(crate::server::middleware::cors_layer())
         .with_state(shared)
 }
 
@@ -200,13 +206,13 @@ fn uuid() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use tower::util::ServiceExt;
 
-    fn make_state() -> AppState<crate::core::backend::CandleBackend> {
+    pub fn make_state() -> AppState<crate::core::backend::CandleBackend> {
         use crate::core::backend::CandleBackend;
         use crate::core::device::Device;
         use crate::inference::engine::Engine;
