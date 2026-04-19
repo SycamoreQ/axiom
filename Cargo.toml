@@ -37,7 +37,7 @@ candle-core = { version = "0.6" }
 candle-nn = { version = "0.6" }
 
 # CUDA low-level kernel management (Phase 3)
-cudarc = { version = "0.12", features = ["cuda-12050"], optional = true }
+cudarc = { version = "0.12", features = ["cuda-12010"], optional = true }
 
 # Memory-mapped weight files (Phase 8)
 memmap2 = "0.9"
@@ -70,13 +70,13 @@ cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",
 ]
-
 # ------------------------------------------------------------------------------
 # Dev dependencies — tests and benchmarks only
 # ------------------------------------------------------------------------------
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+cc="1"
 
 # ------------------------------------------------------------------------------
 # Build profiles

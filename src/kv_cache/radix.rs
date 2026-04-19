@@ -125,3 +125,196 @@ impl<V> RadixTree<V> {
         }
     }
 }
+
+// radix.rs tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── insert + get ──
+
+    #[test]
+    fn test_insert_and_get() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 42);
+        assert_eq!(tree.get(&[1, 2, 3]), Some(&42));
+    }
+
+    #[test]
+    fn test_get_missing_returns_none() {
+        let tree: RadixTree<u32> = RadixTree::new();
+        assert_eq!(tree.get(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn test_get_partial_path_returns_none() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 42);
+        // [1, 2] exists as a node but has no value
+        assert_eq!(tree.get(&[1, 2]), None);
+    }
+
+    #[test]
+    fn test_insert_multiple_sequences() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 10);
+        tree.insert(&[1, 2, 4], 20);
+        tree.insert(&[5, 6], 30);
+        assert_eq!(tree.get(&[1, 2, 3]), Some(&10));
+        assert_eq!(tree.get(&[1, 2, 4]), Some(&20));
+        assert_eq!(tree.get(&[5, 6]), Some(&30));
+    }
+
+    #[test]
+    fn test_insert_overwrites_existing() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2], 10);
+        tree.insert(&[1, 2], 99);
+        assert_eq!(tree.get(&[1, 2]), Some(&99));
+    }
+
+    #[test]
+    fn test_insert_empty_tokens() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[], 7);
+        assert_eq!(tree.get(&[]), Some(&7));
+    }
+
+    // ── prefix_match ──
+
+    #[test]
+    fn test_prefix_match_exact() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 42);
+        let (val, len) = tree.prefix_match(&[1, 2, 3]);
+        assert_eq!(val, Some(&42));
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn test_prefix_match_partial() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 42);
+        // query longer than stored — should still match at [1,2,3]
+        let (val, len) = tree.prefix_match(&[1, 2, 3, 4, 5]);
+        assert_eq!(val, Some(&42));
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn test_prefix_match_no_match() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 42);
+        let (val, len) = tree.prefix_match(&[9, 9, 9]);
+        assert_eq!(val, None);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn test_prefix_match_returns_deepest_value() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2], 10);
+        tree.insert(&[1, 2, 3], 20);
+        // query [1, 2, 3, 4] should match at depth 3
+        let (val, len) = tree.prefix_match(&[1, 2, 3, 4]);
+        assert_eq!(val, Some(&20));
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn test_prefix_match_intermediate_node_with_value() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1], 5);
+        tree.insert(&[1, 2, 3], 15);
+        let (val, len) = tree.prefix_match(&[1, 2]);
+        // [1] has a value, [1,2] does not — best match is at depth 1
+        assert_eq!(val, Some(&5));
+        assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn test_prefix_match_empty_tree() {
+        let tree: RadixTree<u32> = RadixTree::new();
+        let (val, len) = tree.prefix_match(&[1, 2, 3]);
+        assert_eq!(val, None);
+        assert_eq!(len, 0);
+    }
+
+    // ── remove ──
+
+    #[test]
+    fn test_remove_existing() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 42);
+        let removed = tree.remove(&[1, 2, 3]);
+        assert_eq!(removed, Some(42));
+        assert_eq!(tree.get(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn test_remove_missing_returns_none() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        assert_eq!(tree.remove(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn test_remove_does_not_affect_siblings() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 10);
+        tree.insert(&[1, 2, 4], 20);
+        tree.remove(&[1, 2, 3]);
+        assert_eq!(tree.get(&[1, 2, 4]), Some(&20));
+    }
+
+    #[test]
+    fn test_remove_parent_does_not_affect_child() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2], 10);
+        tree.insert(&[1, 2, 3], 20);
+        tree.remove(&[1, 2]);
+        assert_eq!(tree.get(&[1, 2, 3]), Some(&20));
+        assert_eq!(tree.get(&[1, 2]), None);
+    }
+
+    // ── evict_lru ──
+
+    #[test]
+    fn test_evict_lru_empty_tree_returns_none() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        assert_eq!(tree.evict_lru(), None);
+    }
+
+    #[test]
+    fn test_evict_lru_single_entry() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1, 2, 3], 42);
+        let evicted = tree.evict_lru();
+        assert_eq!(evicted, Some(42));
+        assert_eq!(tree.get(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn test_evict_lru_removes_oldest() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1], 10);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        tree.insert(&[2], 20);
+        // [1] was inserted first so it is the oldest
+        let evicted = tree.evict_lru();
+        assert_eq!(evicted, Some(10));
+        // [2] should still be present
+        assert_eq!(tree.get(&[2]), Some(&20));
+    }
+
+    #[test]
+    fn test_evict_lru_twice() {
+        let mut tree: RadixTree<u32> = RadixTree::new();
+        tree.insert(&[1], 10);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        tree.insert(&[2], 20);
+        tree.evict_lru(); // removes [1]
+        tree.evict_lru(); // removes [2]
+        assert_eq!(tree.get(&[1]), None);
+        assert_eq!(tree.get(&[2]), None);
+    }
+}

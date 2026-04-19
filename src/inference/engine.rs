@@ -4,6 +4,7 @@ use crate::inference::batch::Batch;
 use crate::inference::generator::Generator;
 use crate::inference::sampler::{Sampler, SamplerConfig};
 use crate::inference::session::{Session, SessionId, SessionStatus};
+use crate::kv_cache::manager::KVManager;
 use crate::model::model::LlamaModel;
 use crate::tokenizer::tokenizer::{EncodeOptions, Tokenizer};
 
