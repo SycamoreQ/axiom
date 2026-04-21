@@ -5,6 +5,7 @@
 // arXiv:2604.06370
 // =============================================================================
 
+#include <cfloat>
 #include <float.h>
 #include <cuda_fp16.h>
 
@@ -22,7 +23,7 @@
 __device__ __forceinline__ float ra_warp_sum(float val) {
     #pragma unroll
    for (int offset = 16 ;  offset > 0; offset >>=1)
-       val += __shfl_xor_sync(0xfffffff, val , offset);
+       val += __shfl_xor_sync(0xffffffff, val , offset);
    return val
 }
 
@@ -51,7 +52,7 @@ __device__ __forceinline__ void ra_load_base_tile(
         int kv_pos = tile_start + t;
         int page_idx = kv_pos / block_size;
         int page_off = kv_pos % block_size;
-        int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+        int phys_block = base_block_table[page_idx];
         int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
         __half2 h2 = *reinterpret_cast<const __half2*>(&b_cache[base]);
         s_kv[t * kv_stride + d]     = h2.x;
@@ -83,9 +84,10 @@ __device__ __forceinline__ void ra_load_residual_tile(
     const int total_h2 = total_elems / 2;
 
     for (int idx = tid; idx < total_h2; idx += blockDim.x) {
+        int elem = idx*2
         //Map linear index to tile-local (t, d)
-        int t = (idx * 2) / head_dim;
-        int d = (idx * 2) % head_dim;
+        int t = elem / head_dim;
+        int d = elem % head_dim;
 
         //Map tile-local to global sequence position
         int kv_pos = tile_start + t;
@@ -151,6 +153,8 @@ __global__ void residual_attention_decode_f16io_kernel(
     const int warp_id     = tid / 32;
     const int lane_id     = tid % 32;
     const int heads_per_group = num_heads / num_kv_heads;
+    const int half2_iters = (head_dim + 63) / 64
+    const int num_tiles = (context_len + RA_BC - 1) / RA_BC;
 
     // --- shared memory ---
     extern __shared__ char smem_raw[];
@@ -187,31 +191,86 @@ __global__ void residual_attention_decode_f16io_kernel(
     // TODO: normalize head_acc by head_row_sum and write f16 output
     //
 
-    const num_heads_per_group = num_heads/num_kv_heads;
-    #pragma unroll
-    for (int h = 0; h <= 4 ; ++h){
-        int q_head_idx = (kv_head_idx * heads_per_group) + h;
+    const int heads_per_group = num_heads / num_kv_heads;
+    __half q_reg[RA_GQA_MAX_HPG][4];  // declare before the loop
 
-        const __half* q_ptr = Q + (seq_idx * q_stride_seq)
-                                    + (q_head_idx * q_stride_head)
-                                    + d_offset;
-
-            // 3. Vectorized 64-bit load (4 * 16-bit __half = 64 bits)
-            // Using int2 tells the hardware to perform a single LDG.E.64 instruction
-            *reinterpret_cast<int2*>(&q_reg[h][0]) = *reinterpret_cast<const int2*>(q_ptr);
-
+    for (int h = 0; h < heads_per_group && h < RA_GQA_MAX_HPG; ++h) {
+        int q_head_idx = kv_head_idx * heads_per_group + h;
+        int q_base = (seq_idx * num_heads + q_head_idx) * head_dim;
+        // load 4 halfs (8 bytes) -- lane_id selects which 4 elements
+        int d = lane_id * 4;  // you need to decide your register layout here
+        if (d < head_dim) {
+            *reinterpret_cast<int2*>(&q_reg[h][0]) =
+                *reinterpret_cast<const int2*>(&query[q_base + d]);
+        }
     }
 
-    float head_row_max[RA_GQA_MAX_HPG];
-    float head_row_sum[RA_GQA_MAX_HPG];
-    float head_acc[RA_GQA_MAX_HPG][4];
+    for (int g = 0; g < heads_per_group && g < RA_GQA_MAX_HPG; g++) {
+        head_row_max[g] = -FLT_MAX;
+        head_row_sum[g] = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) head_acc[g][r] = 0.0f;
+    }
 
     for (int g = 0; g < heads_per_group && g < RA_GQA_MAX_HPG ; g++) {
         int g_head = kv_head_idx* heads_per_group + g;
         int q_base = (seq_idx * num_heads + g_head) * head_dim;
-        #pragma unroll 
-        for (int r = 0; r < half2_iters )
+        #pragma unroll
+        for (int r = 0; r < half2_iters && r < 2 ; r ++) {
+            int d = lane_id*2 + r * 64;
+            if (d + 1 < head_dim){
+                q_reg[g][r*2] = __half2float(query[q_base + d]) * scale;
+                q_reg[g][r*2 + 1] = --half2float(query[q_base + d + 1]) * scale;
+            }
+            else if(d < head_dim) {
+                q_reg[g][r*2] = __half2float(query[q_base + d]) * scale;
+                q_reg[g][r*2 +1] = 0.0f;
+            }
+            else{
+                q_regs[g][r*2]   = 0.0f;
+                q_regs[g][r*2+1] = 0.0f;
+            }
+        }
+
+        head_row_max[g] = -FLT_MAX;
+        head_row_sum[g] = 0.0f;
+
+        #pragma unroll
+        for (int r = 0 ; r < 4 ; r ++) head_acc[g][r] = 0.0f;
     }
+
+    for (int tile = 0 ; tile < num_tile ; tile ++ ){
+        const int tile_start = tile * RA_BC;
+        const int tile_len = min(RA_BC , base_context_len - tile_start);
+
+        ra_load_base_tile(int *s_buf, const int *b_cache, const int *base_block_table, int kv_head_idx, int tile_start, int tile_len,
+            int head_dim, int num_kv_heads, int block_size, int tid);
+
+        __syncthreads();
+
+        for (int base_t = 0; base_t < tile_len; base_t += FA3_WARPS) {
+            int t = base_t + warp_id;
+            if (t < tile_len) {
+                float dot = 0.0f ;
+                for (nt r = 0 ; r < half2_iters && r<2; r ++){
+                    int d = lane_id * 2 + r*64;
+                    if (d + 1 < head_dim) {
+                        dot += q_reg[r * 2] * __half2float(s_bK[t * kv_stride + d]);
+                        dot += q_reg[r*2 + 1] * __half2float(s_bK[t * kv_stride + d + 1]);
+                    }
+                    else if (d < head_dim) {
+                        dot += q_reg[r * 2] * __half2float(s_bK[t + kv_stride + d]);
+                    }
+                }
+
+                dot = ra_warp_sum(dot);
+                if (lane_id == 0 ) s_score[t] = dot;
+            }
+        }
+
+        __syncthreads();
+    }
+
 }
 
 
