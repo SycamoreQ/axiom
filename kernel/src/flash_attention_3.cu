@@ -29,8 +29,9 @@
 
 __device__ __forceinline__ float fa3_warp_sum(float val) {
     #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
+    for (int offset = 16; offset > 0; offset >>= 1){
         val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
     return val;
 }
 
