@@ -29,7 +29,7 @@ fn main() {
     let ptx_path = PathBuf::from(&out_dir).join("axiom_kernels.ptx");
     let sources = cu_sources();
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_string());
-    let mut command = Command::new(nvcc_path);
+    let mut command = Command::new(nvcc_path());
     command
         .arg("-ptx")
         .arg(format!("-arch={}", arch))
@@ -47,6 +47,6 @@ fn main() {
     }
     println!("cargo:rustc-env=AXIOM_KERNELS_PTX={}", ptx_path.display());
     for source in &sources {
-        println!("cargo:rerun-if-changed={}", source);
+        println!("cargo:rerun-if-changed={:?}", source);
     }
 }
