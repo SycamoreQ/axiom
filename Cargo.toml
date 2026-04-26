@@ -33,8 +33,8 @@ fancy-regex = "0.13"
 
 # Tensor backend — Candle (HuggingFace)
 # CPU-only for now, CUDA feature enabled in the cuda profile below
-candle-core = { version = "0.6" }
-candle-nn = { version = "0.6" }
+candle-core = { version = "0.6", default-features = false }
+candle-nn   = { version = "0.6", default-features = false }
 
 # CUDA low-level kernel management (Phase 3)
 cudarc = { version = "0.12", features = ["cuda-version-from-build-system"], optional = true }
