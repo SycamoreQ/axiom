@@ -25,6 +25,7 @@
 //   Dao et al., FlashAttention-3 (2024)
 //   NVIDIA Hopper TMA White Paper
 //   NVIDIA Blackwell Architecture Technical Brief
+//
 
 #include <cfloat>
 #include <float.h>
