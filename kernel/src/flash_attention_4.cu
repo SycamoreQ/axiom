@@ -59,6 +59,55 @@
 // Shared memory layout
 // Declared as a struct so the compiler can reason about alignment.
 // Instantiated as a static extern __shared__ array in the kernel.
+// Only producer warpgroup threads call this.
+
+__device__ __forceinline__ float fa4_warp_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    return val;
+}
+
+__device__ __forceinline__ float fa4_warp_max(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
+    return val;
+}
+
+// Block-level reduction over the FA4_WARPS warp slots.
+// Uses smem->warp[] as scratch — only consumer threads call this.
+__device__ __forceinline__ float fa4_block_reduce_max(
+    float val, int tid, int lane_id, int warp_id, float* s_warp
+) {
+    val = fa4_warp_max(val);
+    if (lane_id == 0) s_warp[warp_id] = val;
+    __syncthreads();
+    if (tid == 0) {
+        float m = s_warp[0];
+        #pragma unroll
+        for (int w = 1; w < FA4_WARPS; w++) m = fmaxf(m, s_warp[w]);
+        s_warp[0] = m;
+    }
+    __syncthreads();
+    return s_warp[0];
+}
+
+__device__ __forceinline__ float fa4_block_reduce_sum(
+    float val, int tid, int lane_id, int warp_id, float* s_warp
+) {
+    val = fa4_warp_sum(val);
+    if (lane_id == 0) s_warp[warp_id] = val;
+    __syncthreads();
+    if (tid == 0) {
+        float s = s_warp[0];
+        #pragma unroll
+        for (int w = 1; w < FA4_WARPS; w++) s += s_warp[w];
+        s_warp[0] = s;
+    }
+    __syncthreads();
+    return s_warp[0];
+}
 struct FA4Stage {
     __half k[FA4_BC][128 + FA4_KV_PAD];   // [tile_pos][head_dim], dim capped at 128
     __half v[FA4_BC][128 + FA4_KV_PAD];
@@ -90,8 +139,8 @@ struct FA4Smem {
 //   block_table — physical block indices for this seq
 //   kv_head_idx, tile_start, tile_len, head_dim, num_kv_heads, block_size
 
-// Only producer warpgroup threads call this.
-//
+
+
 #if __CUDA_ARCH__ >= 900
     __device__ __forceinline__ void fa4_producer_load_tile(
         int            stage,
@@ -394,54 +443,6 @@ __device__ __forceinline__ void fa4_write_output(
     }
 }
 
-__device__ __forceinline__ float fa4_warp_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, offset);
-    return val;
-}
-
-__device__ __forceinline__ float fa4_warp_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
-    return val;
-}
-
-// Block-level reduction over the FA4_WARPS warp slots.
-// Uses smem->warp[] as scratch — only consumer threads call this.
-__device__ __forceinline__ float fa4_block_reduce_max(
-    float val, int tid, int lane_id, int warp_id, float* s_warp
-) {
-    val = fa4_warp_max(val);
-    if (lane_id == 0) s_warp[warp_id] = val;
-    __syncthreads();
-    if (tid == 0) {
-        float m = s_warp[0];
-        #pragma unroll
-        for (int w = 1; w < FA4_WARPS; w++) m = fmaxf(m, s_warp[w]);
-        s_warp[0] = m;
-    }
-    __syncthreads();
-    return s_warp[0];
-}
-
-__device__ __forceinline__ float fa4_block_reduce_sum(
-    float val, int tid, int lane_id, int warp_id, float* s_warp
-) {
-    val = fa4_warp_sum(val);
-    if (lane_id == 0) s_warp[warp_id] = val;
-    __syncthreads();
-    if (tid == 0) {
-        float s = s_warp[0];
-        #pragma unroll
-        for (int w = 1; w < FA4_WARPS; w++) s += s_warp[w];
-        s_warp[0] = s;
-    }
-    __syncthreads();
-    return s_warp[0];
-}
-
 
 // Main kernel: flash_attention_4_decode_f16io_kernel
 //
@@ -513,9 +514,9 @@ flash_attention_4_decode_f16io_kernel(
             work_idx = atomicAdd(d_tile_counter, 1);
         }
         // Broadcast work_idx to all threads in the block
-        //
-        smem->pipe_tokens[0] = work_idx at tid==0,
-        __syncthreads(), work_idx = smem->pipe_tokens[0];
+        if (tid == 0) smem->pipe_tokens[0] = work_idx;
+                __syncthreads();
+                work_idx = smem->pipe_tokens[0];
 
         if (work_idx >= total_work) break;
 
@@ -523,7 +524,7 @@ flash_attention_4_decode_f16io_kernel(
         const int kv_head_idx = work_idx % num_kv_heads;
         const int ctx_len = context_lens[seq_idx];
 
-        if (ctx_len == 0) {__syncthreads(); continue};
+        if (ctx_len == 0) {__syncthreads(); continue;}
 
         const int num_tiles = (ctx_len + FA4_BC - 1) / FA4_BC;
         const int* blk_table = block_tables + seq_idx * max_blocks_per_seq;

@@ -30,9 +30,12 @@ fn main() {
     let sources = cu_sources();
     let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_string());
     let mut command = Command::new(nvcc_path());
+    let cuda_include =
+        env::var("CUDA_INCLUDE").unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
     command
         .arg("-ptx")
         .arg(format!("-arch={}", arch))
+        .arg(format!("-I{}", cuda_include))
         .arg("-code=sm_80,sm_89,sm_90,sm_100")
         .arg("--expt-relaxed-constexpr")
         .arg("-o")
