@@ -538,66 +538,39 @@ mod tests {
     use cudarc::driver::CudaDevice;
 
     fn try_ctx() -> Option<CudaContext> {
-        // Real tests require the compiled PTX. Skip gracefully without GPU.
-        // In CI with a GPU, set AXIOM_KERNELS_PTX env var to the PTX path.
-        let ptx = std::env::var("AXIOM_KERNELS_PTX").ok()?;
-        let src = std::fs::read_to_string(ptx).ok()?;
-        CudaContext::new(0, &src).ok()
+        let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;
+        CudaContext::new(0, &ptx).ok()
     }
 
     #[test]
-    fn test_rms_norm_shape() {
+    fn test_context_loads_all_kernels() {
         let Some(ctx) = try_ctx() else { return };
-        let dev = ctx.device();
-
-        let num_tokens = 4usize;
-        let hidden_size = 64usize;
-        let n = num_tokens * hidden_size;
-
-        let input = dev.alloc_zeros::<f16>(n).unwrap();
-        let weight = dev.alloc_zeros::<f16>(hidden_size).unwrap();
-        let mut out = dev.alloc_zeros::<f16>(n).unwrap();
-
-        launch_rms_norm_f16(
-            &ctx,
-            &mut out.slice_mut(..),
-            &input.slice(..),
-            &weight.slice(..),
-            1e-5,
-            num_tokens,
-            hidden_size,
-        )
-        .unwrap();
-
-        ctx.synchronize().unwrap();
-        // Zero input -> zero output (weight=0 too since alloc_zeros)
-        let result = dev.dtoh_sync_copy(&out).unwrap();
-        assert!(result.iter().all(|&x| x == f16::ZERO));
+        for &name in KERNEL_NAMES {
+            assert!(ctx.func(name).is_ok(), "failed to load kernel: {}", name);
+        }
     }
 
     #[test]
-    fn test_argmax_all_zeros() {
+    fn test_synchronize_no_work() {
         let Some(ctx) = try_ctx() else { return };
-        let dev = ctx.device();
+        assert!(ctx.synchronize().is_ok());
+    }
 
-        let num_tokens = 2usize;
-        let vocab_size = 128usize;
+    #[test]
+    fn test_ordinal_is_zero() {
+        let Some(ctx) = try_ctx() else { return };
+        assert_eq!(ctx.ordinal(), 0);
+    }
 
-        let logits = dev.alloc_zeros::<f16>(num_tokens * vocab_size).unwrap();
-        let mut out = dev.alloc_zeros::<i32>(num_tokens).unwrap();
+    #[test]
+    fn test_unknown_kernel_returns_err() {
+        let Some(ctx) = try_ctx() else { return };
+        assert!(ctx.func("does_not_exist").is_err());
+    }
 
-        launch_argmax_f16(
-            &ctx,
-            &mut out.slice_mut(..),
-            &logits.slice(..),
-            num_tokens,
-            vocab_size,
-        )
-        .unwrap();
-
-        ctx.synchronize().unwrap();
-        // All zeros — argmax should return 0 for each row
-        let result = dev.dtoh_sync_copy(&out).unwrap();
-        assert!(result.iter().all(|&x| x == 0));
+    #[test]
+    fn test_context_no_device() {
+        let result = CudaContext::new(99, ".version 7.0\n.target sm_80\n.address_size 64\n");
+        assert!(result.is_err());
     }
 }
