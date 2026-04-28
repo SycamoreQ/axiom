@@ -15,6 +15,7 @@ pub struct Vocab {
     special_tokens: HashMap<String, TokenID>,
     special_token_strings: Vec<String>, // sorted longest-first
     special_token_ids: HashSet<TokenID>,
+    special_token_ids_rev: HashMap<TokenID, String>,
     bos_id: Option<TokenID>,
     eos_id: Option<TokenID>,
     pad_id: Option<TokenID>,
@@ -37,9 +38,12 @@ impl Vocab {
             .map(|(i, s)| (s.clone(), i))
             .collect();
 
-        let special_tokens_map: HashMap<String, TokenID> = special_tokens //
-            .into_iter()
+        let special_token_ids_rev: HashMap<TokenID, String> = special_tokens
+            .iter()
+            .map(|(s, id)| (*id, s.clone()))
             .collect();
+
+        let special_tokens_map: HashMap<String, TokenID> = special_tokens.into_iter().collect();
 
         let mut special_token_strings: Vec<String> = special_tokens_map.keys().cloned().collect();
         special_token_strings.sort_by_key(|k| std::cmp::Reverse(k.len()));
@@ -57,6 +61,7 @@ impl Vocab {
             special_tokens: special_tokens_map,
             special_token_strings,
             special_token_ids,
+            special_token_ids_rev,
             bos_id,
             eos_id,
             pad_id,
@@ -82,7 +87,11 @@ impl Vocab {
     }
 
     pub fn id_to_token(&self, id: TokenID) -> Option<&str> {
-        self.tokens.get(id).map(|s| s.as_str())
+        if let Some(s) = self.tokens.get(id) {
+            Some(s.as_str())
+        } else {
+            self.special_token_ids_rev.get(&id).map(|s| s.as_str())
+        }
     }
 
     pub fn score(&self, id: TokenID) -> Option<f32> {
@@ -109,9 +118,7 @@ impl Vocab {
     }
 
     pub fn size(&self) -> usize {
-        //include special tokens
-        let max_special = self.special_tokens.values().copied().max().unwrap_or(0);
-        self.tokens.len().max(max_special + 1)
+        self.tokens.len()
     }
 
     pub fn special_token_strings(&self) -> &[String] {
