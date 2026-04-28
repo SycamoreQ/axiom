@@ -28,7 +28,11 @@ pub mod context;
 #[cfg(feature = "cuda")]
 pub mod error;
 #[cfg(feature = "cuda")]
+pub mod fork_manager;
+#[cfg(feature = "cuda")]
 pub mod kernels;
+#[cfg(feature = "cuda")]
+pub mod paged_session;
 
 #[cfg(feature = "cuda")]
 pub use allocator::{BlockId, BlockTable, PagedBlockAllocator};
@@ -38,15 +42,8 @@ pub use context::CudaContext;
 pub use error::CudaError;
 #[cfg(feature = "cuda")]
 pub use kernels::{
-    launch_argmax_f16,
-    launch_copy_blocks_f16,
-    launch_embedding_gather_f16,
-    launch_flash_attention_3,
-    launch_flash_attention_3_gqa,
-    launch_flash_attention_4,
-    launch_fused_residual_rmsnorm_f16,
-    launch_residual_attention,
-    launch_reshape_and_cache_f16,
-    launch_rms_norm_f16,
-    launch_rotary_embedding_f16,
+    launch_argmax_f16, launch_copy_blocks_f16, launch_embedding_gather_f16,
+    launch_flash_attention_3, launch_flash_attention_3_gqa, launch_flash_attention_4,
+    launch_fused_residual_rmsnorm_f16, launch_reshape_and_cache_f16, launch_residual_attention,
+    launch_rms_norm_f16, launch_rotary_embedding_f16,
 };

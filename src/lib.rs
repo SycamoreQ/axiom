@@ -1,4 +1,5 @@
 pub mod core;
+pub mod cuda;
 pub mod inference;
 pub mod kv_cache;
 pub mod lora;

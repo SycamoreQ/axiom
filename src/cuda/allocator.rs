@@ -187,7 +187,7 @@ impl BlockTable {
     }
 
     pub fn push_block(&mut self, id: BlockId) {
-        self.physical.push(id.0 as i32);
+        self.physical.push(id.0 as i32)
     }
 
     pub fn logical_block_for(&self, token_pos: usize, block_size: usize) -> usize {
