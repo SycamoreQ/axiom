@@ -39,11 +39,8 @@ pub fn launch_rms_norm_f16(
 
     let f = ctx.func("rms_norm_f16_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
-            cfg,
-            (output, input, weight, eps, hidden_size as i32),
-        )
+        ctx.stream()
+            .launch(f, cfg, (output, input, weight, eps, hidden_size as i32))
     }
     .map_err(CudaError::Driver)
 }
@@ -75,8 +72,8 @@ pub fn launch_fused_residual_rmsnorm_f16(
 
     let f = ctx.func("fused_residual_rmsnorm_f16_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 output,
@@ -108,15 +105,16 @@ pub fn launch_rotary_embedding_f16(
     num_kv_heads: usize,
     head_dim: usize,
 ) -> Result<()> {
-    let cfg = LaunchConfig::call(
-        (num_tokens as u32, num_heads as u32, 1),
-        (head_dim as u32 / 2, 1, 1),
-    );
+    let cfg = LaunchConfig {
+        grid_dim: (num_tokens as u32, num_heads as u32, 1),
+        block_dim: (head_dim as u32 / 2, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
     let f = ctx.func("rotary_embedding_f16_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 query,
@@ -151,12 +149,16 @@ pub fn launch_reshape_and_cache_f16(
     head_dim: usize,
 ) -> Result<()> {
     let block = (num_kv_heads * head_dim).min(1024) as u32;
-    let cfg = LaunchConfig::call((num_tokens as u32, 1, 1), (block, 1, 1));
+    let cfg = LaunchConfig {
+        grid_dim: (num_tokens as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
     let f = ctx.func("reshape_and_cache_f16io_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 key_cache,
@@ -188,12 +190,16 @@ pub fn launch_copy_blocks_f16(
     head_dim: usize,
 ) -> Result<()> {
     let block = (block_size * num_kv_heads * head_dim).min(1024) as u32;
-    let cfg = LaunchConfig::call((num_pairs as u32, 1, 1), (block, 1, 1));
+    let cfg = LaunchConfig {
+        grid_dim: (num_pairs as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
     let f = ctx.func("copy_blocks_f16_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 key_cache,
@@ -223,12 +229,16 @@ pub fn launch_embedding_gather_f16(
     vocab_size: usize,
 ) -> Result<()> {
     let block = hidden_size.min(1024) as u32;
-    let cfg = LaunchConfig::call((num_tokens as u32, 1, 1), (block, 1, 1));
+    let cfg = LaunchConfig {
+        grid_dim: (num_tokens as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
     let f = ctx.func("embedding_gather_f16_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 output,
@@ -254,11 +264,18 @@ pub fn launch_argmax_f16(
     vocab_size: usize,
 ) -> Result<()> {
     let block = vocab_size.min(1024) as u32;
-    let cfg = LaunchConfig::call((num_tokens as u32, 1, 1), (block, 1, 1));
+    let cfg = LaunchConfig {
+        grid_dim: (num_tokens as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
     let f = ctx.func("argmax_f16_kernel")?;
-    unsafe { f.launch_on_stream(ctx.stream(), cfg, (logits, output, vocab_size as i32)) }
-        .map_err(CudaError::Driver)
+    unsafe {
+        ctx.stream()
+            .launch(f, cfg, (logits, output, vocab_size as i32))
+    }
+    .map_err(CudaError::Driver)
 }
 
 //flash_attention_3_decode_f16io_kernel (non-GQA)
@@ -297,8 +314,8 @@ pub fn launch_flash_attention_3(
 
     let f = ctx.func("flash_attention_3_decode_f16io_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 output,
@@ -356,8 +373,8 @@ pub fn launch_flash_attention_3_gqa(
 
     let f = ctx.func("flash_attention_3_decode_gqa_f16io_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 output,
@@ -420,8 +437,8 @@ pub fn launch_residual_attention(
 
     let f = ctx.func("residual_attention_decode_f16io_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 output,
@@ -506,8 +523,8 @@ pub fn launch_flash_attention_4(
 
     let f = ctx.func("flash_attention_4_decode_f16io_kernel")?;
     unsafe {
-        f.launch_on_stream(
-            ctx.stream(),
+        ctx.stream().launch(
+            f,
             cfg,
             (
                 output,
@@ -545,7 +562,20 @@ mod tests {
     #[test]
     fn test_context_loads_all_kernels() {
         let Some(ctx) = try_ctx() else { return };
-        for &name in KERNEL_NAMES {
+        let kernel_names = [
+            "rms_norm_f16_kernel",
+            "fused_residual_rmsnorm_f16_kernel",
+            "rotary_embedding_f16_kernel",
+            "reshape_and_cache_f16io_kernel",
+            "copy_blocks_f16_kernel",
+            "embedding_gather_f16_kernel",
+            "argmax_f16_kernel",
+            "flash_attention_3_decode_f16io_kernel",
+            "flash_attention_3_decode_gqa_f16io_kernel",
+            "residual_attention_decode_f16io_kernel",
+            "flash_attention_4_decode_f16io_kernel",
+        ];
+        for &name in kernel_names.iter() {
             assert!(ctx.func(name).is_ok(), "failed to load kernel: {}", name);
         }
     }
