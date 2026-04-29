@@ -107,28 +107,28 @@ impl<B: Backend> ForkManager<B> {
             .lock()
             .map_err(|_| CudaError::Internal("Allocator mutex poisoned".into()))?;
 
-        if allocator.is_shared(BlockId(old_phys_id as usize)) {
-            let new_phys_id = allocator.alloc()?.0 as i64;
+        if allocator.is_shared(old_phys_id) {
+            let new_phys_id = allocator.alloc()?;
 
-            let mapping_host = [old_phys_id, new_phys_id];
-            let mapping_dev = ctx
+            let mapping: Vec<i64> = vec![old_phys_id.0 as i64, new_phys_id.0 as i64];
+            let mapping_buf = ctx
                 .device()
-                .alloc_copy(&mapping_host)
+                .htod_sync_copy(&mapping)
                 .map_err(CudaError::Driver)?;
 
             launch_copy_blocks_f16(
                 ctx,
-                &mut allocator.k_cache.view_mut(),
-                &mut allocator.v_cache.view_mut(),
-                &mapping_dev.view(),
+                &mut allocator.k_cache.slice_mut(..),
+                &mut allocator.v_cache.slice_mut(..),
+                &mapping_buf.slice(..),
+                1, // num_pairs
                 allocator.block_size,
                 allocator.num_kv_heads,
                 allocator.head_dim,
             )?;
 
-            // 4. Update session table and dec_ref the old block
-            session.block_table.physical[block_idx] = new_phys_id as i32;
-            allocator.dec_ref(BlockId((old_phys_id))?;
+            session.block_table.physical[block_idx] = new_phys_id.0 as i32;
+            allocator.dec_ref(old_phys_id)?;
         }
 
         Ok(())
@@ -157,7 +157,6 @@ impl<B: Backend> ForkManager<B> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,22 +169,24 @@ mod tests {
         let dev = Arc::new(CudaDevice::new(0).ok()?);
         let alloc = PagedBlockAllocator::new(&dev, 32, 4, 2, 32).ok()?;
         let alloc = Arc::new(Mutex::new(alloc));
-        let fm = ForkManager::<CandleBackend>::new(
-            Arc::clone(&alloc), 100, 400
-        );
+        let fm = ForkManager::<CandleBackend>::new(Arc::clone(&alloc), 100, 400);
         Some((fm, alloc))
     }
 
     #[test]
     fn test_register_session() {
-        let Some((mut fm, _)) = try_setup() else { return };
+        let Some((mut fm, _)) = try_setup() else {
+            return;
+        };
         fm.register_session(1).unwrap();
         assert!(fm.get_session(1).is_some());
     }
 
     #[test]
     fn test_register_session_twice_is_noop() {
-        let Some((mut fm, _)) = try_setup() else { return };
+        let Some((mut fm, _)) = try_setup() else {
+            return;
+        };
         fm.register_session(1).unwrap();
         fm.register_session(1).unwrap();
         assert!(fm.get_session(1).is_some());
@@ -193,12 +194,16 @@ mod tests {
 
     #[test]
     fn test_fork_inherits_parent_blocks() {
-        let Some((mut fm, alloc)) = try_setup() else { return };
+        let Some((mut fm, alloc)) = try_setup() else {
+            return;
+        };
         fm.register_session(1).unwrap();
         {
             let mut a = alloc.lock().unwrap();
-            fm.get_session_mut(1).unwrap()
-                .allocate_blocks(&mut a, 6).unwrap();
+            fm.get_session_mut(1)
+                .unwrap()
+                .allocate_blocks(&mut a, 6)
+                .unwrap();
         }
         let ctx_ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
         let Some(ptx) = ctx_ptx else { return };
@@ -206,18 +211,22 @@ mod tests {
         let Some(ctx) = ctx else { return };
         fm.fork_session(1, 2, &ctx).unwrap();
         let parent_blocks = fm.get_session(1).unwrap().block_table.physical.clone();
-        let child_blocks  = fm.get_session(2).unwrap().block_table.physical.clone();
+        let child_blocks = fm.get_session(2).unwrap().block_table.physical.clone();
         assert_eq!(parent_blocks, child_blocks);
     }
 
     #[test]
     fn test_fork_increments_ref_count() {
-        let Some((mut fm, alloc)) = try_setup() else { return };
+        let Some((mut fm, alloc)) = try_setup() else {
+            return;
+        };
         fm.register_session(1).unwrap();
         {
             let mut a = alloc.lock().unwrap();
-            fm.get_session_mut(1).unwrap()
-                .allocate_blocks(&mut a, 4).unwrap();
+            fm.get_session_mut(1)
+                .unwrap()
+                .allocate_blocks(&mut a, 4)
+                .unwrap();
         }
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
         let Some(ptx) = ptx else { return };
@@ -226,19 +235,23 @@ mod tests {
         fm.fork_session(1, 2, &ctx).unwrap();
         let a = alloc.lock().unwrap();
         let block_id = crate::cuda::allocator::BlockId(
-            fm.get_session(1).unwrap().block_table.physical[0] as usize
+            fm.get_session(1).unwrap().block_table.physical[0] as usize,
         );
         assert_eq!(a.ref_count(block_id), 2);
     }
 
     #[test]
     fn test_free_parent_after_fork_keeps_child() {
-        let Some((mut fm, alloc)) = try_setup() else { return };
+        let Some((mut fm, alloc)) = try_setup() else {
+            return;
+        };
         fm.register_session(1).unwrap();
         {
             let mut a = alloc.lock().unwrap();
-            fm.get_session_mut(1).unwrap()
-                .allocate_blocks(&mut a, 4).unwrap();
+            fm.get_session_mut(1)
+                .unwrap()
+                .allocate_blocks(&mut a, 4)
+                .unwrap();
         }
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
         let Some(ptx) = ptx else { return };
@@ -249,14 +262,16 @@ mod tests {
         // child blocks should still have ref_count 1
         let a = alloc.lock().unwrap();
         let block_id = crate::cuda::allocator::BlockId(
-            fm.get_session(2).unwrap().block_table.physical[0] as usize
+            fm.get_session(2).unwrap().block_table.physical[0] as usize,
         );
         assert_eq!(a.ref_count(block_id), 1);
     }
 
     #[test]
     fn test_free_session_unknown_id_returns_err() {
-        let Some((mut fm, _)) = try_setup() else { return };
+        let Some((mut fm, _)) = try_setup() else {
+            return;
+        };
         assert!(fm.free_session(99).is_err());
     }
 
@@ -268,7 +283,9 @@ mod tests {
 
     #[test]
     fn test_fork_unknown_parent_returns_err() {
-        let Some((mut fm, _)) = try_setup() else { return };
+        let Some((mut fm, _)) = try_setup() else {
+            return;
+        };
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
         let Some(ptx) = ptx else { return };
         let ctx = crate::cuda::context::CudaContext::new(0, &ptx).ok();
