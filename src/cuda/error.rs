@@ -26,6 +26,9 @@ pub enum CudaError {
 
     #[error("internal cuda error: {0}")]
     Internal(String),
+
+    #[error("session not found: {0}")]
+    InvalidSession(u64),
 }
 
 pub type Result<T> = std::result::Result<T, CudaError>;

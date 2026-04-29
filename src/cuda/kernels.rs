@@ -11,13 +11,10 @@ Responsibilities:
 1. Compute grid / block dims from runtime shapes
 2. Compute dynamic shared memory size if needed
 3. Retrieve the CudaFunction from context
-4. Call launch or launch_on_stream with the argument tuple
+4. Call launch with the argument tuple via the device
 */
 
 //rms_norm_f16_kernel
-//Grid:  (num_tokens, 1, 1)
-//Block: (min(hidden_size, 1024), 1, 1)
-//Smem:  block_dim * sizeof(f32)
 pub fn launch_rms_norm_f16(
     ctx: &CudaContext,
     output: &mut CudaViewMut<f16>,
@@ -39,16 +36,13 @@ pub fn launch_rms_norm_f16(
 
     let f = ctx.func("rms_norm_f16_kernel")?;
     unsafe {
-        ctx.stream()
+        ctx.device()
             .launch(f, cfg, (output, input, weight, eps, hidden_size as i32))
     }
     .map_err(CudaError::Driver)
 }
 
 //fused_residual_rmsnorm_f16_kernel
-//Grid:  (num_tokens, 1, 1)
-//Block: (min(hidden_size, 1024), 1, 1)
-//Smem:  block_dim * sizeof(f32)
 pub fn launch_fused_residual_rmsnorm_f16(
     ctx: &CudaContext,
     output: &mut CudaViewMut<f16>,
@@ -72,7 +66,7 @@ pub fn launch_fused_residual_rmsnorm_f16(
 
     let f = ctx.func("fused_residual_rmsnorm_f16_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
@@ -90,9 +84,6 @@ pub fn launch_fused_residual_rmsnorm_f16(
 }
 
 //rotary_embedding_f16_kernel
-//Grid:  (num_tokens, num_heads, 1)
-//Block: (head_dim / 2, 1, 1)
-//Smem:  none
 pub fn launch_rotary_embedding_f16(
     ctx: &CudaContext,
     query: &mut CudaViewMut<f16>,
@@ -113,7 +104,7 @@ pub fn launch_rotary_embedding_f16(
 
     let f = ctx.func("rotary_embedding_f16_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
@@ -133,10 +124,6 @@ pub fn launch_rotary_embedding_f16(
 }
 
 //reshape_and_cache_f16io_kernel
-//Scatters per-token K/V into the paged cache at slot_mapping positions.
-//Grid:  (num_tokens, 1, 1)
-//Block: (min(num_kv_heads * head_dim, 1024), 1, 1)
-//Smem:  none
 pub fn launch_reshape_and_cache_f16(
     ctx: &CudaContext,
     key_cache: &mut CudaViewMut<f16>,
@@ -157,7 +144,7 @@ pub fn launch_reshape_and_cache_f16(
 
     let f = ctx.func("reshape_and_cache_f16io_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
@@ -176,14 +163,11 @@ pub fn launch_reshape_and_cache_f16(
 }
 
 //copy_blocks_f16_kernel
-//Grid:  (num_pairs, 1, 1)
-//Block: (min(block_size * num_kv_heads * head_dim, 1024), 1, 1)
-//Smem:  none
 pub fn launch_copy_blocks_f16(
     ctx: &CudaContext,
     key_cache: &mut CudaViewMut<f16>,
     value_cache: &mut CudaViewMut<f16>,
-    block_mapping: &CudaView<i64>, // [num_pairs, 2] as flat slice
+    block_mapping: &CudaView<i64>,
     num_pairs: usize,
     block_size: usize,
     num_kv_heads: usize,
@@ -198,7 +182,7 @@ pub fn launch_copy_blocks_f16(
 
     let f = ctx.func("copy_blocks_f16_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
@@ -215,10 +199,7 @@ pub fn launch_copy_blocks_f16(
     .map_err(CudaError::Driver)
 }
 
-/// embedding_gather_f16_kernel
-/// Grid:  (num_tokens, 1, 1)
-/// Block: (min(hidden_size, 1024), 1, 1)
-/// Smem:  none
+//embedding_gather_f16_kernel
 pub fn launch_embedding_gather_f16(
     ctx: &CudaContext,
     output: &mut CudaViewMut<f16>,
@@ -237,7 +218,7 @@ pub fn launch_embedding_gather_f16(
 
     let f = ctx.func("embedding_gather_f16_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
@@ -253,9 +234,6 @@ pub fn launch_embedding_gather_f16(
 }
 
 //argmax_f16_kernel
-//Grid:  (num_tokens, 1, 1)
-//Block: (min(vocab_size, 1024), 1, 1)
-//Smem:  none (uses static shared arrays in kernel)
 pub fn launch_argmax_f16(
     ctx: &CudaContext,
     output: &mut CudaViewMut<i32>,
@@ -272,18 +250,13 @@ pub fn launch_argmax_f16(
 
     let f = ctx.func("argmax_f16_kernel")?;
     unsafe {
-        ctx.stream()
+        ctx.device()
             .launch(f, cfg, (logits, output, vocab_size as i32))
     }
     .map_err(CudaError::Driver)
 }
 
-//flash_attention_3_decode_f16io_kernel (non-GQA)
-//Grid:  (num_seqs, num_heads, 1)
-//Block: (256, 1, 1)
-//Smem:  BC*(head_dim+2)*2 + BC*4 + 8*4  bytes
-//Use when num_heads == num_kv_heads.
-//For GQA (num_heads != num_kv_heads) use launch_flash_attention_3_gqa.
+//flash_attention_3_decode_f16io_kernel
 pub fn launch_flash_attention_3(
     ctx: &CudaContext,
     output: &mut CudaViewMut<f16>,
@@ -314,7 +287,7 @@ pub fn launch_flash_attention_3(
 
     let f = ctx.func("flash_attention_3_decode_f16io_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
@@ -337,10 +310,6 @@ pub fn launch_flash_attention_3(
 }
 
 //flash_attention_3_decode_gqa_f16io_kernel
-//Grid:  (num_seqs, num_kv_heads, 1)
-//Block: (256, 1, 1)
-//Smem:  BC*(head_dim+2)*2 + HPG*(BC+1)*4 + 8*4  bytes
-//Use when num_heads != num_kv_heads (GQA / MQA).
 pub fn launch_flash_attention_3_gqa(
     ctx: &CudaContext,
     output: &mut CudaViewMut<f16>,
@@ -373,7 +342,7 @@ pub fn launch_flash_attention_3_gqa(
 
     let f = ctx.func("flash_attention_3_decode_gqa_f16io_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
@@ -396,10 +365,7 @@ pub fn launch_flash_attention_3_gqa(
     .map_err(CudaError::Driver)
 }
 
-//residual_attention_decode_f16io_kernel  (ForkKV Algorithm 1)
-//Grid:  (num_seqs, num_kv_heads, 1)
-//Block: (256, 1, 1)
-//Smem:  RA_BC*(head_dim+2)*2 + HPG*(RA_BC+1)*4 + 8*4  bytes
+//residual_attention_decode_f16io_kernel
 pub fn launch_residual_attention(
     ctx: &CudaContext,
     output: &mut CudaViewMut<f16>,
@@ -437,7 +403,7 @@ pub fn launch_residual_attention(
 
     let f = ctx.func("residual_attention_decode_f16io_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
@@ -464,12 +430,7 @@ pub fn launch_residual_attention(
     .map_err(CudaError::Driver)
 }
 
-//flash_attention_4_decode_f16io_kernel  (persistent, producer/consumer)
-//Grid:  (sm_count * 2, 1, 1)   — persistent, blocks self-schedule
-//Block: (512, 1, 1)
-//Smem:  sizeof(FA4Smem) — computed below
-//d_tile_counter must be zeroed on device before each call.
-//The smem formula must match FA4Smem in flash_attention_4.cu.
+//flash_attention_4_decode_f16io_kernel
 pub fn launch_flash_attention_4(
     ctx: &CudaContext,
     output: &mut CudaViewMut<f16>,
@@ -488,12 +449,6 @@ pub fn launch_flash_attention_4(
     max_blocks_per_seq: usize,
     sm_count: usize,
 ) -> Result<()> {
-    // FA4Smem layout (must match the struct in flash_attention_4.cu):
-    //   stages[2]: each = BC * (128+2) * 2 bytes for k + same for v
-    //   q:  GQA_MAX_HPG * 128 * 2 bytes
-    //   scores: GQA_MAX_HPG * (BC+1) * 4 bytes
-    //   warp: 16 * 4 bytes
-    //   work_broadcast: 4 bytes
     const FA4_BC: usize = 64;
     const FA4_KV_PAD: usize = 2;
     const FA4_PIPE_DEPTH: usize = 2;
@@ -508,22 +463,19 @@ pub fn launch_flash_attention_4(
         + FA4_WARPS * std::mem::size_of::<f32>()
         + std::mem::size_of::<i32>();
 
-    let grid = (sm_count * 2) as u32;
-
     let cfg = LaunchConfig {
-        grid_dim: (grid, 1, 1),
+        grid_dim: ((sm_count * 2) as u32, 1, 1),
         block_dim: (512, 1, 1),
         shared_mem_bytes: smem as u32,
     };
 
-    // Zero the tile counter before launch
     ctx.device()
         .memset_zeros(d_tile_counter)
         .map_err(CudaError::Driver)?;
 
     let f = ctx.func("flash_attention_4_decode_f16io_kernel")?;
     unsafe {
-        ctx.stream().launch(
+        ctx.device().launch(
             f,
             cfg,
             (
