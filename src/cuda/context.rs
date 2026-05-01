@@ -1,7 +1,9 @@
 use crate::cuda::error::{CudaError, Result};
-use cudarc::driver::CudaContext as CuContext;
-use cudarc::driver::{CudaFunction, CudaModule, CudaStream};
+
+use cudarc::driver::{CudaDevice, CudaFunction, CudaModule, CudaStream};
+
 use cudarc::nvrtc::Ptx;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,7 +40,7 @@ pub const KERNEL_NAMES: &[&str] = &[
 pub const MODULE_NAME: &str = "axiom_kernels";
 
 pub struct CudaContext {
-    pub device: Arc<CuContext>,
+    pub device: Arc<CudaDevice>,
     pub stream: Arc<CudaStream>,
     pub module: Arc<CudaModule>,
     funcs: HashMap<&'static str, CudaFunction>,
@@ -47,16 +49,25 @@ pub struct CudaContext {
 
 impl CudaContext {
     pub fn new(ordinal: usize, ptx_src: &str) -> Result<Self> {
-        let device = CuContext::new(ordinal).map_err(CudaError::Driver)?;
+        let device = CudaDevice::new(ordinal).map_err(CudaError::Driver)?;
 
-        let stream = device.new_stream().map_err(CudaError::Driver)?;
+        let stream = device.fork_default_stream().map_err(CudaError::Driver)?;
 
         let ptx = Ptx::from_src(ptx_src);
-        let module = device.load_module(ptx).map_err(CudaError::Driver)?;
+
+        device
+            .load_ptx(ptx, MODULE_NAME, KERNEL_NAMES)
+            .map_err(CudaError::Driver)?;
+
+        let module = device.get_module(MODULE_NAME).map_err(CudaError::Driver)?;
 
         let mut funcs = HashMap::new();
+
         for &name in KERNEL_NAMES {
-            let f = device.load_function(name).map_err(CudaError::Driver)?;
+            let f = device
+                .get_func(MODULE_NAME, name)
+                .map_err(CudaError::Driver)?;
+
             funcs.insert(name, f);
         }
 
@@ -79,9 +90,11 @@ impl CudaContext {
     pub fn ordinal(&self) -> usize {
         self.ordinal
     }
-    pub fn device(&self) -> &Arc<CuContext> {
+
+    pub fn device(&self) -> &Arc<CudaDevice> {
         &self.device
     }
+
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
@@ -97,12 +110,14 @@ mod tests {
 
     fn try_ctx() -> Option<CudaContext> {
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;
+
         CudaContext::new(0, &ptx).ok()
     }
 
     #[test]
     fn test_context_loads_all_kernels() {
         let Some(ctx) = try_ctx() else { return };
+
         for &name in KERNEL_NAMES {
             assert!(ctx.func(name).is_ok(), "failed to load: {}", name);
         }
@@ -129,6 +144,7 @@ mod tests {
     #[test]
     fn test_context_no_device() {
         let result = CudaContext::new(99, ".version 7.0\n.target sm_80\n.address_size 64\n");
+
         assert!(result.is_err());
     }
 }

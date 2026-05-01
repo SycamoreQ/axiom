@@ -1,3 +1,4 @@
+use cudarc::driver::PushKernelArg;
 use cudarc::driver::{CudaView, CudaViewMut, LaunchConfig};
 use half::f16;
 
@@ -43,6 +44,7 @@ pub fn launch_rms_norm_f16(
             .arg(eps)
             .arg(hidden_size as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -81,6 +83,7 @@ pub fn launch_fused_residual_rmsnorm_f16(
             .arg(eps)
             .arg(hidden_size as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -118,6 +121,7 @@ pub fn launch_rotary_embedding_f16(
             .arg(num_kv_heads as i32)
             .arg(head_dim as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -154,6 +158,7 @@ pub fn launch_reshape_and_cache_f16(
             .arg(num_kv_heads as i32)
             .arg(head_dim as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -188,6 +193,7 @@ pub fn launch_copy_blocks_f16(
             .arg(num_kv_heads as i32)
             .arg(head_dim as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -219,6 +225,7 @@ pub fn launch_embedding_gather_f16(
             .arg(hidden_size as i32)
             .arg(vocab_size as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -246,6 +253,7 @@ pub fn launch_argmax_f16(
             .arg(output)
             .arg(vocab_size as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -297,6 +305,7 @@ pub fn launch_flash_attention_3(
             .arg(block_size as i32)
             .arg(max_blocks_per_seq as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -352,6 +361,7 @@ pub fn launch_flash_attention_3_gqa(
             .arg(max_context_len as i32)
             .arg(max_blocks_per_seq as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -416,6 +426,7 @@ pub fn launch_residual_attention(
             .arg(max_base_blocks as i32)
             .arg(max_residual_blocks as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -483,6 +494,7 @@ pub fn launch_flash_attention_4(
             .arg(block_size as i32)
             .arg(max_blocks_per_seq as i32)
             .launch(cfg)
+            .map(|_| ())
     }
     .map_err(CudaError::Driver)
 }
@@ -492,7 +504,7 @@ pub fn launch_flash_attention_4(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cudarc::driver::CudaDevice;
+    use crate::cuda::context::CudaContext;
 
     fn try_ctx() -> Option<CudaContext> {
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;

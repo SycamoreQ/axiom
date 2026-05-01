@@ -165,7 +165,7 @@ impl<B: Backend> ForkManager<B> {
 mod tests {
     use super::*;
     use crate::core::backend::CandleBackend;
-    use crate::cuda::allocator::PagedBlockAllocator;
+    use crate::cuda::allocator::{BlockId, BlockTable, PagedBlockAllocator};
     use crate::cuda::context::CudaContext;
     use std::sync::{Arc, Mutex};
 
