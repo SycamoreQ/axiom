@@ -1,6 +1,5 @@
 use crate::cuda::error::{CudaError, Result};
-use cudarc::driver::{CudaFunction, CudaModule, CudaStream};.
-use cudarc::driver::safe::CudaDevice as Device;
+use cudarc::driver::{CudaContext as GPUContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::Ptx;
 
 use std::collections::HashMap;
@@ -9,6 +8,11 @@ use std::sync::Arc;
 /*  CudaContext
 // Owns the device handle, a dedicated inference stream, and a cache of
 // loaded kernel functions. One CudaContext per GPU.
+//
+// cudarc 0.19: CudaDevice is gone. GPUContext (cudarc::driver::CudaContext)
+// now owns the device + CUDA context together. Streams are obtained from it
+// via default_stream() / new_stream(). Modules are loaded via load_module()
+// and functions via module.load_function().
 */
 
 pub const KERNEL_NAMES: &[&str] = &[
@@ -25,10 +29,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "flash_attention_4_decode_f16io_kernel",
 ];
 
-pub const MODULE_NAME: &str = "axiom_kernels";
-
 pub struct CudaContext {
-    pub device: Arc<Device>,
+    pub gpu: Arc<GPUContext>,
     pub stream: Arc<CudaStream>,
     pub module: Arc<CudaModule>,
     funcs: HashMap<&'static str, CudaFunction>,
@@ -37,36 +39,25 @@ pub struct CudaContext {
 
 impl CudaContext {
     pub fn new(ordinal: usize, ptx_src: &str) -> Result<Self> {
-        // cudarc's CudaDevice::new already returns an Arc<CudaDevice>
-        let device = Device::new(ordinal).map_err(CudaError::Driver)?;
-
-        let stream = device.fork_default_stream().map_err(CudaError::Driver)?;
-
+        let gpu: Arc<GPUContext> = GPUContext::new(ordinal).map_err(CudaError::Driver)?;
+        let stream = gpu.default_stream();
         let ptx = Ptx::from_src(ptx_src);
-
-        // Load PTX module into the device
-        device
-            .load_ptx(ptx, MODULE_NAME, KERNEL_NAMES)
-            .map_err(CudaError::Driver)?;
-
-        let module = device.get_module(MODULE_NAME).ok_or_else(|| {
-            CudaError::Internal(format!("Module {} not found after loading", MODULE_NAME))
-        })?;
+        let module: Arc<CudaModule> = gpu.load_module(ptx).map_err(CudaError::Driver)?;
 
         let mut funcs = HashMap::new();
 
         for &name in KERNEL_NAMES {
-            let f = device
-                .get_func(MODULE_NAME, name)
-                .ok_or_else(|| CudaError::KernelNotLoaded(name))?;
+            let f = module
+                .load_function(name)
+                .map_err(|_| CudaError::KernelNotLoaded(name))?;
 
             funcs.insert(name, f);
         }
 
         Ok(Self {
-            device,
+            gpu,
             stream,
-            module: Arc::new(module),
+            module,
             funcs,
             ordinal,
         })
@@ -83,8 +74,8 @@ impl CudaContext {
         self.ordinal
     }
 
-    pub fn device(&self) -> &Arc<Device> {
-        &self.device
+    pub fn gpu(&self) -> &Arc<GPUContext> {
+        &self.gpu
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {

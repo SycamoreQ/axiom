@@ -7,17 +7,26 @@
 // cuda = ["cudarc", "half"]
 //
 // [dependencies]
-// cudarc = { version = "0.12", features = ["cuda-version-from-build-system"], optional = true }
+// cudarc = { version = "0.19", features = ["cuda-version-from-build-system"], optional = true }
 // half   = { version = "2",    features = ["num-traits"],                      optional = true }
 //
 // The kernels crate (in /kernel) must be compiled to PTX before this module
 // can be used. The build.rs in the kernels crate handles this when the
 // `cuda` feature is enabled.
 //
+// cudarc 0.19 notes:
+//   - CudaDevice is gone. cudarc::driver::CudaContext (aliased as GPUContext
+//     inside context.rs) now owns both the device and the CUDA context.
+//   - Memory allocation moves from device.alloc_zeros() to stream.alloc_zeros().
+//   - Host-to-device copies use stream.clone_htod() instead of htod_sync_copy().
+//   - Modules loaded via ctx.load_module(ptx) -> Arc<CudaModule>.
+//   - Functions loaded via module.load_function(name) -> CudaFunction.
+//   - Kernel launch uses stream.launch_builder(&f).arg(...).launch(cfg).
+//
 // Typical usage:
 //
 //   let ctx = CudaContext::new(0, include_str!(...axiom_kernels.ptx...))?;
-//   let alloc = PagedBlockAllocator::new(ctx.device(), num_blocks, block_size, ...)?;
+//   let alloc = PagedBlockAllocator::new(&ctx, num_blocks, block_size, ...)?;
 //   launch_rms_norm_f16(&ctx, &mut output, &input, &weight, eps, tokens, hidden)?;
 //   ctx.synchronize()?;
 

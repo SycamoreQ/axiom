@@ -1,21 +1,14 @@
-use tracing::Instrument;
-
 use crate::core::backend::Backend;
-use crate::cuda::{BlockId, BlockTable, PagedBlockAllocator};
 use crate::cuda::context::CudaContext;
-use crate::cuda::error::Result;
+use crate::cuda::error::{CudaError, Result};
 use crate::cuda::kernels::launch_copy_blocks_f16;
 use crate::cuda::paged_session::{CacheKind, PagedSession};
-use crate::inference::session::{Session, SessionId};
+use crate::cuda::{BlockId, BlockTable, PagedBlockAllocator};
 use crate::kv_cache::manager::KVConfig;
 use crate::kv_cache::manager::KVManager;
-use cudarc::driver::{CudaFunction, CudaModule, CudaStream};
-use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
-use cudarc::nvrtc::Ptx;
-use std::alloc::alloc;
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use crate::cuda::error::CudaError;
 
 pub struct ForkManager<B: Backend> {
     kv_manager: KVManager<B>,
@@ -116,9 +109,12 @@ impl<B: Backend> ForkManager<B> {
             let new_phys_id = allocator.alloc()?;
 
             let mapping: Vec<i64> = vec![old_phys_id.0 as i64, new_phys_id.0 as i64];
+
+            // cudarc 0.19: htod_sync_copy is gone. Use stream.clone_htod() instead,
+            // which copies a host slice to a new device allocation on the stream.
             let mapping_buf = ctx
-                .device()
-                .htod_sync_copy(&mapping)
+                .stream()
+                .clone_htod(&mapping)
                 .map_err(CudaError::Driver)?;
 
             launch_copy_blocks_f16(
@@ -157,6 +153,7 @@ impl<B: Backend> ForkManager<B> {
     pub fn get_session(&self, session_id: u64) -> Option<&PagedSession> {
         self.sessions.get(&session_id)
     }
+
     pub fn get_session_mut(&mut self, session_id: u64) -> Option<&mut PagedSession> {
         self.sessions.get_mut(&session_id)
     }
@@ -173,7 +170,7 @@ mod tests {
     fn try_setup() -> Option<(ForkManager<CandleBackend>, Arc<Mutex<PagedBlockAllocator>>)> {
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;
         let ctx = CudaContext::new(0, &ptx).ok()?;
-        let alloc = PagedBlockAllocator::new(ctx, 32, 4, 2, 32).ok()?;
+        let alloc = PagedBlockAllocator::new(&ctx, 32, 4, 2, 32).ok()?;
         let alloc = Arc::new(Mutex::new(alloc));
         let fm = ForkManager::<CandleBackend>::new(Arc::clone(&alloc), 100, 400);
         Some((fm, alloc))
@@ -211,9 +208,9 @@ mod tests {
                 .allocate_blocks(&mut a, 6)
                 .unwrap();
         }
-        let ctx_ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
-        let Some(ptx) = ctx_ptx else { return };
-        let ctx = crate::cuda::context::CudaContext::new(0, &ptx).ok();
+        let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
+        let Some(ptx) = ptx else { return };
+        let ctx = CudaContext::new(0, &ptx).ok();
         let Some(ctx) = ctx else { return };
         fm.fork_session(1, 2, &ctx).unwrap();
         let parent_blocks = fm.get_session(1).unwrap().block_table.physical.clone();
@@ -236,13 +233,11 @@ mod tests {
         }
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
         let Some(ptx) = ptx else { return };
-        let ctx = crate::cuda::context::CudaContext::new(0, &ptx).ok();
+        let ctx = CudaContext::new(0, &ptx).ok();
         let Some(ctx) = ctx else { return };
         fm.fork_session(1, 2, &ctx).unwrap();
         let a = alloc.lock().unwrap();
-        let block_id = crate::cuda::allocator::BlockId(
-            fm.get_session(1).unwrap().block_table.physical[0] as usize,
-        );
+        let block_id = BlockId(fm.get_session(1).unwrap().block_table.physical[0] as usize);
         assert_eq!(a.ref_count(block_id), 2);
     }
 
@@ -261,15 +256,13 @@ mod tests {
         }
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
         let Some(ptx) = ptx else { return };
-        let ctx = crate::cuda::context::CudaContext::new(0, &ptx).ok();
+        let ctx = CudaContext::new(0, &ptx).ok();
         let Some(ctx) = ctx else { return };
         fm.fork_session(1, 2, &ctx).unwrap();
         fm.free_session(1).unwrap();
         // child blocks should still have ref_count 1
         let a = alloc.lock().unwrap();
-        let block_id = crate::cuda::allocator::BlockId(
-            fm.get_session(2).unwrap().block_table.physical[0] as usize,
-        );
+        let block_id = BlockId(fm.get_session(2).unwrap().block_table.physical[0] as usize);
         assert_eq!(a.ref_count(block_id), 1);
     }
 
@@ -294,7 +287,7 @@ mod tests {
         };
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok();
         let Some(ptx) = ptx else { return };
-        let ctx = crate::cuda::context::CudaContext::new(0, &ptx).ok();
+        let ctx = CudaContext::new(0, &ptx).ok();
         let Some(ctx) = ctx else { return };
         assert!(fm.fork_session(99, 1, &ctx).is_err());
     }

@@ -1,5 +1,5 @@
-use thiserror::Error;
 use cudarc::driver::DriverError;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CudaError {

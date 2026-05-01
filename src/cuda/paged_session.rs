@@ -1,11 +1,11 @@
 use crate::cuda::context::CudaContext;
+use crate::cuda::error::CudaError;
 use crate::cuda::error::Result;
 use crate::cuda::kernels::{launch_flash_attention_3_gqa, launch_reshape_and_cache_f16};
 use crate::cuda::{BlockId, BlockTable, PagedBlockAllocator};
 use candle_nn::kv_cache::Cache;
 use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
 use cudarc::nvrtc::Ptx;
-use crate::cuda::error::CudaError;
 use half::f16;
 
 /*
@@ -93,7 +93,7 @@ mod tests {
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;
         let ctx = CudaContext::new(0, &ptx).ok()?;
 
-        PagedBlockAllocator::new(ctx, 16, 4, 2, 32).ok()
+        PagedBlockAllocator::new(&ctx, 16, 4, 2, 32).ok()
     }
 
     #[test]
