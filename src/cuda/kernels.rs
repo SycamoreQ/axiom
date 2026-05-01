@@ -1,9 +1,8 @@
-use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
+use cudarc::nvrtc::Ptx;
 use half::f16;
 use std::sync::Arc;
-
-use crate::cuda::context::CudaContext;
-use crate::cuda::error::{CudaError, Result};
 
 /*  Kernel launch wrappers
 Each function here is a thin Rust wrapper around one CUDA kernel.

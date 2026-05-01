@@ -1,4 +1,5 @@
 pub mod core;
+#[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod inference;
 pub mod kv_cache;

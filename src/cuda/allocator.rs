@@ -1,4 +1,6 @@
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
+use cudarc::nvrtc::Ptx;
 use half::f16;
 use std::collections::VecDeque;
 use std::sync::Arc;

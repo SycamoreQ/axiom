@@ -1,5 +1,6 @@
-use crate::cuda::error::{CudaError, Result};
-use cudarc::driver::{CudaDevice, CudaFunction, CudaStream};
+use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
+use cudarc::nvrtc::Ptx;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,7 +42,7 @@ pub struct CudaContext {
     ordinal: usize,
 }
 
-impl CudaContext {
+impl AxiomContext {
     //Create a context for device `ordinal`, load all kernels from the
     //embedded PTX string, and cache their function handles.
     pub fn new(ordinal: usize, ptx_src: &str) -> Result<Self> {

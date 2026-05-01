@@ -2,12 +2,13 @@ use tracing::Instrument;
 
 use crate::core::backend::Backend;
 use crate::cuda::allocator::{BlockId, BlockTable, PagedBlockAllocator};
-use crate::cuda::context::CudaContext;
-use crate::cuda::error::{CudaError, Result};
 use crate::cuda::kernels::launch_copy_blocks_f16;
 use crate::cuda::paged_session::{CacheKind, PagedSession};
 use crate::inference::session::{Session, SessionId};
 use crate::kv_cache::manager::KVManager;
+use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
+use cudarc::nvrtc::Ptx;
 use std::alloc::alloc;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -145,7 +146,7 @@ impl<B: Backend> ForkManager<B> {
             .lock()
             .map_err(|_| CudaError::Internal("Allocator mutex poisoned".into()))?;
 
-        session.free_blocks(&mut *allocator_guard);
+        session.free_blocks(&mut *allocator);
         Ok(())
     }
 

@@ -1,9 +1,8 @@
-use crate::cuda::allocator::{BlockId, BlockTable, PagedBlockAllocator};
-use crate::cuda::context::CudaContext;
-use crate::cuda::error::{CudaError, Result};
 use crate::cuda::kernels::{launch_flash_attention_3_gqa, launch_reshape_and_cache_f16};
 use candle_nn::kv_cache::Cache;
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
+use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
+use cudarc::nvrtc::Ptx;
 use half::f16;
 use std::sync::Arc;
 
