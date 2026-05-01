@@ -1,3 +1,4 @@
+use crate::cuda::error::Result;
 use cudarc::driver::DriverError;
 use thiserror::Error;
 

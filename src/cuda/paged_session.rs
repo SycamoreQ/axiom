@@ -1,10 +1,10 @@
+use crate::cuda::context::CudaContext;
+use crate::cuda::error::Result;
 use crate::cuda::kernels::{launch_flash_attention_3_gqa, launch_reshape_and_cache_f16};
 use candle_nn::kv_cache::Cache;
-use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
 use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use half::f16;
-use std::sync::Arc;
 
 /*
 PagedSession:
@@ -51,10 +51,6 @@ impl PagedSession {
             self.block_table.push_block(id);
         }
 
-        for i in 0..allocated_block_ids.iter().len() {
-            self.block_table.push_block(BlockId(i));
-        }
-
         self.seq_len += num_new_tokens;
         Ok(())
     }
@@ -88,12 +84,14 @@ impl PagedSession {
 mod tests {
     use super::*;
     use crate::cuda::allocator::PagedBlockAllocator;
-    use cudarc::driver::CudaDevice;
+    use crate::cuda::context::CudaContext;
     use std::sync::Arc;
 
     fn try_alloc() -> Option<PagedBlockAllocator> {
-        let dev = Arc::new(CudaDevice::new(0).ok()?);
-        PagedBlockAllocator::new(&dev, 16, 4, 2, 32).ok()
+        let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;
+        let ctx = CudaContext::new(0, &ptx).ok()?;
+
+        PagedBlockAllocator::new(ctx, 16, 4, 2, 32).ok()
     }
 
     #[test]

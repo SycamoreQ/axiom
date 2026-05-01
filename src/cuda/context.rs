@@ -1,5 +1,6 @@
-use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
-use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
+use crate::cuda::error::{CudaError, Result};
+use cudarc::driver::CudaContext as CuContext;
+use cudarc::driver::{CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::Ptx;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 
 //Names of every kernel function exposed by the kernels crate.
 //These must match the extern "C" names in the .cu files exactly.
+
 pub const KERNEL_NAMES: &[&str] = &[
     "rms_norm_f16_kernel",
     "fused_residual_rmsnorm_f16_kernel",
@@ -36,43 +38,37 @@ pub const KERNEL_NAMES: &[&str] = &[
 pub const MODULE_NAME: &str = "axiom_kernels";
 
 pub struct CudaContext {
-    pub device: Arc<CudaDevice>,
-    pub stream: CudaStream,
+    pub device: Arc<CuContext>,
+    pub stream: Arc<CudaStream>,
+    pub module: Arc<CudaModule>,
     funcs: HashMap<&'static str, CudaFunction>,
     ordinal: usize,
 }
 
-impl AxiomContext {
-    //Create a context for device `ordinal`, load all kernels from the
-    //embedded PTX string, and cache their function handles.
+impl CudaContext {
     pub fn new(ordinal: usize, ptx_src: &str) -> Result<Self> {
-        let device = CudaDevice::new(ordinal).map_err(CudaError::Driver)?;
-        let device = Arc::new(device);
+        let device = CuContext::new(ordinal).map_err(CudaError::Driver)?;
 
-        let stream = device.fork_default_stream().map_err(CudaError::Driver)?;
+        let stream = device.new_stream().map_err(CudaError::Driver)?;
 
-        let ptx = cudarc::driver::Ptx::from_src(ptx_src);
-        device
-            .load_ptx(ptx, MODULE_NAME, KERNEL_NAMES)
-            .map_err(CudaError::Driver)?;
+        let ptx = Ptx::from_src(ptx_src);
+        let module = device.load_module(ptx).map_err(CudaError::Driver)?;
 
         let mut funcs = HashMap::new();
         for &name in KERNEL_NAMES {
-            let f = device
-                .get_func(MODULE_NAME, name)
-                .ok_or(CudaError::KernelNotLoaded(name))?;
+            let f = device.load_function(name).map_err(CudaError::Driver)?;
             funcs.insert(name, f);
         }
 
         Ok(Self {
             device,
             stream,
+            module,
             funcs,
             ordinal,
         })
     }
 
-    //Retrieve a kernel function by name.
     pub fn func(&self, name: &'static str) -> Result<CudaFunction> {
         self.funcs
             .get(name)
@@ -83,20 +79,15 @@ impl AxiomContext {
     pub fn ordinal(&self) -> usize {
         self.ordinal
     }
-
-    pub fn device(&self) -> &Arc<CudaDevice> {
+    pub fn device(&self) -> &Arc<CuContext> {
         &self.device
     }
-
-    pub fn stream(&self) -> &CudaStream {
+    pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
 
-    //Synchronise the inference stream — blocks until all pending GPU work
-    //on this context's stream has completed.
-    //Call before reading device->host results.
     pub fn synchronize(&self) -> Result<()> {
-        self.device.synchronize().map_err(CudaError::Driver)
+        self.stream.synchronize().map_err(CudaError::Driver)
     }
 }
 
@@ -113,7 +104,7 @@ mod tests {
     fn test_context_loads_all_kernels() {
         let Some(ctx) = try_ctx() else { return };
         for &name in KERNEL_NAMES {
-            assert!(ctx.func(name).is_ok(), "failed to load kernel: {}", name);
+            assert!(ctx.func(name).is_ok(), "failed to load: {}", name);
         }
     }
 

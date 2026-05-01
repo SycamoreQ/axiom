@@ -2,11 +2,14 @@ use tracing::Instrument;
 
 use crate::core::backend::Backend;
 use crate::cuda::allocator::{BlockId, BlockTable, PagedBlockAllocator};
+use crate::cuda::context::CudaContext;
+use crate::cuda::error::Result;
 use crate::cuda::kernels::launch_copy_blocks_f16;
 use crate::cuda::paged_session::{CacheKind, PagedSession};
 use crate::inference::session::{Session, SessionId};
+use crate::kv_cache::manager::KVConfig;
 use crate::kv_cache::manager::KVManager;
-use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
+use cudarc::driver::{CudaFunction, CudaModule, CudaStream};
 use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use std::alloc::alloc;
@@ -163,12 +166,13 @@ mod tests {
     use super::*;
     use crate::core::backend::CandleBackend;
     use crate::cuda::allocator::PagedBlockAllocator;
-    use cudarc::driver::CudaDevice;
+    use crate::cuda::context::CudaContext;
     use std::sync::{Arc, Mutex};
 
     fn try_setup() -> Option<(ForkManager<CandleBackend>, Arc<Mutex<PagedBlockAllocator>>)> {
-        let dev = Arc::new(CudaDevice::new(0).ok()?);
-        let alloc = PagedBlockAllocator::new(&dev, 32, 4, 2, 32).ok()?;
+        let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;
+        let ctx = CudaContext::new(0, &ptx).ok()?;
+        let alloc = PagedBlockAllocator::new(ctx, 32, 4, 2, 32).ok()?;
         let alloc = Arc::new(Mutex::new(alloc));
         let fm = ForkManager::<CandleBackend>::new(Arc::clone(&alloc), 100, 400);
         Some((fm, alloc))

@@ -1,11 +1,10 @@
-use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
+use crate::cuda::context::CudaContext;
+use crate::cuda::error::{CudaError, Result};
 use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use half::f16;
 use std::collections::VecDeque;
 use std::sync::Arc;
-
-use crate::cuda::error::{CudaError, Result};
 
 /*  PagedBlockAllocator
 Manages a fixed GPU memory pool divided into equal-sized blocks.
@@ -45,7 +44,7 @@ pub struct PagedBlockAllocator {
 
 impl PagedBlockAllocator {
     pub fn new(
-        device: &Arc<CudaDevice>,
+        ctx: CudaContext,
         num_blocks: usize,
         block_size: usize,
         num_kv_heads: usize,
@@ -54,10 +53,12 @@ impl PagedBlockAllocator {
         let elems_per_block = block_size * num_kv_heads * head_dim;
         let total_elems = num_blocks * elems_per_block;
 
-        let k_cache = device
+        let k_cache = ctx
+            .device()
             .alloc_zeros::<f16>(total_elems)
             .map_err(CudaError::Driver)?;
-        let v_cache = device
+        let v_cache = ctx
+            .device()
             .alloc_zeros::<f16>(total_elems)
             .map_err(CudaError::Driver)?;
 
@@ -219,14 +220,15 @@ mod tests {
 
     // Most allocator tests require a real CUDA device.
     // Guard with an availability check so CI without GPU still passes.
-    fn try_device() -> Option<Arc<CudaDevice>> {
-        CudaDevice::new(0).ok().map(Arc::new)
+    fn try_ctx() -> Option<CudaContext> {
+        let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;
+        CudaContext::new(0, &ptx).ok()
     }
 
     #[test]
     fn test_alloc_and_free() {
-        let Some(dev) = try_device() else { return };
-        let mut alloc = PagedBlockAllocator::new(&dev, 8, 16, 4, 64).unwrap();
+        let Some(dev) = try_ctx() else { return };
+        let mut alloc = PagedBlockAllocator::new(dev, 8, 16, 4, 64).unwrap();
         assert_eq!(alloc.num_free(), 8);
 
         let b0 = alloc.alloc().unwrap();
@@ -240,8 +242,8 @@ mod tests {
 
     #[test]
     fn test_out_of_blocks() {
-        let Some(dev) = try_device() else { return };
-        let mut alloc = PagedBlockAllocator::new(&dev, 2, 16, 4, 64).unwrap();
+        let Some(dev) = try_ctx() else { return };
+        let mut alloc = PagedBlockAllocator::new(dev, 2, 16, 4, 64).unwrap();
         alloc.alloc().unwrap();
         alloc.alloc().unwrap();
         assert!(alloc.alloc().is_err());
@@ -249,8 +251,8 @@ mod tests {
 
     #[test]
     fn test_ref_counting() {
-        let Some(dev) = try_device() else { return };
-        let mut alloc = PagedBlockAllocator::new(&dev, 4, 16, 4, 64).unwrap();
+        let Some(dev) = try_ctx() else { return };
+        let mut alloc = PagedBlockAllocator::new(dev, 4, 16, 4, 64).unwrap();
         let b = alloc.alloc().unwrap();
         alloc.inc_ref(b).unwrap();
         assert!(alloc.is_shared(b));
@@ -265,8 +267,8 @@ mod tests {
 
     #[test]
     fn test_alloc_n_rollback() {
-        let Some(dev) = try_device() else { return };
-        let mut alloc = PagedBlockAllocator::new(&dev, 3, 16, 4, 64).unwrap();
+        let Some(dev) = try_ctx() else { return };
+        let mut alloc = PagedBlockAllocator::new(dev, 3, 16, 4, 64).unwrap();
         assert!(alloc.alloc_n(5).is_err()); // more than available
         assert_eq!(alloc.num_free(), 3); // nothing consumed
     }
@@ -287,8 +289,8 @@ mod tests {
 
     #[test]
     fn test_block_offset_elems() {
-        let Some(dev) = try_device() else { return };
-        let alloc = PagedBlockAllocator::new(&dev, 4, 16, 4, 64).unwrap();
+        let Some(dev) = try_ctx() else { return };
+        let alloc = PagedBlockAllocator::new(dev, 4, 16, 4, 64).unwrap();
         // elems_per_block = 16 * 4 * 64 = 4096
         assert_eq!(alloc.block_offset_elems(BlockId(0)), 0);
         assert_eq!(alloc.block_offset_elems(BlockId(1)), 4096);

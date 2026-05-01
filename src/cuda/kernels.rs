@@ -1,8 +1,8 @@
-use cudarc::driver::{CudaContext as CudaDevice, CudaFunction, CudaStream};
-use cudarc::driver::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
-use cudarc::nvrtc::Ptx;
+use cudarc::driver::{CudaView, CudaViewMut, LaunchConfig};
 use half::f16;
-use std::sync::Arc;
+
+use crate::cuda::context::CudaContext;
+use crate::cuda::error::{CudaError, Result};
 
 /*  Kernel launch wrappers
 Each function here is a thin Rust wrapper around one CUDA kernel.
@@ -35,8 +35,14 @@ pub fn launch_rms_norm_f16(
 
     let f = ctx.func("rms_norm_f16_kernel")?;
     unsafe {
-        ctx.device()
-            .launch(f, cfg, (output, input, weight, eps, hidden_size as i32))
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(output)
+            .arg(input)
+            .arg(weight)
+            .arg(eps)
+            .arg(hidden_size as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -65,19 +71,16 @@ pub fn launch_fused_residual_rmsnorm_f16(
 
     let f = ctx.func("fused_residual_rmsnorm_f16_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                output,
-                residual,
-                input,
-                add,
-                weight,
-                eps,
-                hidden_size as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(output)
+            .arg(residual)
+            .arg(input)
+            .arg(add)
+            .arg(weight)
+            .arg(eps)
+            .arg(hidden_size as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -103,21 +106,18 @@ pub fn launch_rotary_embedding_f16(
 
     let f = ctx.func("rotary_embedding_f16_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                query,
-                key,
-                cos_cache,
-                sin_cache,
-                positions,
-                num_tokens as i32,
-                num_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(query)
+            .arg(key)
+            .arg(cos_cache)
+            .arg(sin_cache)
+            .arg(positions)
+            .arg(num_tokens as i32)
+            .arg(num_heads as i32)
+            .arg(num_kv_heads as i32)
+            .arg(head_dim as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -143,20 +143,17 @@ pub fn launch_reshape_and_cache_f16(
 
     let f = ctx.func("reshape_and_cache_f16io_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                key_cache,
-                value_cache,
-                key,
-                value,
-                slot_mapping,
-                num_tokens as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(key_cache)
+            .arg(value_cache)
+            .arg(key)
+            .arg(value)
+            .arg(slot_mapping)
+            .arg(num_tokens as i32)
+            .arg(num_kv_heads as i32)
+            .arg(head_dim as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -181,19 +178,16 @@ pub fn launch_copy_blocks_f16(
 
     let f = ctx.func("copy_blocks_f16_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                key_cache,
-                value_cache,
-                block_mapping,
-                num_pairs as i32,
-                block_size as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(key_cache)
+            .arg(value_cache)
+            .arg(block_mapping)
+            .arg(num_pairs as i32)
+            .arg(block_size as i32)
+            .arg(num_kv_heads as i32)
+            .arg(head_dim as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -217,17 +211,14 @@ pub fn launch_embedding_gather_f16(
 
     let f = ctx.func("embedding_gather_f16_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                output,
-                embed_table,
-                token_ids,
-                hidden_size as i32,
-                vocab_size as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(output)
+            .arg(embed_table)
+            .arg(token_ids)
+            .arg(hidden_size as i32)
+            .arg(vocab_size as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -249,8 +240,12 @@ pub fn launch_argmax_f16(
 
     let f = ctx.func("argmax_f16_kernel")?;
     unsafe {
-        ctx.device()
-            .launch(f, cfg, (logits, output, vocab_size as i32))
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(logits)
+            .arg(output)
+            .arg(vocab_size as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -274,6 +269,7 @@ pub fn launch_flash_attention_3(
 ) -> Result<()> {
     const FA3_BC: usize = 64;
     const FA3_THREADS: u32 = 256;
+
     let smem = (FA3_BC * (head_dim + 2) * std::mem::size_of::<u16>() * 2
         + FA3_BC * std::mem::size_of::<f32>()
         + 8 * std::mem::size_of::<f32>()) as u32;
@@ -286,24 +282,21 @@ pub fn launch_flash_attention_3(
 
     let f = ctx.func("flash_attention_3_decode_f16io_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                output,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                context_lens,
-                scale,
-                num_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                block_size as i32,
-                max_blocks_per_seq as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(output)
+            .arg(query)
+            .arg(key_cache)
+            .arg(value_cache)
+            .arg(block_tables)
+            .arg(context_lens)
+            .arg(scale)
+            .arg(num_heads as i32)
+            .arg(num_kv_heads as i32)
+            .arg(head_dim as i32)
+            .arg(block_size as i32)
+            .arg(max_blocks_per_seq as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -328,7 +321,9 @@ pub fn launch_flash_attention_3_gqa(
 ) -> Result<()> {
     const FA3_BC: usize = 64;
     const FA3_THREADS: u32 = 256;
+
     let heads_per_group = num_heads / num_kv_heads;
+
     let smem = (FA3_BC * (head_dim + 2) * std::mem::size_of::<u16>() * 2
         + heads_per_group * (FA3_BC + 1) * std::mem::size_of::<f32>()
         + 8 * std::mem::size_of::<f32>()) as u32;
@@ -341,25 +336,22 @@ pub fn launch_flash_attention_3_gqa(
 
     let f = ctx.func("flash_attention_3_decode_gqa_f16io_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                output,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                context_lens,
-                scale,
-                num_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                block_size as i32,
-                max_context_len as i32,
-                max_blocks_per_seq as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(output)
+            .arg(query)
+            .arg(key_cache)
+            .arg(value_cache)
+            .arg(block_tables)
+            .arg(context_lens)
+            .arg(scale)
+            .arg(num_heads as i32)
+            .arg(num_kv_heads as i32)
+            .arg(head_dim as i32)
+            .arg(block_size as i32)
+            .arg(max_context_len as i32)
+            .arg(max_blocks_per_seq as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -388,8 +380,10 @@ pub fn launch_residual_attention(
 ) -> Result<()> {
     const RA_BC: usize = 64;
     const RA_THREADS: u32 = 256;
+
     let heads_per_group = num_heads / num_kv_heads;
     let kv_stride = head_dim + 2;
+
     let smem = (RA_BC * kv_stride * std::mem::size_of::<u16>()
         + heads_per_group * (RA_BC + 1) * std::mem::size_of::<f32>()
         + 8 * std::mem::size_of::<f32>()) as u32;
@@ -402,29 +396,26 @@ pub fn launch_residual_attention(
 
     let f = ctx.func("residual_attention_decode_f16io_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                output,
-                query,
-                b_key_cache,
-                b_val_cache,
-                b_block_table,
-                base_context_len as i32,
-                r_key_cache,
-                r_val_cache,
-                r_block_table,
-                residual_context_len as i32,
-                scale,
-                num_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                block_size as i32,
-                max_base_blocks as i32,
-                max_residual_blocks as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(output)
+            .arg(query)
+            .arg(b_key_cache)
+            .arg(b_val_cache)
+            .arg(b_block_table)
+            .arg(base_context_len as i32)
+            .arg(r_key_cache)
+            .arg(r_val_cache)
+            .arg(r_block_table)
+            .arg(residual_context_len as i32)
+            .arg(scale)
+            .arg(num_heads as i32)
+            .arg(num_kv_heads as i32)
+            .arg(head_dim as i32)
+            .arg(block_size as i32)
+            .arg(max_base_blocks as i32)
+            .arg(max_residual_blocks as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -456,6 +447,7 @@ pub fn launch_flash_attention_4(
     const FA4_SCORE_PAD: usize = 1;
 
     let stage_size = FA4_BC * (128 + FA4_KV_PAD) * std::mem::size_of::<u16>() * 2;
+
     let smem = FA4_PIPE_DEPTH * stage_size
         + FA4_GQA_MAX_HPG * 128 * std::mem::size_of::<u16>()
         + FA4_GQA_MAX_HPG * (FA4_BC + FA4_SCORE_PAD) * std::mem::size_of::<f32>()
@@ -474,26 +466,23 @@ pub fn launch_flash_attention_4(
 
     let f = ctx.func("flash_attention_4_decode_f16io_kernel")?;
     unsafe {
-        ctx.device().launch(
-            f,
-            cfg,
-            (
-                output,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                context_lens,
-                d_tile_counter,
-                scale,
-                num_seqs as i32,
-                num_heads as i32,
-                num_kv_heads as i32,
-                head_dim as i32,
-                block_size as i32,
-                max_blocks_per_seq as i32,
-            ),
-        )
+        ctx.stream()
+            .launch_builder(&f)
+            .arg(output)
+            .arg(query)
+            .arg(key_cache)
+            .arg(value_cache)
+            .arg(block_tables)
+            .arg(context_lens)
+            .arg(d_tile_counter)
+            .arg(scale)
+            .arg(num_seqs as i32)
+            .arg(num_heads as i32)
+            .arg(num_kv_heads as i32)
+            .arg(head_dim as i32)
+            .arg(block_size as i32)
+            .arg(max_blocks_per_seq as i32)
+            .launch(cfg)
     }
     .map_err(CudaError::Driver)
 }
@@ -513,6 +502,7 @@ mod tests {
     #[test]
     fn test_context_loads_all_kernels() {
         let Some(ctx) = try_ctx() else { return };
+
         let kernel_names = [
             "rms_norm_f16_kernel",
             "fused_residual_rmsnorm_f16_kernel",
@@ -526,6 +516,7 @@ mod tests {
             "residual_attention_decode_f16io_kernel",
             "flash_attention_4_decode_f16io_kernel",
         ];
+
         for &name in kernel_names.iter() {
             assert!(ctx.func(name).is_ok(), "failed to load kernel: {}", name);
         }
@@ -552,6 +543,7 @@ mod tests {
     #[test]
     fn test_context_no_device() {
         let result = CudaContext::new(99, ".version 7.0\n.target sm_80\n.address_size 64\n");
+
         assert!(result.is_err());
     }
 }
