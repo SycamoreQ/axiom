@@ -1,15 +1,12 @@
-use candle_core::Tensor;
 
 use crate::core::backend::Backend;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
-use crate::core::error::CoreError;
 use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
-use crate::model::rope::RotaryEmbedding;
 
 pub struct FeedForward<B: Backend> {
     gate_proj: Linear<B>, // [intermediate_size, hidden_size]

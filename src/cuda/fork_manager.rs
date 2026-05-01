@@ -1,7 +1,7 @@
 use tracing::Instrument;
 
 use crate::core::backend::Backend;
-use crate::cuda::allocator::{BlockId, BlockTable, PagedBlockAllocator};
+use crate::cuda::{BlockId, BlockTable, PagedBlockAllocator};
 use crate::cuda::context::CudaContext;
 use crate::cuda::error::Result;
 use crate::cuda::kernels::launch_copy_blocks_f16;
@@ -15,6 +15,7 @@ use cudarc::nvrtc::Ptx;
 use std::alloc::alloc;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use crate::cuda::error::CudaError;
 
 pub struct ForkManager<B: Backend> {
     kv_manager: KVManager<B>,

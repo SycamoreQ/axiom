@@ -1,7 +1,6 @@
 use crate::tokenizer::vocab::{TokenID, Vocab};
 use fancy_regex::Regex;
 use once_cell::sync::Lazy;
-use serde_json::*;
 
 /*
 This module sits between raw input text and the BPE engine.

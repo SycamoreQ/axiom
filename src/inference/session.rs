@@ -1,6 +1,4 @@
 use crate::core::backend::Backend;
-use crate::core::backend::CandleTensor;
-use crate::core::tensor::TensorOps;
 
 /*
 A session represents one inference request — its state lives here between generation steps.

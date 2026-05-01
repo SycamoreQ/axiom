@@ -1,6 +1,5 @@
 use crate::tokenizer::pretokenize::*;
 use crate::tokenizer::vocab::{TokenID, Vocab};
-use serde_json::*;
 use std::collections::*;
 use std::sync::*;
 

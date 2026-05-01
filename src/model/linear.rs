@@ -1,6 +1,5 @@
-use crate::core::backend::{Backend, CandleBackend, CandleTensor};
+use crate::core::backend::Backend;
 use crate::core::error::Result;
-use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 
 pub struct Linear<B: Backend> {

@@ -1,4 +1,4 @@
-use crate::core::error::{CoreError, Result};
+use crate::core::error::CoreError;
 use candle_core;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -58,7 +58,7 @@ impl TryFrom<candle_core::Device> for Device {
     fn try_from(device: candle_core::Device) -> std::result::Result<Self, Self::Error> {
         match device {
             candle_core::Device::Cpu => Ok(Device::Cpu),
-            candle_core::Device::Cuda(d) => Ok(Device::Cuda(0)),
+            candle_core::Device::Cuda(_d) => Ok(Device::Cuda(0)),
             candle_core::Device::Metal(_) => Err(CoreError::Internal(
                 "Metal device not supported".to_string(),
             )),

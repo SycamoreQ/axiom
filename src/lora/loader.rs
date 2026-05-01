@@ -1,10 +1,8 @@
 use crate::core::backend::Backend;
 use crate::core::device::Device;
-use crate::core::error::CoreError;
 use crate::lora::config::AdapterMeta;
-use crate::lora::layer::LoraLinear;
 use crate::weights::gguf::GgufFile;
-use crate::weights::loader::{self, config_from_gguf, LoaderError};
+use crate::weights::loader::{self, LoaderError};
 use std::collections::HashMap;
 use std::path::Path;
 

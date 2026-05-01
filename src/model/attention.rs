@@ -1,9 +1,7 @@
-use candle_core::Tensor;
 
 use crate::core::backend::Backend;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
-use crate::core::error::CoreError;
 use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;

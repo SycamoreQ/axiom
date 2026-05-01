@@ -3,7 +3,7 @@ use crate::core::device::Device;
 use crate::core::dtype::{DType, Element};
 use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
-use candle_core::{self, Tensor};
+use candle_core::{self};
 use candle_nn;
 
 fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
@@ -674,7 +674,7 @@ impl TensorOps for CudarcTensor {
     fn broadcast_matmul(&self, _: &Self) -> Result<Self> {
         todo!("Phase 4")
     }
-    fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
+    fn index_select(&self, _indexes: &Self, _dim: usize) -> Result<Self> {
         todo!("phase 4")
     }
 
@@ -697,7 +697,7 @@ impl TensorOps for CudarcTensor {
         todo!("Phase 4")
     }
 
-    fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
+    fn narrow(&self, _dim: usize, _start: usize, _len: usize) -> Result<Self> {
         todo!("Phase 4")
     }
 
@@ -721,10 +721,10 @@ impl TensorOps for CudarcTensor {
         todo!("phase 4")
     }
 
-    fn sum_keepdim(&self, dim: usize) -> Result<Self> {
+    fn sum_keepdim(&self, _dim: usize) -> Result<Self> {
         todo!("Phase 4")
     }
-    fn broadcast_div(&self, other: &Self) -> Result<Self> {
+    fn broadcast_div(&self, _other: &Self) -> Result<Self> {
         todo!("phase 4")
     }
 

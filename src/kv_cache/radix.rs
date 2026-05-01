@@ -1,8 +1,5 @@
-use std::{collections::HashMap, hash::Hash, time::Instant};
+use std::{collections::HashMap, time::Instant};
 
-use tracing::Instrument;
-use tracing_subscriber::fmt::time;
-use unix_ts::Timestamp;
 
 /*
 A radix tree keyed by token sequences. Enables O(prefix_len) lookup for shared prefix matching. This is the main

@@ -1,4 +1,3 @@
-use candle_nn::kv_cache::Cache;
 
 use crate::core::backend::Backend;
 use crate::kv_cache::cache::{BaseCache, ResidualCache};

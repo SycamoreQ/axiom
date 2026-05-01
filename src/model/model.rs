@@ -1,11 +1,9 @@
-use crate::core::backend::{Backend, CandleTensor};
+use crate::core::backend::Backend;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
-use crate::core::error::{CoreError, Result};
+use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
-use crate::core::tensor::{TopKLastDimOp, TopKOutput};
-use crate::model::attention::Attention;
 use crate::model::block::Block;
 use crate::model::config::ModelConfig;
 use crate::model::embedding::Embedding;
@@ -74,7 +72,7 @@ impl<B: Backend> LlamaModel<B> {
         offset: usize,
     ) -> Result<B::Tensor> {
         let seq_len = token_ids.len();
-        let mut x = self.embedding.forward(token_ids)?;
+        let x = self.embedding.forward(token_ids)?;
         let mut x = x.unsqueeze(0)?;
         let device = x.device().clone();
         let mask = self.causal_mask(seq_len, &device)?;

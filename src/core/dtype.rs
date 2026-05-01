@@ -1,5 +1,4 @@
 use crate::core::error::CoreError;
-use candle_core::DType as CandleDType;
 use half;
 
 /*

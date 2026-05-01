@@ -4,7 +4,6 @@ use crate::core::error::CoreError;
 use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
-use crate::model::config::ModelConfig;
 
 /*
 Instead of adding positional embeddings to the input, it encodes position by rotating query and key vectors in complex space before attention.

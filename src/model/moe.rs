@@ -1,10 +1,10 @@
-use crate::core::backend::{Backend, CandleTensor};
+use crate::core::backend::Backend;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
-use crate::core::error::{CoreError, Result};
+use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
-use crate::core::tensor::{TopKLastDimOp, TopKOutput};
+use crate::core::tensor::TopKLastDimOp;
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
 
@@ -234,7 +234,7 @@ impl<B: Backend> Router<B> {
         };
 
         let topk_out = TopKLastDimOp::topk(&scores, self.config.experts_per_token)?;
-        let mut routing_weights = topk_out.values;
+        let routing_weights = topk_out.values;
         let expert_indices = topk_out.indices;
 
         //Renormalize (if using Softmax)
@@ -297,9 +297,9 @@ impl<B: Backend> Router<B> {
     }
 
     pub fn load_balance_loss(
-        router_logits: &B::Tensor,  // [T, E]
-        expert_indices: &B::Tensor, // [T, K]
-        num_experts: usize,
+        _router_logits: &B::Tensor,  // [T, E]
+        _expert_indices: &B::Tensor, // [T, K]
+        _num_experts: usize,
     ) -> Result<B::Tensor> {
         todo!()
     } // scalar loss
@@ -515,7 +515,7 @@ pub fn combine<B: Backend>(
     output_accumulator: &mut Vec<Option<B::Tensor>>,
 ) -> Result<()> {
     let n = expert_out.shape().dim(0)?;
-    let d = expert_out.shape().dim(1)?;
+    let _d = expert_out.shape().dim(1)?;
 
     for i in 0..n {
         let t = positions[i].0;

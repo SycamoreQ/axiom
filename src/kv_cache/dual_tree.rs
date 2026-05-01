@@ -59,8 +59,8 @@ impl<B: Backend> DualRadixTree<B> {
 
     // fork semantics — Step 1 of ForkKV paper Figure 9
     // inherits base cache via prefix match, allocates slot for residual
-    pub fn fork(&self, tokens: &[u32], new_agent_id: &str, _adapter_id: &str) -> ForkResult<B> {
-        let (hit_len, cache) = self.prefix_match_base(tokens);
+    pub fn fork(&self, tokens: &[u32], _new_agent_id: &str, _adapter_id: &str) -> ForkResult<B> {
+        let (hit_len, _cache) = self.prefix_match_base(tokens);
         ForkResult {
             base_cache: None,
             base_hit_len: hit_len,

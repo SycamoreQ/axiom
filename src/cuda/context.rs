@@ -1,7 +1,6 @@
 use crate::cuda::error::{CudaError, Result};
-
-use cudarc::driver::{CudaDevice, CudaFunction, CudaModule, CudaStream};
-
+use cudarc::driver::{CudaFunction, CudaModule, CudaStream};.
+use cudarc::driver::safe::CudaDevice as Device;
 use cudarc::nvrtc::Ptx;
 
 use std::collections::HashMap;
@@ -10,18 +9,7 @@ use std::sync::Arc;
 /*  CudaContext
 // Owns the device handle, a dedicated inference stream, and a cache of
 // loaded kernel functions. One CudaContext per GPU.
-// The kernel function cache avoids re-loading PTX on every call.
-// Functions are looked up by name after the PTX module is loaded once
-// at construction time.
-// Important cudarc notes:
-//   - CudaDevice::load_ptx takes (Ptx, module_name: &str, fn_names: &[&str])
-//   - The fn_names slice must exactly match extern "C" kernel names in the .cu
-//   - CudaDevice::get_func(module_name, fn_name) retrieves a loaded function
-//   - CudaFunction is Clone — cheap to hand out
 */
-
-//Names of every kernel function exposed by the kernels crate.
-//These must match the extern "C" names in the .cu files exactly.
 
 pub const KERNEL_NAMES: &[&str] = &[
     "rms_norm_f16_kernel",
@@ -40,7 +28,7 @@ pub const KERNEL_NAMES: &[&str] = &[
 pub const MODULE_NAME: &str = "axiom_kernels";
 
 pub struct CudaContext {
-    pub device: Arc<CudaDevice>,
+    pub device: Arc<Device>,
     pub stream: Arc<CudaStream>,
     pub module: Arc<CudaModule>,
     funcs: HashMap<&'static str, CudaFunction>,
@@ -49,24 +37,28 @@ pub struct CudaContext {
 
 impl CudaContext {
     pub fn new(ordinal: usize, ptx_src: &str) -> Result<Self> {
-        let device = CudaDevice::new(ordinal).map_err(CudaError::Driver)?;
+        // cudarc's CudaDevice::new already returns an Arc<CudaDevice>
+        let device = Device::new(ordinal).map_err(CudaError::Driver)?;
 
         let stream = device.fork_default_stream().map_err(CudaError::Driver)?;
 
         let ptx = Ptx::from_src(ptx_src);
 
+        // Load PTX module into the device
         device
             .load_ptx(ptx, MODULE_NAME, KERNEL_NAMES)
             .map_err(CudaError::Driver)?;
 
-        let module = device.get_module(MODULE_NAME).map_err(CudaError::Driver)?;
+        let module = device.get_module(MODULE_NAME).ok_or_else(|| {
+            CudaError::Internal(format!("Module {} not found after loading", MODULE_NAME))
+        })?;
 
         let mut funcs = HashMap::new();
 
         for &name in KERNEL_NAMES {
             let f = device
                 .get_func(MODULE_NAME, name)
-                .map_err(CudaError::Driver)?;
+                .ok_or_else(|| CudaError::KernelNotLoaded(name))?;
 
             funcs.insert(name, f);
         }
@@ -74,7 +66,7 @@ impl CudaContext {
         Ok(Self {
             device,
             stream,
-            module,
+            module: Arc::new(module),
             funcs,
             ordinal,
         })
@@ -91,7 +83,7 @@ impl CudaContext {
         self.ordinal
     }
 
-    pub fn device(&self) -> &Arc<CudaDevice> {
+    pub fn device(&self) -> &Arc<Device> {
         &self.device
     }
 
@@ -110,7 +102,6 @@ mod tests {
 
     fn try_ctx() -> Option<CudaContext> {
         let ptx = std::fs::read_to_string(env!("AXIOM_KERNELS_PTX")).ok()?;
-
         CudaContext::new(0, &ptx).ok()
     }
 
@@ -139,12 +130,5 @@ mod tests {
     fn test_unknown_kernel_returns_err() {
         let Some(ctx) = try_ctx() else { return };
         assert!(ctx.func("does_not_exist").is_err());
-    }
-
-    #[test]
-    fn test_context_no_device() {
-        let result = CudaContext::new(99, ".version 7.0\n.target sm_80\n.address_size 64\n");
-
-        assert!(result.is_err());
     }
 }

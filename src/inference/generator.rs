@@ -4,7 +4,7 @@ use crate::core::tensor::TensorOps;
 use crate::inference::sampler::Sampler;
 use crate::inference::session::{Session, SessionId, SessionStatus};
 use crate::model::model::LlamaModel;
-use crate::tokenizer::tokenizer::{EncodeOptions, Tokenizer};
+use crate::tokenizer::tokenizer::Tokenizer;
 
 /*
 This is the core of the inference engine — it wires the model, tokenizer, sampler, and session together into a generation loop.

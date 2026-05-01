@@ -14,7 +14,6 @@ use axum::{
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
-use crate::server::middleware;
 use axum::middleware as axum_mw;
 
 pub struct AppState<B: Backend> {

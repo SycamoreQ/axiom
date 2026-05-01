@@ -201,7 +201,7 @@ pub fn load_bytes_as_tensor<B: Backend>(
     device: &Device,
 ) -> Result<B::Tensor, LoaderError> {
     //GGUF stores weights in column-major (reversed) dimension order
-    let mut shape_dims: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
+    let shape_dims: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
     let shape = Shape::new(&shape_dims);
 
     match info.dtype {
