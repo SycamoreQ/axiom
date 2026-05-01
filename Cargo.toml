@@ -37,7 +37,7 @@ candle-core = { version = "0.6", default-features = false }
 candle-nn   = { version = "0.6", default-features = false }
 
 # CUDA low-level kernel management (Phase 3)
-cudarc = { version = "0.19", features = ["driver" , "nvrtc" , "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "0.19", features = ["driver" , "nvrtc" , "cuda-version-from-build-system" , "f16"], optional = true }
 
 # Memory-mapped weight files (Phase 8)
 memmap2 = "0.9"
