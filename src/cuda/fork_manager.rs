@@ -1,9 +1,9 @@
 use crate::core::backend::Backend;
+use crate::cuda::{BlockId, BlockTable, PagedBlockAllocator};
 use crate::cuda::context::CudaContext;
 use crate::cuda::error::{CudaError, Result};
 use crate::cuda::kernels::launch_copy_blocks_f16;
 use crate::cuda::paged_session::{CacheKind, PagedSession};
-use crate::cuda::{BlockId, BlockTable, PagedBlockAllocator};
 use crate::kv_cache::manager::KVConfig;
 use crate::kv_cache::manager::KVManager;
 use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
@@ -44,7 +44,7 @@ impl<B: Backend> ForkManager<B> {
         Ok(())
     }
 
-    pub fn fork_session(&mut self, parent_id: u64, child_id: u64, ctx: &CudaContext) -> Result<()> {
+    pub fn fork_session(&mut self, parent_id: u64, child_id: u64, _ctx: &CudaContext) -> Result<()> {
         let (parent_blocks, parent_seq_len) = {
             let parent = self
                 .sessions
@@ -110,22 +110,29 @@ impl<B: Backend> ForkManager<B> {
 
             let mapping: Vec<i64> = vec![old_phys_id.0 as i64, new_phys_id.0 as i64];
 
-            // cudarc 0.19: htod_sync_copy is gone. Use stream.clone_htod() instead,
-            // which copies a host slice to a new device allocation on the stream.
+            // cudarc 0.19: htod_sync_copy is gone. Use stream.clone_htod() instead.
             let mapping_buf = ctx
                 .stream()
                 .clone_htod(&mapping)
                 .map_err(CudaError::Driver)?;
 
+            let block_size   = allocator.block_size;
+            let num_kv_heads = allocator.num_kv_heads;
+            let head_dim     = allocator.head_dim;
+            
+            let alloc_ref = &mut *allocator;
+            let mut k_view = alloc_ref.k_cache.slice_mut(..);
+            let mut v_view = alloc_ref.v_cache.slice_mut(..);
+
             launch_copy_blocks_f16(
                 ctx,
-                &mut allocator.k_cache.slice_mut(..),
-                &mut allocator.v_cache.slice_mut(..),
+                &mut k_view,
+                &mut v_view,
                 &mapping_buf.slice(..),
-                1, // num_pairs
-                allocator.block_size,
-                allocator.num_kv_heads,
-                allocator.head_dim,
+                1, 
+                block_size,
+                num_kv_heads,
+                head_dim,
             )?;
 
             session.block_table.physical[block_idx] = new_phys_id.0 as i32;
@@ -237,7 +244,9 @@ mod tests {
         let Some(ctx) = ctx else { return };
         fm.fork_session(1, 2, &ctx).unwrap();
         let a = alloc.lock().unwrap();
-        let block_id = BlockId(fm.get_session(1).unwrap().block_table.physical[0] as usize);
+        let block_id = BlockId(
+            fm.get_session(1).unwrap().block_table.physical[0] as usize,
+        );
         assert_eq!(a.ref_count(block_id), 2);
     }
 
@@ -262,7 +271,9 @@ mod tests {
         fm.free_session(1).unwrap();
         // child blocks should still have ref_count 1
         let a = alloc.lock().unwrap();
-        let block_id = BlockId(fm.get_session(2).unwrap().block_table.physical[0] as usize);
+        let block_id = BlockId(
+            fm.get_session(2).unwrap().block_table.physical[0] as usize,
+        );
         assert_eq!(a.ref_count(block_id), 1);
     }
 

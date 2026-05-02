@@ -3,7 +3,6 @@ use crate::cuda::error::{CudaError, Result};
 use cudarc::driver::{CudaSlice, CudaView, CudaViewMut};
 use half::f16;
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 /*  PagedBlockAllocator
 Manages a fixed GPU memory pool divided into equal-sized blocks.
@@ -52,16 +51,28 @@ impl PagedBlockAllocator {
         let elems_per_block = block_size * num_kv_heads * head_dim;
         let total_elems = num_blocks * elems_per_block;
 
-        // cudarc 0.19: memory is allocated via the stream, not the device.
-        // stream.alloc_zeros() replaces device.alloc_zeros().
-        let k_cache = ctx
-            .stream()
-            .alloc_zeros::<f16>(total_elems)
-            .map_err(CudaError::Driver)?;
-        let v_cache = ctx
-            .stream()
-            .alloc_zeros::<f16>(total_elems)
-            .map_err(CudaError::Driver)?;
+        // f16 does not implement cudarc's ValidAsZeroBits/DeviceRepr unless the
+        // cudarc "f16" feature is enabled. Two options:
+        //   A) Add `features = ["f16"]` to cudarc in Cargo.toml  ← preferred
+        //   B) Allocate as u16 (same bit-width) and transmute the owned slice.
+        //
+        // We use option B here so no Cargo change is required.
+        // Safety: CudaSlice<u16> and CudaSlice<f16> have identical memory layout
+        // (both are 2 bytes per element, no padding). All-zero bits = f16 +0.0.
+        let k_cache: CudaSlice<f16> = unsafe {
+            let raw: CudaSlice<u16> = ctx
+                .stream()
+                .alloc_zeros::<u16>(total_elems)
+                .map_err(CudaError::Driver)?;
+            std::mem::transmute(raw)
+        };
+        let v_cache: CudaSlice<f16> = unsafe {
+            let raw: CudaSlice<u16> = ctx
+                .stream()
+                .alloc_zeros::<u16>(total_elems)
+                .map_err(CudaError::Driver)?;
+            std::mem::transmute(raw)
+        };
 
         let blocks: Vec<BlockMeta> = (0..num_blocks)
             .map(|_| BlockMeta { ref_count: 0 })

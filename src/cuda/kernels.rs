@@ -471,7 +471,9 @@ pub fn launch_flash_attention_4(
         shared_mem_bytes: smem as u32,
     };
 
-    ctx.device()
+    // cudarc 0.19: memset_zeros moved from device to stream.
+    // ctx.device().memset_zeros() → ctx.stream().memset_zeros()
+    ctx.stream()
         .memset_zeros(d_tile_counter)
         .map_err(CudaError::Driver)?;
 
@@ -555,7 +557,6 @@ mod tests {
     #[test]
     fn test_context_no_device() {
         let result = CudaContext::new(99, ".version 7.0\n.target sm_80\n.address_size 64\n");
-
         assert!(result.is_err());
     }
 }
