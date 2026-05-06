@@ -129,7 +129,7 @@ impl Sampler {
         }
     }
 
-    fn softmax(logits: &[f32]) -> Vec<f32> {
+    pub fn softmax(logits: &[f32]) -> Vec<f32> {
         let max_l = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         let exps: Vec<f32> = logits.iter().map(|l| (l - max_l).exp()).collect();
         let sum: f32 = exps.iter().sum();
