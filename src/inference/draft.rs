@@ -32,9 +32,7 @@ impl<B: Backend> DraftModel<B> {
         let mut current_input = session.next_input_tokens().to_vec();
 
         for i in 0..self.gamma {
-            let logits_tensor =
-                self.model
-                    .forward(&current_input, Some(&mut draft_kv), draft_offset)?;
+            let logits_tensor = self.model.forward(&current_input, None, draft_offset)?;
 
             let seq_len = logits_tensor.shape().dims()[1];
             let last_logits_tensor = logits_tensor

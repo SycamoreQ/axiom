@@ -3,21 +3,64 @@ use crate::core::error::Result;
 use crate::core::tensor::TensorOps;
 use crate::inference::draft::DraftModel;
 use crate::inference::sampler::Sampler;
-use crate::inference::session::{self, Session, SessionStatus};
+use crate::inference::session::Session;
 use crate::model::model::LlamaModel;
-use candle_core::Tensor;
-use rand::thread_rng;
 use rand::Rng;
+
+//Accept or reject a draft token using the speculative sampling criterion.
+pub fn acceptance_criterion(p_target: f32, p_draft: f32, r: f32) -> bool {
+    if p_draft <= 0.0 {
+        return true; // avoid division by zero — accept if draft had zero mass
+    }
+    r < (p_target / p_draft).min(1.0)
+}
+
+//Compute the correction distribution: max(0, p_target - p_draft), renormalized.
+//Sampled on rejection to maintain the target distribution in expectation.
+pub fn adjusted_distribution(target_probs: &[f32], draft_probs: &[f32]) -> Vec<f32> {
+    let mut diff: Vec<f32> = target_probs
+        .iter()
+        .zip(draft_probs.iter())
+        .map(|(t, d)| (t - d).max(0.0))
+        .collect();
+
+    let sum: f32 = diff.iter().sum();
+    if sum > 0.0 {
+        for v in diff.iter_mut() {
+            *v /= sum;
+        }
+    } else {
+        let n = diff.len() as f32;
+        for v in diff.iter_mut() {
+            *v = 1.0 / n;
+        }
+    }
+    diff
+}
+
+//Weighted sampling from a probability vector.
+pub fn sample_from_distribution(probs: &[f32], rng: &mut rand::rngs::StdRng) -> u32 {
+    use rand::distributions::{Distribution, WeightedIndex};
+    let dist = WeightedIndex::new(probs).expect("invalid probability distribution");
+    dist.sample(rng) as u32
+}
+
+/*
+SpeculativeDecoder: main loop which takes the draft tokens and does a forward pass
+*/
 
 pub struct SpeculativeDecoder<B: Backend> {
     target: LlamaModel<B>,
     draft: DraftModel<B>,
     target_sampler: Sampler,
-    accepted_total: usize, // lifetime stats
-    drafted_total: usize,
+    pub accepted_total: usize,
+    pub drafted_total: usize,
 }
 
-impl<B: Backend> SpeculativeDecoder<B> {
+impl<B: Backend> SpeculativeDecoder<B>
+where
+    B::Tensor: Clone,
+{
     pub fn new(target: LlamaModel<B>, draft: DraftModel<B>, target_sampler: Sampler) -> Self {
         Self {
             target,
@@ -29,30 +72,43 @@ impl<B: Backend> SpeculativeDecoder<B> {
     }
 
     pub fn step(&mut self, session: &mut Session<B>) -> Result<Vec<u32>> {
+        //draft
         let drafted_pairs = self.draft.draft(session)?;
-        self.drafted_total += drafted_pairs.len(); // Track total tokens drafted
+        self.drafted_total += drafted_pairs.len();
+        let next_tokens = session.next_input_tokens().to_vec();
+        let tokens_to_verify: Vec<u32> = drafted_pairs.iter().map(|(t, _)| *t).collect();
+
+        if drafted_pairs.is_empty() {
+            // gamma == 0: just sample one token from target
+            let logits = self
+                .target
+                .forward(&tokens_to_verify, None, session.offset)?;
+            let seq_len = logits.shape().dim(1)?;
+            let last = logits.narrow(1, seq_len - 1, 1)?.squeeze(0)?.squeeze(0)?;
+            let logits_vec = last.to_vec_f32()?;
+            let token = self
+                .target_sampler
+                .sample(&logits_vec, &session.all_tokens());
+            session.push_token(token);
+            return Ok(vec![token]);
+        }
 
         let tokens_to_verify: Vec<u32> = drafted_pairs.iter().map(|(t, _)| *t).collect();
 
-        // Batched forward pass on target model
-        let target_logits_tensor = self.target.forward(
-            &tokens_to_verify,
-            Some(&mut session.kv_cache),
-            session.offset,
-        )?;
+        //batched target forward over all draft tokens
+        let target_logits_tensor = self
+            .target
+            .forward(&tokens_to_verify, None, session.offset)?;
 
-        let seq_len = target_logits_tensor.shape().dims()[1];
-        let last_logits_tensor = target_logits_tensor
-            .narrow(1, seq_len - 1, 1)?
-            .squeeze(0)?
-            .squeeze(0)?;
+        let gamma = drafted_pairs.len();
+        let mut accepted_tokens: Vec<u32> = Vec::new();
+        let mut rng = rand::thread_rng();
 
-        let last_logits_vec = last_logits_tensor.to_vec_f32()?;
+        //accept/reject loop
+        for i in 0..gamma {
+            let (draft_token, ref draft_logits) = drafted_pairs[i];
 
-        let mut accepted_tokens = Vec::new();
-
-        for i in 0..drafted_pairs.len() {
-            let (draft_token, draft_logits) = &drafted_pairs[i];
+            // extract target logits at position i
             let pos_logits = target_logits_tensor
                 .narrow(1, i, 1)?
                 .squeeze(0)?
@@ -61,11 +117,17 @@ impl<B: Backend> SpeculativeDecoder<B> {
             let p_target = Sampler::softmax(&pos_logits);
             let p_draft = Sampler::softmax(draft_logits);
 
-            if self.check_acceptance(*draft_token, &p_target, &p_draft) {
-                accepted_tokens.push(*draft_token);
+            let r: f32 = rng.gen();
+            if acceptance_criterion(
+                p_target[draft_token as usize],
+                p_draft[draft_token as usize],
+                r,
+            ) {
+                accepted_tokens.push(draft_token);
             } else {
-                // Found a rejection: sample correction and stop this step
-                let correction = self.sample_correction_dist(&p_target, &p_draft);
+                // rejection: sample correction token
+                let adj = adjusted_distribution(&p_target, &p_draft);
+                let correction = self.target_sampler.sample(&adj, &session.all_tokens());
                 accepted_tokens.push(correction);
 
                 self.accepted_total += accepted_tokens.len();
@@ -76,42 +138,32 @@ impl<B: Backend> SpeculativeDecoder<B> {
             }
         }
 
-        let bonus_pos = target_logits_tensor
-            .narrow(1, drafted_pairs.len(), 1)?
+        //all accepted — sample bonus token from target at position gamma
+        let bonus_logits = target_logits_tensor
+            .narrow(1, gamma - 1, 1)?
             .squeeze(0)?
             .squeeze(0)?
             .to_vec_f32()?;
-        let last_p_target = Sampler::softmax(&bonus_pos);
-        let prev_token = 0;
-        let bonus_token = self.target_sampler.sample(&last_p_target, &[prev_token]);
+        let bonus_token = self
+            .target_sampler
+            .sample(&bonus_logits, &session.all_tokens());
         accepted_tokens.push(bonus_token);
 
         self.accepted_total += accepted_tokens.len();
         for &t in &accepted_tokens {
             session.push_token(t);
         }
+
         Ok(accepted_tokens)
     }
 
     pub fn step_to_completion(&mut self, session: &mut Session<B>) -> Result<Vec<u32>> {
         let mut all_generated = Vec::new();
-
         while !session.is_finished() {
             let mut new_tokens = self.step(session)?;
             all_generated.append(&mut new_tokens);
-
-            // Safety break if we exceed max tokens outside of the session check
-            if all_generated.len() >= session.max_new_tokens as usize {
-                break;
-            }
         }
-
         Ok(all_generated)
-    }
-
-    pub fn reset_stats(&mut self) {
-        self.accepted_total = 0;
-        self.drafted_total = 0;
     }
 
     pub fn acceptance_rate(&self) -> f32 {
@@ -121,48 +173,10 @@ impl<B: Backend> SpeculativeDecoder<B> {
         self.accepted_total as f32 / self.drafted_total as f32
     }
 
-    fn check_acceptance(&self, token: u32, p_target: &[f32], p_draft: &[f32]) -> bool {
-        let mut rng = thread_rng();
-        let r: f32 = rng.gen();
-
-        let target_prob = p_target[token as usize];
-        let draft_prob = p_draft[token as usize];
-
-        acceptance_criterion(target_prob, draft_prob, r)
+    pub fn reset_stats(&mut self) {
+        self.accepted_total = 0;
+        self.drafted_total = 0;
     }
-
-    //Samples a correction token from the adjusted distribution when a draft is rejected.
-    fn sample_correction_dist(&mut self, p_target: &[f32], p_draft: &[f32]) -> u32 {
-        let adj_probs = adjusted_distribution(p_target, p_draft);
-        let context = vec![0u32];
-        self.target_sampler.sample(&adj_probs, &context)
-    }
-}
-
-//Determines if a drafted token is statistically valid.
-pub fn acceptance_criterion(p_target: f32, p_draft: f32, r: f32) -> bool {
-    r < (p_target / p_draft).min(1.0)
-}
-
-//This is used to sample a replacement token when a draft is rejected.
-pub fn adjusted_distribution(target_probs: &[f32], draft_probs: &[f32]) -> Vec<f32> {
-    let mut adj: Vec<f32> = target_probs
-        .iter()
-        .zip(draft_probs.iter())
-        .map(|(p_t, p_d)| (p_t - p_d).max(0.0))
-        .collect();
-
-    let sum: f32 = adj.iter().sum();
-
-    if sum > 0.0 {
-        for v in adj.iter_mut() {
-            *v /= sum;
-        }
-    } else {
-        return target_probs.to_vec();
-    }
-
-    adj
 }
 
 #[cfg(test)]
@@ -225,31 +239,7 @@ mod tests {
         Session::new(SessionId(0), vec![1u32, 2, 3], 32, eos)
     }
 
-    #[test]
-    fn test_acceptance_rate_zero_initially() {
-        let dec = make_decoder();
-        assert_eq!(dec.acceptance_rate(), 0.0);
-    }
-
-    #[test]
-    fn test_acceptance_rate_after_manual_set() {
-        let mut dec = make_decoder();
-        dec.accepted_total = 3;
-        dec.drafted_total = 4;
-        let rate = dec.acceptance_rate();
-        assert!((rate - 0.75).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_reset_stats() {
-        let mut dec = make_decoder();
-        dec.accepted_total = 10;
-        dec.drafted_total = 20;
-        dec.reset_stats();
-        assert_eq!(dec.accepted_total, 0);
-        assert_eq!(dec.drafted_total, 0);
-        assert_eq!(dec.acceptance_rate(), 0.0);
-    }
+    // --- free function tests ---
 
     #[test]
     fn test_acceptance_criterion_accepts_higher_prob() {
@@ -268,9 +258,13 @@ mod tests {
 
     #[test]
     fn test_acceptance_criterion_boundary() {
-        // r == ratio exactly -> should reject (r < ratio is false)
         let ratio = 0.1f32 / 0.9f32;
         assert!(!acceptance_criterion(0.1, 0.9, ratio));
+    }
+
+    #[test]
+    fn test_acceptance_criterion_zero_draft_always_accepts() {
+        assert!(acceptance_criterion(0.5, 0.0, 0.99));
     }
 
     #[test]
@@ -301,6 +295,34 @@ mod tests {
         }
     }
 
+    // --- decoder tests ---
+
+    #[test]
+    fn test_acceptance_rate_zero_initially() {
+        let dec = make_decoder();
+        assert_eq!(dec.acceptance_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_acceptance_rate_after_manual_set() {
+        let mut dec = make_decoder();
+        dec.accepted_total = 3;
+        dec.drafted_total = 4;
+        let rate = dec.acceptance_rate();
+        assert!((rate - 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_reset_stats() {
+        let mut dec = make_decoder();
+        dec.accepted_total = 10;
+        dec.drafted_total = 20;
+        dec.reset_stats();
+        assert_eq!(dec.accepted_total, 0);
+        assert_eq!(dec.drafted_total, 0);
+        assert_eq!(dec.acceptance_rate(), 0.0);
+    }
+
     #[test]
     fn test_step_returns_nonempty_tokens() {
         let mut dec = make_decoder();
@@ -328,9 +350,17 @@ mod tests {
     }
 
     #[test]
+    fn test_step_updates_session_offset() {
+        let mut dec = make_decoder();
+        let mut session = make_session(None);
+        let offset_before = session.offset;
+        dec.step(&mut session).unwrap();
+        assert!(session.offset > offset_before);
+    }
+
+    #[test]
     fn test_step_to_completion_finishes_session() {
         let mut dec = make_decoder();
-        // eos=0, zero-weight model always picks 0 -> stops immediately
         let mut session = make_session(Some(0));
         dec.step_to_completion(&mut session).unwrap();
         assert!(session.is_finished());

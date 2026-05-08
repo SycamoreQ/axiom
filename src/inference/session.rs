@@ -1,4 +1,6 @@
 use crate::core::backend::Backend;
+#[cfg(feature = "cuda")]
+use crate::cuda::BlockTable;
 
 /*
 A session represents one inference request — its state lives here between generation steps.
@@ -27,6 +29,11 @@ pub struct Session<B: Backend> {
 
     // KV cache — one (k,v) pair per layer, grows each step
     pub kv_cache: Vec<(B::Tensor, B::Tensor)>,
+    pub session_id_u64: u64,
+    #[cfg(feature = "cuda")]
+    pub block_table: Option<crate::cuda::BlockTable>,
+    pub is_forked: bool, // true if this session was forked from a parent
+    pub base_len: usize,
 
     // position tracking
     pub offset: usize, // current position in sequence
@@ -56,6 +63,11 @@ impl<B: Backend> Session<B> {
             max_new_tokens,
             eos_token_id,
             status: SessionStatus::Waiting,
+            session_id_u64: id.0,
+            #[cfg(feature = "cuda")]
+            block_table: None,
+            is_forked: false,
+            base_len: 0,
         }
     }
 
@@ -107,13 +119,24 @@ impl<B: Backend> Session<B> {
             std::slice::from_ref(last)
         }
     }
-    // full token sequence prompt + generated
+    //full token sequence prompt + generated
     pub fn all_tokens(&self) -> Vec<u32> {
         self.prompt_tokens
             .iter()
             .chain(self.generated_tokens.iter())
             .copied()
             .collect()
+    }
+
+    //Mark this session as a fork of a parent at parent_seq_len.
+    pub fn mark_forked(&mut self, base_len: usize) {
+        self.is_forked = true;
+        self.base_len = base_len;
+    }
+
+    //Returns how many residual tokens this session has generated past the fork point.
+    pub fn residual_len(&self) -> usize {
+        self.total_tokens().saturating_sub(self.base_len)
     }
 }
 
@@ -277,5 +300,82 @@ mod tests {
         let id3 = SessionId(99);
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_new_session_is_not_forked() {
+        let s = make_session(vec![1, 2, 3], 10);
+        assert!(!s.is_forked);
+        assert_eq!(s.base_len, 0);
+    }
+
+    #[test]
+    fn test_new_session_block_table_is_none() {
+        let s = make_session(vec![1, 2, 3], 10);
+        #[cfg(feature = "cuda")]
+        assert!(s.block_table.is_none());
+    }
+
+    #[test]
+    fn test_new_session_id_u64_matches() {
+        let s = make_session(vec![1, 2, 3], 10);
+        assert_eq!(s.session_id_u64, 1u64); // make_session uses SessionId(1)
+    }
+
+    #[test]
+    fn test_mark_forked_sets_is_forked() {
+        let mut s = make_session(vec![1, 2, 3], 10);
+        s.mark_forked(3);
+        assert!(s.is_forked);
+    }
+
+    #[test]
+    fn test_mark_forked_sets_base_len() {
+        let mut s = make_session(vec![1, 2, 3], 10);
+        s.mark_forked(3);
+        assert_eq!(s.base_len, 3);
+    }
+
+    #[test]
+    fn test_mark_forked_twice_takes_last() {
+        let mut s = make_session(vec![1, 2, 3], 10);
+        s.mark_forked(3);
+        s.mark_forked(5);
+        assert_eq!(s.base_len, 5);
+    }
+
+    #[test]
+    fn test_residual_len_unforked_equals_total_tokens() {
+        let mut s = make_session(vec![1, 2, 3], 10);
+        s.push_token(4);
+        s.push_token(5);
+        // not forked, base_len = 0, residual = total = 5
+        assert_eq!(s.residual_len(), s.total_tokens());
+    }
+
+    #[test]
+    fn test_residual_len_forked_subtracts_base() {
+        let mut s = make_session(vec![1, 2, 3], 10);
+        s.mark_forked(3); // base covers the 3 prompt tokens
+        s.push_token(4);
+        s.push_token(5);
+        // total = 5, base = 3, residual = 2
+        assert_eq!(s.residual_len(), 2);
+    }
+
+    #[test]
+    fn test_residual_len_forked_no_generation_is_zero() {
+        let mut s = make_session(vec![1, 2, 3], 10);
+        s.mark_forked(3);
+        // no tokens generated yet, residual = 0
+        assert_eq!(s.residual_len(), 0);
+    }
+
+    #[test]
+    fn test_residual_len_saturates_at_zero() {
+        let mut s = make_session(vec![1, 2, 3], 10);
+        s.mark_forked(10); // base_len larger than total_tokens
+                           // should not underflow
+        assert_eq!(s.residual_len(), 0);
     }
 }
