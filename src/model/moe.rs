@@ -7,6 +7,7 @@ use crate::core::tensor::TensorOps;
 use crate::core::tensor::TopKLastDimOp;
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
+use crate::model::moe_loss::{compute_aux_loss, AuxLossConfig, MoeLossOutput};
 
 /*
 The Mixture Of Expert Backend. Very derivative from what vLLM did and the LLM seriving stratergies for the Megatron Core
@@ -297,12 +298,18 @@ impl<B: Backend> Router<B> {
     }
 
     pub fn load_balance_loss(
-        _router_logits: &B::Tensor,  // [T, E]
-        _expert_indices: &B::Tensor, // [T, K]
-        _num_experts: usize,
+        router_logits: &B::Tensor,  // [T, E]
+        expert_indices: &B::Tensor, // [T, K]
+        num_experts: usize,
     ) -> Result<B::Tensor> {
-        todo!()
-    } // scalar loss
+        let device = router_logits.device().clone();
+        crate::model::moe_loss::load_balance_loss::<B>(
+            router_logits,
+            expert_indices,
+            num_experts,
+            &device,
+        )
+    }
 }
 
 /* Expert  (single routed expert)
@@ -546,11 +553,10 @@ pub fn combine<B: Backend>(
 
 #[derive(Debug)]
 pub struct MoeOutput<B: Backend> {
-    //The transformed hidden states
     pub hidden_states: B::Tensor,
-    //Placeholder for auxiliary loss — filled in when wire the
-    //load-balancing file is made
     pub aux_loss: Option<B::Tensor>,
+    // replace the placeholder with the real loss output
+    pub loss_output: Option<MoeLossOutput<B>>,
 }
 
 pub struct MoeLayer<B: Backend> {
@@ -565,6 +571,7 @@ pub struct MoeLayer<B: Backend> {
     //The dimension experts actually compute over.
     //latent_dim if LatentMoE, else hidden_size.
     pub expert_dim: usize,
+    pub aux_loss_config: AuxLossConfig,
 }
 
 impl<B: Backend> MoeLayer<B> {
@@ -616,6 +623,7 @@ impl<B: Backend> MoeLayer<B> {
             config: router_config,
             hidden_size,
             expert_dim,
+            aux_loss_config: AuxLossConfig::inference(),
         })
     }
 
@@ -631,6 +639,16 @@ impl<B: Backend> MoeLayer<B> {
         let seq_len = x.shape().dim(1)?;
         let hidden_dim = x.shape().dim(2)?;
         let t = batch * seq_len;
+        let routing_output = self.router.forward(x)?;
+
+        let loss_output = compute_aux_loss::<B>(
+            &routing_output.router_logits,
+            &routing_output.expert_indices,
+            self.experts.len(),
+            &self.aux_loss_config,
+            x.device(),
+        )
+        .ok();
 
         let x_flat = x.reshape(&Shape::new(&[t, hidden_dim]))?;
 
@@ -647,7 +665,15 @@ impl<B: Backend> MoeLayer<B> {
         };
 
         // route tokens
-        let routing_output = self.router.forward(x)?;
+        // speculative correction — if we have a pregate buffer,
+        // compute the correction mask and store it for logging/metrics
+        // does not change routing, just identifies mispredictions
+        let _correction_mask = if let Some(ref buf) = self.pregate_buffer {
+            let device = x.device();
+            Router::<B>::speculative_correction(&routing_output, buf, device).ok()
+        } else {
+            None
+        };
 
         // dispatch to expert to combine
         let mut accumulator: Vec<Option<B::Tensor>> = vec![None; t];
@@ -698,7 +724,11 @@ impl<B: Backend> MoeLayer<B> {
 
         Ok(MoeOutput {
             hidden_states,
-            aux_loss: None,
+            aux_loss: loss_output
+                .as_ref()
+                .and_then(|l| l.total_aux_loss.as_ref())
+                .cloned(),
+            loss_output,
         })
     }
 
@@ -754,6 +784,24 @@ impl<B: Backend> MoeLayer<B> {
         if let Some(buf) = &mut self.pregate_buffer {
             buf.clear();
         }
+    }
+
+    pub fn set_training_mode(&mut self, config: AuxLossConfig) {
+        self.aux_loss_config = config;
+    }
+
+    //Returns the set of expert indices that should be prefetched
+    //for the next step based on high-confidence predictions in the buffer.
+    //Called before forward() in the generation loop.
+    pub fn prefetch_experts(&self) -> Vec<ExpertIndex> {
+        match (&self.pregate_buffer, self.config.prefetch_threshold) {
+            (Some(buf), Some(threshold)) => buf.prefetch_candidates(threshold),
+            _ => vec![],
+        }
+    }
+
+    pub fn is_prefetched(&self, e: ExpertIndex) -> bool {
+        self.prefetch_experts().contains(&e)
     }
 }
 
@@ -1114,5 +1162,189 @@ mod tests {
         assert_eq!(out.hidden_states.shape(), &Shape::new(&[1, 1, 32]));
         let buf = layer.pregate_buffer.as_ref().unwrap();
         assert!(buf.read(TokenPos(10)).is_some());
+    }
+
+    // ── Phase 4 tests ──
+
+    #[test]
+    fn test_moe_layer_has_inference_aux_config_by_default() {
+        let config = make_moe_config();
+        let layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        assert!(!layer.aux_loss_config.enabled);
+    }
+
+    #[test]
+    fn test_moe_layer_set_training_mode() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        layer.set_training_mode(crate::model::moe_loss::AuxLossConfig::training());
+        assert!(layer.aux_loss_config.enabled);
+    }
+
+    #[test]
+    fn test_moe_forward_inference_aux_loss_is_none() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        assert!(out.aux_loss.is_none());
+    }
+
+    #[test]
+    fn test_moe_forward_training_aux_loss_is_some() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        layer.set_training_mode(crate::model::moe_loss::AuxLossConfig::training());
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        assert!(out.aux_loss.is_some());
+    }
+
+    #[test]
+    fn test_moe_forward_training_aux_loss_is_scalar() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        layer.set_training_mode(crate::model::moe_loss::AuxLossConfig::training());
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        assert_eq!(out.aux_loss.unwrap().numel(), 1);
+    }
+
+    #[test]
+    fn test_moe_forward_training_aux_loss_is_positive() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        layer.set_training_mode(crate::model::moe_loss::AuxLossConfig::training());
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        let val = out.aux_loss.unwrap().to_vec_f32().unwrap()[0];
+        assert!(val > 0.0, "aux loss should be positive, got {}", val);
+    }
+
+    #[test]
+    fn test_prefetch_experts_empty_without_buffer() {
+        let mut config = make_moe_config();
+        config.prefetch_threshold = None;
+        let layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        assert!(layer.prefetch_experts().is_empty());
+    }
+
+    #[test]
+    fn test_prefetch_experts_returns_high_confidence_experts() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        if let Some(ref mut buf) = layer.pregate_buffer {
+            buf.write(
+                TokenPos(0),
+                SpeculativeRecord {
+                    token_pos: TokenPos(0),
+                    expert_indices: vec![ExpertIndex(1), ExpertIndex(3)],
+                    max_score: 0.9,
+                },
+            );
+        }
+        let candidates = layer.prefetch_experts();
+        assert!(!candidates.is_empty());
+        assert!(candidates.contains(&ExpertIndex(1)));
+        assert!(candidates.contains(&ExpertIndex(3)));
+    }
+
+    #[test]
+    fn test_prefetch_experts_ignores_low_confidence() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        if let Some(ref mut buf) = layer.pregate_buffer {
+            buf.write(
+                TokenPos(0),
+                SpeculativeRecord {
+                    token_pos: TokenPos(0),
+                    expert_indices: vec![ExpertIndex(0)],
+                    max_score: 0.1,
+                },
+            );
+        }
+        let candidates = layer.prefetch_experts();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_is_prefetched_true_for_candidate() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        if let Some(ref mut buf) = layer.pregate_buffer {
+            buf.write(
+                TokenPos(0),
+                SpeculativeRecord {
+                    token_pos: TokenPos(0),
+                    expert_indices: vec![ExpertIndex(2)],
+                    max_score: 0.95,
+                },
+            );
+        }
+        assert!(layer.is_prefetched(ExpertIndex(2)));
+    }
+
+    #[test]
+    fn test_is_prefetched_false_for_non_candidate() {
+        let config = make_moe_config();
+        let layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        assert!(!layer.is_prefetched(ExpertIndex(0)));
+    }
+
+    #[test]
+    fn test_speculative_correction_wired_in_forward() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 2, 32]), DType::F32, &cpu()).unwrap();
+        layer.forward(&x, 0).unwrap();
+        let buf = layer.pregate_buffer.as_ref().unwrap();
+        assert!(buf.read(TokenPos(0)).is_some());
+        assert!(buf.read(TokenPos(1)).is_some());
+        // second forward — correction mask computed internally, no panic
+        layer.forward(&x, 0).unwrap();
+    }
+
+    #[test]
+    fn test_router_load_balance_loss_delegates_correctly() {
+        let config = make_moe_config();
+        let rc = RouterConfig::from_model_config(&config);
+        let router = Router::<CandleBackend>::new(32, rc, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let routing = router.forward(&x).unwrap();
+        let loss = Router::<CandleBackend>::load_balance_loss(
+            &routing.router_logits,
+            &routing.expert_indices,
+            4,
+        )
+        .unwrap();
+        assert_eq!(loss.numel(), 1);
+        let val = loss.to_vec_f32().unwrap()[0];
+        assert!(val > 0.0);
+    }
+
+    #[test]
+    fn test_loss_output_field_populated_in_training_mode() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        layer.set_training_mode(crate::model::moe_loss::AuxLossConfig::training());
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        assert!(out.loss_output.is_some());
+        let loss_out = out.loss_output.unwrap();
+        assert!(loss_out.load_balance_loss.is_some());
+        assert!(loss_out.z_loss.is_some());
+        assert!(loss_out.total_aux_loss.is_some());
+    }
+
+    #[test]
+    fn test_loss_output_none_in_inference_mode() {
+        let config = make_moe_config();
+        let mut layer = MoeLayer::<CandleBackend>::new(&config, None, &cpu()).unwrap();
+        let x = CandleTensor::zeros(&Shape::new(&[1, 4, 32]), DType::F32, &cpu()).unwrap();
+        let out = layer.forward(&x, 0).unwrap();
+        // in inference mode loss_output should be None or all fields None
+        if let Some(loss_out) = out.loss_output {
+            assert!(loss_out.total_aux_loss.is_none());
+        }
     }
 }

@@ -1,7 +1,7 @@
 use crate::core::backend::Backend;
 use crate::core::device::Device;
 #[cfg(feature = "cuda")]
-use crate::cuda::{CudaContext, ForkManager};
+use crate::cuda::{fork_manager::ForkManager, CudaContext};
 use crate::inference::batch::Batch;
 use crate::inference::generator::Generator;
 use crate::inference::sampler::{Sampler, SamplerConfig};
@@ -178,7 +178,7 @@ impl<B: Backend> Engine<B> {
         if let Some(fm) = &self.fork_manager {
             fm.lock()
                 .unwrap()
-                .fork_session(parent_id.0, child_id.0, parent_tokens);
+                .fork_session(parent_id.0, child_id.0, _ctx);
         }
 
         let base_len = child_session.prompt_tokens.len();

@@ -1,6 +1,8 @@
 use crate::core::backend::Backend;
 use crate::core::device::Device;
 use crate::core::tensor::TensorOps;
+#[cfg(feature = "cuda")]
+use crate::cuda::fork_manager::ForkManager;
 use crate::inference::sampler::Sampler;
 use crate::inference::session::{Session, SessionId, SessionStatus};
 use crate::model::model::LlamaModel;

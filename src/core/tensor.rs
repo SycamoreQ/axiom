@@ -96,6 +96,8 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn sum_keepdim(&self, dim: usize) -> Result<Self>;
     fn broadcast_div(&self, other: &Self) -> Result<Self>;
     fn to_vec_f32(&self) -> Result<Vec<f32>>;
+    fn exp(&self) -> Result<Self>;
+    fn log(&self) -> Result<Self>;
 }
 
 impl TensorOps for CandleTensor {
@@ -574,6 +576,24 @@ impl TensorOps for CandleTensor {
             .to_vec1::<f32>()
             .map_err(|e| CoreError::Candle(e))
     }
+
+    fn exp(&self) -> Result<Self> {
+        Ok(CandleTensor {
+            inner: self.inner.exp()?,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
+    fn log(&self) -> Result<Self> {
+        Ok(CandleTensor {
+            inner: self.inner.log()?,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
 }
 
 // todo component as Cudarc tensors yet to implemented in itslf for kernel logic
@@ -729,6 +749,14 @@ impl TensorOps for CudarcTensor {
     }
 
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        todo!("phase 4")
+    }
+
+    fn exp(&self) -> Result<Self> {
+        todo!("phase 4")
+    }
+
+    fn log(&self) -> Result<Self> {
         todo!("phase 4")
     }
 }

@@ -6,5 +6,6 @@ pub mod feedforward;
 pub mod linear;
 pub mod model;
 pub mod moe;
+pub mod moe_loss;
 pub mod norm;
 pub mod rope;
