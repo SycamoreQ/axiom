@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 pub struct Engine<B: Backend> {
     generator: Generator<B>,
-    batch: Batch<B>,
+    pub batch: Batch<B>,
     next_session_id: u64,
     #[cfg(feature = "cuda")]
     pub fork_manager: Option<Arc<Mutex<ForkManager<B>>>>,
@@ -145,6 +145,10 @@ impl<B: Backend> Engine<B> {
             results.push((s.id, s.generated_tokens));
         }
         results
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        self.generator.tokenizer()
     }
 
     #[cfg(feature = "cuda")]

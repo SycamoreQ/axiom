@@ -13,6 +13,7 @@ pub struct SamplerConfig {
     pub repetition_penalty: f32, // 1.0 = no penalty, >1.0 = penalize repeats
     pub max_new_tokens: usize,
     pub seed: Option<u64>,
+    pub vocab_size: Option<usize>,
 }
 
 pub struct Sampler {
@@ -29,6 +30,7 @@ impl Default for SamplerConfig {
             repetition_penalty: 1.0,
             max_new_tokens: 256,
             seed: None,
+            vocab_size: None,
         }
     }
 }
@@ -44,6 +46,14 @@ impl Sampler {
 
     pub fn sample(&mut self, logits: &[f32], previous_tokens: &[u32]) -> u32 {
         let mut logits_vec = logits.to_vec();
+
+        if let Some(vocab_size) = self.config.vocab_size {
+            if logits_vec.len() > vocab_size {
+                for v in &mut logits_vec[vocab_size..] {
+                    *v = f32::NEG_INFINITY;
+                }
+            }
+        }
 
         //Repetition Penalty (Do this first on raw logits)
         if self.config.repetition_penalty != 1.0 {

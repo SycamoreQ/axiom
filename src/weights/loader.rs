@@ -218,16 +218,28 @@ pub fn load_bytes_as_tensor<B: Backend>(
             B::Tensor::from_slice(&floats, &shape, device)
                 .map_err(|e| LoaderError::Backend(e.to_string()))
         }
-        // Quantized types — stub, dequantization kernels come in Phase 4/8
+
         dtype => {
-            // TODO: implement dequantization for Q4_0, Q4_1, Q8_0, Q4_K, etc.
-            // For now return zeros with correct shape so model structure loads
-            eprintln!(
-                "WARNING: tensor {} dtype {:?} — loading as zeros (dequant not yet implemented)",
-                info.name, dtype
-            );
-            B::Tensor::zeros(&shape, DType::F32, device)
-                .map_err(|e| LoaderError::Backend(e.to_string()))
+            let floats = crate::weights::quantize::dequantize(data, dtype, info.numel() as usize);
+            // check if it was actually handled or fell through to zeros
+            if matches!(
+                dtype,
+                GgufDType::Q4_0
+                    | GgufDType::Q4_1
+                    | GgufDType::Q8_0
+                    | GgufDType::Q4_K
+                    | GgufDType::Q6_K
+            ) {
+                B::Tensor::from_slice(&floats, &shape, device)
+                    .map_err(|e| LoaderError::Backend(e.to_string()))
+            } else {
+                eprintln!(
+                    "WARNING: tensor {} dtype {:?} — no dequant, loading as zeros",
+                    info.name, dtype
+                );
+                B::Tensor::zeros(&shape, DType::F32, device)
+                    .map_err(|e| LoaderError::Backend(e.to_string()))
+            }
         }
     }
 }

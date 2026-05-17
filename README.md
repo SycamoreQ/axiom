@@ -255,17 +255,15 @@ cargo test --features cuda cuda::
 
 ---
 
-## Development Arcs
+## First Words 
 
-| Arc | Status | Description |
-|-----|--------|-------------|
-| Arc 1 | Complete | Core tensor layer, model, tokenizer, sampler, server, GGUF loader |
-| Arc 2 | Complete | CUDA kernels, PTX compilation, cudarc bindings, paged allocator |
-| Arc 3 | In progress | ForkKV engine integration, paged sessions, fork operation |
-| Arc 3.5 | Planned | Speculative decoding integrated with ForkKV |
-| Arc 4 | Planned | MoE pre-gating prefetch, novel routing, quantization dequant kernels |
+```bash
+Loading tokenizer... ok  (vocab 128000)
+Loading model (this takes a few seconds)... ok
+Output   : Once upon a time
+          .el addChildCompatiblecountyуют//*[miyor ExclusiveootballLL
+```
 
----
 
 ## References
 
