@@ -50,7 +50,7 @@ fn main() {
 
     // ── engine ──
     let sampler_config = SamplerConfig {
-        temperature: 0.8,
+        temperature: 0.0,
         top_p: Some(0.95),
         top_k: Some(40),
         seed: Some(42),

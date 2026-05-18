@@ -326,5 +326,7 @@ TSWLatexianTemp*
 #*Notes.bib
 
 /target
+/target 2
+/target 3
 *.gguf
 testdata/*.gguf

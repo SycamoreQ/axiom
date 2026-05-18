@@ -230,6 +230,15 @@ pub fn load_bytes_as_tensor<B: Backend>(
                     | GgufDType::Q4_K
                     | GgufDType::Q6_K
             ) {
+                if info.name == "token_embd.weight" {
+                    let scale_bits = u16::from_le_bytes([data[0], data[1]]);
+                    let scale = half::f16::from_bits(scale_bits).to_f32();
+                    eprintln!("DEBUG token_embd first block scale: {}", scale);
+                    eprintln!(
+                        "DEBUG token_embd first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+                        data[0], data[1], data[2], data[3]
+                    );
+                }
                 B::Tensor::from_slice(&floats, &shape, device)
                     .map_err(|e| LoaderError::Backend(e.to_string()))
             } else {

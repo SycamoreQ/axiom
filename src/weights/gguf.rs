@@ -3,6 +3,7 @@ use memmap2::Mmap;
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::Path;
+use tokio::io::AsyncSeekExt;
 
 /*
 GGUF is the binary format used by llama.cpp and most community model distributions.
@@ -334,6 +335,8 @@ pub fn parse_gguf(buffer: &[u8]) -> Result<GgufFile, GgufError> {
         );
     }
 
+    let mut current_offset = cursor.stream_position()?;
+
     let alignment = metadata
         .get("general.alignment")
         .and_then(|v| {
@@ -344,6 +347,7 @@ pub fn parse_gguf(buffer: &[u8]) -> Result<GgufFile, GgufError> {
             }
         })
         .unwrap_or(32u64);
+
     let pos = cursor.position();
     let data_offset = ((pos + alignment - 1) & !(alignment - 1)) as usize;
 
