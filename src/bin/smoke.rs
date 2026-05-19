@@ -25,7 +25,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
-    println!("=== Axiom Smoke Test ===");
+    println!("Axiom Smoke Test");
     println!("Model    : {}", gguf_path);
     println!("Tokenizer: {}", tokenizer_path);
     println!("Prompt   : {:?}", prompt);
@@ -50,12 +50,12 @@ fn main() {
 
     // ── engine ──
     let sampler_config = SamplerConfig {
-        temperature: 0.0,
-        top_p: Some(0.95),
-        top_k: Some(40),
+        temperature: 0.5,
+        top_p: Some(0.9),
+        top_k: Some(50),
         seed: Some(42),
         max_new_tokens,
-        repetition_penalty: 1.1,
+        repetition_penalty: 1.4,
         vocab_size: Some(vocab_size),
     };
 
@@ -87,7 +87,6 @@ fn main() {
         for (sid, token) in &results {
             if *sid == session_id {
                 let text = engine.tokenizer().decode(&[*token as usize]);
-                print!("{}", text);
                 std::io::stdout().flush().unwrap();
                 steps += 1;
             }
@@ -118,7 +117,7 @@ fn main() {
 
     // ── full decoded output ──
     println!();
-    println!("=== Full output ===");
+    println!("Full output");
     let full = engine.decode_output(session_id).unwrap_or_default();
     println!("{}{}", prompt, full);
 }

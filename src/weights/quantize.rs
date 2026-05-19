@@ -45,7 +45,6 @@ const Q4_0_BLOCK_SIZE: usize = 32;
 const Q4_0_BLOCK_BYTES: usize = 2 + Q4_0_BLOCK_SIZE / 2; // 18 bytes
 
 fn dequantize_q4_0(data: &[u8], numel: usize) -> Vec<f32> {
-    // block layout: 2 bytes f16 scale + 16 bytes nibbles = 18 bytes per 32 elements
     let mut out = vec![0.0f32; numel];
     let mut out_idx = 0;
 
@@ -54,28 +53,94 @@ fn dequantize_q4_0(data: &[u8], numel: usize) -> Vec<f32> {
             break;
         }
 
-        // first 2 bytes: f16 scale
+        // little-endian f16 scale
         let scale_bits = u16::from_le_bytes([block[0], block[1]]);
         let scale = half::f16::from_bits(scale_bits).to_f32();
 
-        // next 16 bytes: 32 nibbles packed, two per byte
-        // low nibble first, then high nibble
-        for byte_idx in 0..16 {
-            if out_idx + 1 >= numel + 1 {
+        // 16 bytes = 32 nibbles
+        // qs[i] low  nibble = element i
+        // qs[i] high nibble = element i + 16
+        let qs = &block[2..18];
+
+        // first pass: low nibbles → elements 0..15
+        for i in 0..16 {
+            if out_idx >= numel {
                 break;
             }
-            let byte = block[2 + byte_idx];
-            let lo = (byte & 0x0F) as i32 - 8;
-            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+            let lo = (qs[i] & 0x0F) as i32 - 8;
+            out[out_idx] = lo as f32 * scale;
+            out_idx += 1;
+        }
 
-            if out_idx < numel {
-                out[out_idx] = lo as f32 * scale;
-                out_idx += 1;
+        // second pass: high nibbles → elements 16..31
+        for i in 0..16 {
+            if out_idx >= numel {
+                break;
             }
-            if out_idx < numel {
-                out[out_idx] = hi as f32 * scale;
-                out_idx += 1;
+            let hi = ((qs[i] >> 4) & 0x0F) as i32 - 8;
+            out[out_idx] = hi as f32 * scale;
+            out_idx += 1;
+        }
+    }
+
+    out
+}
+
+const Q6_K_BLOCK_SIZE: usize = 256;
+const Q6_K_BLOCK_BYTES: usize = 128 + 64 + 16 + 2; // 210 bytes
+
+fn dequantize_q6_k(data: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let mut out_idx = 0;
+
+    for block in data.chunks_exact(Q6_K_BLOCK_BYTES) {
+        if out_idx >= numel {
+            break;
+        }
+
+        // superblock scale: f16 at bytes 208-209
+        let d_bits = u16::from_le_bytes([block[208], block[209]]);
+        let d = half::f16::from_bits(d_bits).to_f32();
+
+        // ql: bytes 0..128   — lower 4 bits of each quant
+        // qh: bytes 128..192 — upper 2 bits of each quant
+        // scales: bytes 192..208 — int8 scale per 16-element subblock
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+
+        // reconstruct 256 quantized values
+        for i in 0..Q6_K_BLOCK_SIZE {
+            if out_idx >= numel {
+                break;
             }
+
+            // lower 4 bits come from ql
+            // ql packs two 4-bit values per byte
+            // element i uses ql[i/2], taking low nibble for even i, high for odd
+            let ql_byte = ql[i / 2];
+            let lower = if i % 2 == 0 {
+                (ql_byte & 0x0F) as i32
+            } else {
+                ((ql_byte >> 4) & 0x0F) as i32
+            };
+
+            // upper 2 bits come from qh
+            // qh packs four 2-bit values per byte
+            // element i uses qh[i/4], taking bits [2*(i%4)] and [2*(i%4)+1]
+            let qh_byte = qh[i / 4];
+            let shift = (i % 4) * 2;
+            let upper = ((qh_byte >> shift) & 0x03) as i32;
+
+            // combine: 6-bit value centered at 32
+            let q = (lower | (upper << 4)) - 32;
+
+            // scale: one int8 scale per 16-element subblock
+            let scale_idx = i / 16;
+            let scale = scales[scale_idx] as i8 as f32;
+
+            out[out_idx] = q as f32 * scale * d;
+            out_idx += 1;
         }
     }
 
@@ -108,12 +173,6 @@ fn dequantize_q8_0(data: &[u8], numel: usize) -> Vec<f32> {
 //More complex layout — see ggml-quants.c for reference
 
 fn dequantize_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
-    // todo()
-    let _ = data;
-    vec![0.0f32; numel]
-}
-
-fn dequantize_q6_k(data: &[u8], numel: usize) -> Vec<f32> {
     // todo()
     let _ = data;
     vec![0.0f32; numel]
@@ -169,17 +228,14 @@ mod tests {
 
     #[test]
     fn test_q4_0_known_values() {
-        // construct one block with known scale and nibbles
-        // scale = 1.0 in f16 = 0x3C00
-        // nibble value 15 → (15 - 8) * 1.0 = 7.0
-        // nibble value 0  → (0  - 8) * 1.0 = -8.0
-        // pack as byte: lo=15 (0xF), hi=0 (0x0) → byte = 0x0F
+        // scale = f16(1.0) = 0x3C00, little-endian = [0x00, 0x3C]
+        // qs[0] = 0x0F → lo nibble=15 → 15-8=7, hi nibble=0 → 0-8=-8
+        // element 0 = 7.0, element 16 = -8.0
         let mut block = vec![0u8; Q4_0_BLOCK_BYTES];
         block[0] = 0x00;
-        block[1] = 0x3C; // f16 1.0 in little-endian = [0x00, 0x3C]
-                         // first nibble byte: lo=15, hi=0
-        block[2] = 0x0F;
-        // rest: lo=8, hi=8 → centered at 0
+        block[1] = 0x3C; // f16 1.0
+        block[2] = 0x0F; // lo=15, hi=0
+                         // rest: 0x88 → lo=8-8=0, hi=8-8=0
         for i in 3..Q4_0_BLOCK_BYTES {
             block[i] = 0x88;
         }
@@ -187,17 +243,29 @@ mod tests {
         assert_eq!(out.len(), 32);
         assert!(
             (out[0] - 7.0).abs() < 1e-3,
-            "lo nibble 15 → 7.0, got {}",
+            "element 0 should be 7.0, got {}",
             out[0]
         );
         assert!(
-            (out[1] - (-8.0)).abs() < 1e-3,
-            "hi nibble 0 → -8.0, got {}",
-            out[1]
+            (out[16] - (-8.0)).abs() < 1e-3,
+            "element 16 should be -8.0, got {}",
+            out[16]
         );
-        // rest should be 0.0
-        for v in &out[2..] {
-            assert!(v.abs() < 1e-3, "expected ~0.0, got {}", v);
+        for i in 1..16 {
+            assert!(
+                out[i].abs() < 1e-3,
+                "element {} should be 0.0, got {}",
+                i,
+                out[i]
+            );
+        }
+        for i in 17..32 {
+            assert!(
+                out[i].abs() < 1e-3,
+                "element {} should be 0.0, got {}",
+                i,
+                out[i]
+            );
         }
     }
 
@@ -224,5 +292,52 @@ mod tests {
         let block = vec![0u8; Q4_0_BLOCK_BYTES];
         let out = dequantize(&block, GgufDType::Q4_0, 32);
         assert_eq!(out.len(), 32);
+    }
+
+    #[test]
+    fn test_q6_k_block_bytes_constant() {
+        assert_eq!(Q6_K_BLOCK_BYTES, 210);
+    }
+
+    #[test]
+    fn test_q6_k_output_length() {
+        let data = vec![0u8; Q6_K_BLOCK_BYTES];
+        let out = dequantize_q6_k(&data, 256);
+        assert_eq!(out.len(), 256);
+    }
+
+    #[test]
+    fn test_q6_k_zero_scale_produces_zeros() {
+        // d = f16(0) = 0x0000, all other bytes zero
+        // q values = (0 | 0) - 32 = -32, but scale d=0 → output 0
+        let mut block = vec![0u8; Q6_K_BLOCK_BYTES];
+        block[208] = 0x00;
+        block[209] = 0x00;
+        let out = dequantize_q6_k(&block, 256);
+        for v in &out {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_q6_k_multiple_blocks() {
+        let block = vec![0u8; Q6_K_BLOCK_BYTES];
+        let data = [block.clone(), block].concat();
+        let out = dequantize_q6_k(&data, 512);
+        assert_eq!(out.len(), 512);
+    }
+
+    #[test]
+    fn test_q6_k_numel_truncation() {
+        let block = vec![0u8; Q6_K_BLOCK_BYTES];
+        let out = dequantize_q6_k(&block, 128);
+        assert_eq!(out.len(), 128);
+    }
+
+    #[test]
+    fn test_dequantize_dispatch_q6_k() {
+        let block = vec![0u8; Q6_K_BLOCK_BYTES];
+        let out = dequantize(&block, GgufDType::Q6_K, 256);
+        assert_eq!(out.len(), 256);
     }
 }

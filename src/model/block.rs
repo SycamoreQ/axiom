@@ -65,7 +65,14 @@ impl<B: Backend> Block<B> {
         //attention with pre-norm and residual
         let h = self.attn_norm.forward(x)?;
         let (attn_out, new_k, new_v) = self.attn.forward(&h, mask, kv_cache, offset)?;
+
+        let ao_vec = attn_out.to_vec_f32()?;
+        let ao_max = ao_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
         let x = x.add(&attn_out)?;
+
+        let after_vec = x.to_vec_f32()?;
+        let after_max = after_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
         //ffn with pre-norm and residual
         let h = self.ffn_norm.forward(&x)?;

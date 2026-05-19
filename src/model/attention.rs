@@ -1,4 +1,3 @@
-
 use crate::core::backend::Backend;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
@@ -124,6 +123,9 @@ impl<B: Backend> Attention<B> {
             None => scores,
         };
 
+        let scores_vec = scores.to_vec_f32()?;
+        let scores_max = scores_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
         let weights = scores.softmax(3)?;
         let out = weights.broadcast_matmul(&v)?;
 
@@ -135,6 +137,14 @@ impl<B: Backend> Attention<B> {
         ]))?;
 
         let out = self.o_proj.forward(&out)?;
+
+        let out_vec = out.to_vec_f32()?;
+        let out_max = out_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ATTN_CALL: AtomicUsize = AtomicUsize::new(0);
+        let call_idx = ATTN_CALL.fetch_add(1, Ordering::Relaxed);
+        if call_idx < 2 {}
 
         Ok((out, k_cache, v_cache)) // (output, new_k, new_v)
     }

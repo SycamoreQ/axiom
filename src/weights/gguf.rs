@@ -120,6 +120,7 @@ impl GgufDType {
             Self::Q8_0 => 1.0 + (4.0 / 32.0), // 32 i8 + 1 f16 scale per block
             Self::Q4_0 => 0.5 + (2.0 / 32.0), // 32 nibbles + 1 f16 scale
             Self::Q4_1 => 0.5 + (4.0 / 32.0), // 32 nibbles + 2 f16
+            Self::Q6_K => 210.0 / 256.0,      // 210 bytes per 256 elements
             _ => 0.5,                         // conservative default
         }
     }
@@ -334,8 +335,6 @@ pub fn parse_gguf(buffer: &[u8]) -> Result<GgufFile, GgufError> {
             },
         );
     }
-
-    let mut current_offset = cursor.stream_position()?;
 
     let alignment = metadata
         .get("general.alignment")

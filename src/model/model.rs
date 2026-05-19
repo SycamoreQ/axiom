@@ -74,10 +74,19 @@ impl<B: Backend> LlamaModel<B> {
         let seq_len = token_ids.len();
         let x = self.embedding.forward(token_ids)?;
         let mut x = x.unsqueeze(0)?;
+        let emb_vec = x.to_vec_f32()?;
+        let emb_max = emb_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let emb_min = emb_vec.iter().cloned().fold(f32::INFINITY, f32::min);
         let device = x.device().clone();
         let mask = self.causal_mask(seq_len, &device)?;
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
+            if i == 0 {
+                let b_vec = x.to_vec_f32()?;
+                let b_max = b_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let b_min = b_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+            }
+
             let cache = kv_cache
                 .as_deref()
                 .and_then(|v| v.get(i).map(|(k, v)| (k, v)));

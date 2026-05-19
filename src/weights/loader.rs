@@ -222,6 +222,11 @@ pub fn load_bytes_as_tensor<B: Backend>(
         dtype => {
             let floats = crate::weights::quantize::dequantize(data, dtype, info.numel() as usize);
             // check if it was actually handled or fell through to zeros
+            // add temporarily in loader.rs after the dequantize call
+            if info.name == "blk.0.attn_q.weight" {
+                let first_few: Vec<f32> = floats.iter().take(8).cloned().collect();
+            }
+
             if matches!(
                 dtype,
                 GgufDType::Q4_0
@@ -233,19 +238,10 @@ pub fn load_bytes_as_tensor<B: Backend>(
                 if info.name == "token_embd.weight" {
                     let scale_bits = u16::from_le_bytes([data[0], data[1]]);
                     let scale = half::f16::from_bits(scale_bits).to_f32();
-                    eprintln!("DEBUG token_embd first block scale: {}", scale);
-                    eprintln!(
-                        "DEBUG token_embd first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
-                        data[0], data[1], data[2], data[3]
-                    );
                 }
                 B::Tensor::from_slice(&floats, &shape, device)
                     .map_err(|e| LoaderError::Backend(e.to_string()))
             } else {
-                eprintln!(
-                    "WARNING: tensor {} dtype {:?} — no dequant, loading as zeros",
-                    info.name, dtype
-                );
                 B::Tensor::zeros(&shape, DType::F32, device)
                     .map_err(|e| LoaderError::Backend(e.to_string()))
             }
@@ -264,19 +260,47 @@ pub fn load_from_gguf<B: Backend>(
     let mut model =
         LlamaModel::<B>::new(&config, device).map_err(|e| LoaderError::Backend(e.to_string()))?;
 
-    // Load each known tensor into the model
+    let mut has_output_weight = false;
+    let mut token_embd_tensor: Option<B::Tensor> = None;
+
     for (name, info) in &gguf.tensors {
         let kind = match LlamaTensor::parse(name) {
             Some(k) => k,
-            None => continue, // skip unknown / rope tensors etc.
+            None => continue,
         };
+
         let data = gguf
             .get_tensor_data(name)
             .ok_or_else(|| LoaderError::MissingTensor(name.clone()))?;
         let tensor = load_bytes_as_tensor::<B>(data, info, device)?;
+
+        // track whether we have a separate output weight
+        if matches!(kind, LlamaTensor::Output) {
+            has_output_weight = true;
+        }
+
+        // keep a clone of the embedding tensor for weight tying
+        if matches!(kind, LlamaTensor::TokenEmbd) {
+            token_embd_tensor = Some(tensor.clone());
+        }
+
         model
             .set_tensor(&kind, tensor)
             .map_err(|e| LoaderError::Backend(e.to_string()))?;
+    }
+
+    // weight tying — if no separate output.weight exists,
+    // lm_head uses the same weights as the token embedding
+    if !has_output_weight {
+        if let Some(embd) = token_embd_tensor {
+            // embd shape is [2048, 128256] after GGUF shape reversal
+            // Linear::forward does weight.transpose(0,1) → [128256, 2048]
+            // then x @ wt = [batch, seq, 2048] @ [2048, 128256] = [batch, seq, 128256]
+            // so we pass embd directly, no extra transpose needed
+            model
+                .set_tensor(&LlamaTensor::Output, embd)
+                .map_err(|e| LoaderError::Backend(e.to_string()))?;
+        }
     }
 
     Ok(model)
