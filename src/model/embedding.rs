@@ -5,7 +5,7 @@ use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 
 pub struct Embedding<B: Backend> {
-    weight: B::Tensor, // [vocab_size, hidden_size]
+    weight: B::Tensor,
     vocab_size: usize,
     hidden_size: usize,
 }
@@ -31,6 +31,7 @@ impl<B: Backend> Embedding<B> {
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
     }
+
     pub fn hidden_size(&self) -> usize {
         self.hidden_size
     }

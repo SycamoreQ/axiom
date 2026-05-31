@@ -118,14 +118,14 @@ impl GgufDType {
             Self::F16 | Self::BF16 | Self::I16 => 2.0,
             Self::I8 => 1.0,
             Self::Q8_0 => 1.0 + (4.0 / 32.0), // 32 i8 + 1 f16 scale per block
-            Self::Q4_0 => 0.5 + (2.0 / 32.0), // 32 nibbles + 1 f16 scale
+            Self::Q4_0 => 0.5 + (4.0 / 32.0), // 32 nibbles + 1 f16 scale
             Self::Q4_1 => 0.5 + (4.0 / 32.0), // 32 nibbles + 2 f16
             Self::Q6_K => 210.0 / 256.0,      // 210 bytes per 256 elements
-            _ => 0.5,                         // conservative default
+            _ => 0.5,
         }
     }
 
-    /// Is this type directly loadable as f32 without dequantization?
+    //Is this type directly loadable as f32 without dequantization?
     pub fn is_float(&self) -> bool {
         matches!(self, Self::F32 | Self::F16 | Self::BF16)
     }
@@ -145,9 +145,25 @@ impl GgufTensorInfo {
         self.shape.iter().product()
     }
 
-    /// Byte size on disk (approximate for quantized types).
     pub fn byte_size(&self) -> usize {
-        (self.numel() as f32 * self.dtype.bytes_per_element()).ceil() as usize
+        let n = self.numel() as usize;
+        match self.dtype {
+            GgufDType::F32 | GgufDType::I32 => n * 4,
+            GgufDType::F16 | GgufDType::BF16 | GgufDType::I16 => n * 2,
+            GgufDType::I8 => n,
+            GgufDType::Q4_0 => ((n + 31) / 32) * 18,
+            GgufDType::Q4_1 => ((n + 31) / 32) * 20,
+            GgufDType::Q8_0 => ((n + 31) / 32) * 34,
+            GgufDType::Q5_0 => ((n + 31) / 32) * 22,
+            GgufDType::Q5_1 => ((n + 31) / 32) * 24,
+            GgufDType::Q2_K => ((n + 255) / 256) * 84,
+            GgufDType::Q3_K => ((n + 255) / 256) * 110,
+            GgufDType::Q4_K => ((n + 255) / 256) * 144,
+            GgufDType::Q5_K => ((n + 255) / 256) * 176,
+            GgufDType::Q6_K => ((n + 255) / 256) * 210,
+            GgufDType::Q8_K => ((n + 255) / 256) * 292,
+            _ => (self.numel() as f64 * self.dtype.bytes_per_element() as f64).ceil() as usize,
+        }
     }
 }
 
@@ -178,6 +194,10 @@ impl GgufFile {
     pub fn get_u32(&self, key: &str) -> Option<u32> {
         match self.metadata.get(key)? {
             GgufValue::Uint32(v) => Some(*v),
+            GgufValue::Uint64(v) => Some(*v as u32),
+            GgufValue::Int32(v) => Some(*v as u32),
+            GgufValue::Int64(v) => Some(*v as u32),
+            GgufValue::String(s) => s.parse::<u32>().ok(),
             _ => None,
         }
     }
@@ -185,6 +205,20 @@ impl GgufFile {
     pub fn get_f32(&self, key: &str) -> Option<f32> {
         match self.metadata.get(key)? {
             GgufValue::Float32(v) => Some(*v),
+            GgufValue::Float64(v) => Some(*v as f32),
+            GgufValue::String(s) => s.parse::<f32>().ok(),
+            GgufValue::Uint32(v) => Some(*v as f32),
+            GgufValue::Int32(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        match self.metadata.get(key)? {
+            GgufValue::Uint64(v) => Some(*v),
+            GgufValue::Uint32(v) => Some(*v as u64),
+            GgufValue::Int64(v) => Some(*v as u64),
+            GgufValue::Int32(v) => Some(*v as u64),
             _ => None,
         }
     }

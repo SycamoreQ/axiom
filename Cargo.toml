@@ -33,8 +33,11 @@ fancy-regex = "0.13"
 
 # Tensor backend — Candle (HuggingFace)
 # CPU-only for now, CUDA feature enabled in the cuda profile below
-candle-core = { version = "0.6", default-features = false }
-candle-nn   = { version = "0.6", default-features = false }
+candle-core = { version = "0.6", features = ["accelerate"] }
+candle-nn   = { version = "0.6", features = ["accelerate"] }
+
+# Apple Accelerate BLAS bindings
+accelerate-src = { version = "0.3", optional = true }
 
 # CUDA low-level kernel management (Phase 3)
 cudarc = { version = "0.19", features = ["driver" , "nvrtc" , "cuda-version-from-build-system" , "f16"], optional = true }
@@ -68,6 +71,7 @@ candle = []
 cuda = [
     "dep:cudarc",
 ]
+accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate"]
 # ------------------------------------------------------------------------------
 # Dev dependencies — tests and benchmarks only
 # ------------------------------------------------------------------------------

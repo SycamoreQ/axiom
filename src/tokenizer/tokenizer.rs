@@ -22,7 +22,7 @@ impl Default for EncodeOptions {
 }
 
 pub struct Tokenizer {
-    vocab: Arc<Vocab>,
+    vocab: Vocab,
     bpe: Bpe,
     decode_table: HashMap<char, u8>,
 }
@@ -34,8 +34,7 @@ impl Tokenizer {
         };
         match loader.load()? {
             LoadedTokenizer::HfVocab(vocab, merges) => {
-                let vocab = Arc::new(vocab);
-                let bpe = Bpe::new(Arc::clone(&vocab), merges, MergeMode::Rank);
+                let bpe = Bpe::new(vocab.clone(), merges, MergeMode::Rank);
                 let decode_table = build_decode_table();
                 Ok(Self {
                     vocab,
@@ -44,8 +43,7 @@ impl Tokenizer {
                 })
             }
             LoadedTokenizer::GgufVocab(vocab) => {
-                let vocab = Arc::new(vocab);
-                let bpe = Bpe::new(Arc::clone(&vocab), vec![], MergeMode::Score);
+                let bpe = Bpe::new(vocab.clone(), vec![], MergeMode::Score);
                 let decode_table = build_decode_table();
                 Ok(Self {
                     vocab,

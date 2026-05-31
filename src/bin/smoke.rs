@@ -32,11 +32,18 @@ fn main() {
     println!("Max new  : {}", max_new_tokens);
     println!("---");
 
-    // ── tokenizer ──
-    print!("Loading tokenizer... ");
     std::io::stdout().flush().unwrap();
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("failed to load tokenizer");
+    let mut tokenizer = Tokenizer::from_file(&tokenizer_path).expect("failed to load tokenizer");
     println!("ok  (vocab {})", tokenizer.vocab().size());
+
+    let check_tokens = vec![18403usize, 117734, 75580, 123905, 21886];
+    for t in &check_tokens {
+        eprintln!(
+            "DEBUG token {} = {:?}",
+            t,
+            tokenizer.vocab().id_to_token(*t)
+        );
+    }
 
     // ── model ──
     print!("Loading model (this takes a few seconds)... ");
@@ -46,34 +53,39 @@ fn main() {
         .expect("failed to load model");
     println!("ok");
 
-    let vocab_size = tokenizer.vocab().size();
+    let model_vocab = model.config().vocab_size;
+    let tokenizer_vocab = tokenizer.vocab().size();
 
     // ── engine ──
     let sampler_config = SamplerConfig {
-        temperature: 0.5,
+        temperature: 0.0,
         top_p: Some(0.9),
         top_k: Some(50),
         seed: Some(42),
         max_new_tokens,
         repetition_penalty: 1.4,
-        vocab_size: Some(vocab_size),
+        vocab_size: Some(model_vocab),
     };
 
     let mut engine = Engine::new(model, tokenizer, sampler_config, 1, device);
 
-    // ── encode prompt ──
+    let formatted_prompt = format!(
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        prompt
+    );
+
     let session_id = engine
         .submit_text(
-            &prompt,
+            &formatted_prompt,
             max_new_tokens,
             EncodeOptions {
-                add_bos: true,
+                add_bos: false,
                 add_eos: false,
             },
         )
         .expect("failed to submit prompt");
 
-    println!("Output   : {}", prompt);
+    println!("\nOutput   : {}", prompt);
     print!("          ");
     std::io::stdout().flush().unwrap();
 
@@ -87,18 +99,13 @@ fn main() {
         for (sid, token) in &results {
             if *sid == session_id {
                 let text = engine.tokenizer().decode(&[*token as usize]);
+                print!("{}", text);
                 std::io::stdout().flush().unwrap();
                 steps += 1;
             }
         }
 
-        // stop if batch is empty
-        if engine.batch.active_sessions().is_empty() {
-            break;
-        }
-
-        // safety stop
-        if steps >= max_new_tokens {
+        if engine.batch.active_sessions().is_empty() || steps >= max_new_tokens {
             break;
         }
     }
@@ -115,9 +122,7 @@ fn main() {
         tok_per_sec
     );
 
-    // ── full decoded output ──
-    println!();
-    println!("Full output");
+    println!("\nFull output:");
     let full = engine.decode_output(session_id).unwrap_or_default();
     println!("{}{}", prompt, full);
 }

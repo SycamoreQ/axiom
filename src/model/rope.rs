@@ -49,12 +49,11 @@ impl<B: Backend> RotaryEmbedding<B> {
     pub fn forward(
         &self,
         x: &B::Tensor, // [batch, seq_len, num_heads, head_dim]
-        offset: usize, // position offset for KV cache
+        offset: usize,
     ) -> Result<B::Tensor> {
-        let seq_len = x.shape().dim(1)?; // dim 1 is seq_len in [batch, seq_len, heads, head_dim]
+        let seq_len = x.shape().dim(1)?;
         let end = offset + seq_len;
         let max_seq_len = self.cos.shape().dim(0)?;
-
         if end > max_seq_len {
             return Err(CoreError::OutOfBounds {
                 op: "rope_slice",

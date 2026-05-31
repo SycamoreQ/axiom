@@ -42,12 +42,21 @@ impl<B: Backend> Generator<B> {
         }
     }
     //One step of autoregressive generation:
-    pub fn step(&mut self, session: &mut Session<B>) -> std::result::Result<u32, GeneratorError> {
+    pub fn step(&mut self, session: &mut Session<B>) -> Result<u32, GeneratorError> {
         let session_tokens = session.next_input_tokens().to_vec();
-        let logits = self
-            .model
-            .forward(&session_tokens, Some(&mut session.kv_cache), session.offset)
-            .map_err(GeneratorError::Model)?;
+        eprintln!(
+            "DEBUG step: offset={} num_generated={} tokens_len={} tokens={:?}",
+            session.offset,
+            session.generated_tokens.len(),
+            session_tokens.len(),
+            &session_tokens[..session_tokens.len().min(5)]
+        );
+
+        let logits =
+            self.model
+                .forward(&session_tokens, Some(&mut session.kv_cache), session.offset)?;
+
+        session.offset += session_tokens.len();
 
         let seq_len: usize = logits.shape().dim(1)?;
         let last_token_logits = logits.narrow(1, seq_len - 1, 1)?;
@@ -95,7 +104,6 @@ impl<B: Backend> Generator<B> {
         let eos_id = self.tokenizer.eos_id().map(|id| id as u32);
 
         let mut session = Session::new(SessionId(0), prompt_ids, max_new_tokens, eos_id);
-
         let generated = self.run(&mut session)?;
 
         let token_ids: Vec<usize> = generated.iter().map(|&id| id as usize).collect();

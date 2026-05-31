@@ -14,8 +14,7 @@ impl<B: Backend> Linear<B> {
     }
 
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
-        let wt = self.weight.transpose(0, 1)?;
-        let out = x.broadcast_matmul(&wt)?;
+        let out = x.broadcast_matmul(&self.weight)?;
         match &self.bias {
             Some(bias) => out.broadcast_add(bias),
             None => Ok(out),

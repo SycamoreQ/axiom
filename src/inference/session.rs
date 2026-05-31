@@ -53,7 +53,7 @@ impl<B: Backend> Session<B> {
         max_new_tokens: usize,
         eos_token_id: Option<u32>,
     ) -> Self {
-        let offset = prompt_tokens.len();
+        let offset = 0;
         Self {
             id,
             prompt_tokens,
@@ -96,11 +96,8 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    // add a newly generated token, update offset, check stop conditions
     pub fn push_token(&mut self, token: u32) {
         self.generated_tokens.push(token);
-        self.offset += 1;
-
         if self.last_token_is_eos() || self.num_generated() >= self.max_new_tokens {
             self.status = SessionStatus::Finished;
         }
@@ -152,7 +149,7 @@ mod tests {
     #[test]
     fn test_new_session_initial_state() {
         let s = make_session(vec![1, 2, 3], 10);
-        assert_eq!(s.offset, 3);
+        assert_eq!(s.offset, 0);
         assert_eq!(s.status, SessionStatus::Waiting);
         assert!(s.generated_tokens.is_empty());
         assert!(s.kv_cache.is_empty());
@@ -241,11 +238,11 @@ mod tests {
     #[test]
     fn test_push_token_updates_offset() {
         let mut s = make_session(vec![1, 2, 3], 10);
-        assert_eq!(s.offset, 3);
+        assert_eq!(s.offset, 0);
         s.push_token(42);
-        assert_eq!(s.offset, 4);
+        assert_eq!(s.offset, 0);
         s.push_token(43);
-        assert_eq!(s.offset, 5);
+        assert_eq!(s.offset, 0);
     }
 
     #[test]

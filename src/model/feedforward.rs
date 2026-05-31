@@ -1,4 +1,3 @@
-
 use crate::core::backend::Backend;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
@@ -9,9 +8,9 @@ use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
 
 pub struct FeedForward<B: Backend> {
-    gate_proj: Linear<B>, // [intermediate_size, hidden_size]
-    up_proj: Linear<B>,   // [intermediate_size, hidden_size]
-    down_proj: Linear<B>, // [hidden_size, intermediate_size]
+    pub gate_proj: Linear<B>, // [intermediate_size, hidden_size]
+    pub up_proj: Linear<B>,   // [intermediate_size, hidden_size]
+    pub down_proj: Linear<B>, // [hidden_size, intermediate_size]
 }
 
 impl<B: Backend> FeedForward<B> {
@@ -47,6 +46,10 @@ impl<B: Backend> FeedForward<B> {
     }
     pub fn set_down(&mut self, l: Linear<B>) {
         self.down_proj = l;
+    }
+
+    pub fn gate_proj(&self) -> &Linear<B> {
+        &self.gate_proj
     }
 }
 

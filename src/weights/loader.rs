@@ -105,55 +105,61 @@ impl LlamaTensor {
 
 //Build a ModelConfig from GGUF metadata.
 pub fn config_from_gguf(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
-    let req_u32 = |key: &str| -> Result<usize, LoaderError> {
-        gguf.get_u32(key)
-            .map(|v| v as usize)
-            .ok_or_else(|| LoaderError::MissingMetadata(key.to_string()))
-    };
-    let req_f32 = |key: &str| -> Result<f32, LoaderError> {
-        gguf.get_f32(key)
-            .ok_or_else(|| LoaderError::MissingMetadata(key.to_string()))
-    };
+    // Helper to get u32 with better error messages
+    let get_u32 = |key: &str| -> Result<usize, LoaderError> {
+        let value = gguf
+            .metadata
+            .get(key)
+            .ok_or_else(|| LoaderError::MissingMetadata(key.to_string()))?;
 
-    let dtype_str = gguf
-        .get_string("general.file_type")
-        .unwrap_or("float32")
-        .to_string();
-
-    //map GGUF file_type integers to dtype strings when the field is numeric
-    let torch_dtype = match dtype_str.as_str() {
-        "0" | "float32" => "float32",
-        "1" | "float16" => "float16",
-        "32" | "bfloat16" => "bfloat16",
-        _ => "float32",
-    }
-    .to_string();
-
-    Ok(ModelConfig {
-        hidden_size: req_u32("llama.embedding_length")?,
-        num_hidden_layers: req_u32("llama.block_count")?,
-        num_attention_heads: req_u32("llama.attention.head_count")?,
-        num_key_value_heads: req_u32("llama.attention.head_count_kv")
-            .unwrap_or_else(|_| req_u32("llama.attention.head_count").unwrap()),
-        intermediate_size: req_u32("llama.feed_forward_length")?,
-        vocab_size: req_u32("llama.vocab_size").or_else(|_| {
-            // fallback: count from tokenizer vocab array
-            match gguf.metadata.get("tokenizer.ggml.tokens") {
-                Some(GgufValue::Array(arr)) => Ok(arr.len()),
-                _ => Err(LoaderError::MissingMetadata("llama.vocab_size".into())),
+        let num = match value {
+            GgufValue::Uint32(v) => *v as usize,
+            GgufValue::Uint64(v) => *v as usize,
+            GgufValue::Int32(v) => *v as usize,
+            GgufValue::Int64(v) => *v as usize,
+            _ => {
+                return Err(LoaderError::MissingMetadata(format!(
+                    "{} has wrong type",
+                    key
+                )))
             }
-        })?,
-        max_position_embeddings: req_u32("llama.context_length")?,
-        rms_norm_eps: req_f32("llama.attention.layer_norm_rms_epsilon")
-            .map(|v| v as f64)
-            .unwrap_or(1e-5),
+        };
+        Ok(num)
+    };
+
+    let get_f32 = |key: &str| -> Result<f32, LoaderError> {
+        let value = gguf
+            .metadata
+            .get(key)
+            .ok_or_else(|| LoaderError::MissingMetadata(key.to_string()))?;
+
+        match value {
+            GgufValue::Float32(v) => Ok(*v),
+            GgufValue::Float64(v) => Ok(*v as f32),
+            GgufValue::Uint32(v) => Ok(*v as f32),
+            GgufValue::Int32(v) => Ok(*v as f32),
+            _ => Err(LoaderError::MissingMetadata(format!(
+                "{} has wrong type",
+                key
+            ))),
+        }
+    };
+
+    // Read vocab_size - DON'T fall back to token array
+    let vocab_size = get_u32("llama.vocab_size")?;
+    Ok(ModelConfig {
+        hidden_size: get_u32("llama.embedding_length")?,
+        num_hidden_layers: get_u32("llama.block_count")?,
+        num_attention_heads: get_u32("llama.attention.head_count")?,
+        num_key_value_heads: get_u32("llama.attention.head_count_kv")?,
+        intermediate_size: get_u32("llama.feed_forward_length")?,
+        vocab_size,
+        max_position_embeddings: get_u32("llama.context_length")?,
+        rms_norm_eps: get_f32("llama.attention.layer_norm_rms_epsilon")? as f64,
         hidden_act: "silu".to_string(),
-        rope_theta: gguf
-            .get_f32("llama.rope.freq_base")
-            .map(|v| v as f64)
-            .unwrap_or(10000.0),
+        rope_theta: get_f32("llama.rope.freq_base")? as f64,
         rope_scaling: None,
-        torch_dtype,
+        torch_dtype: "float32".to_string(),
         num_local_experts: None,
         num_experts_per_tok: None,
         num_shared_experts: None,
@@ -200,8 +206,8 @@ pub fn load_bytes_as_tensor<B: Backend>(
     info: &crate::weights::gguf::GgufTensorInfo,
     device: &Device,
 ) -> Result<B::Tensor, LoaderError> {
-    //GGUF stores weights in column-major (reversed) dimension order
-    let shape_dims: Vec<usize> = info.shape.iter().rev().map(|&d| d as usize).collect();
+    // DO NOT reverse dimensions! GGUF uses row-major order matching PyTorch
+    let shape_dims: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
     let shape = Shape::new(&shape_dims);
 
     match info.dtype {
@@ -218,33 +224,11 @@ pub fn load_bytes_as_tensor<B: Backend>(
             B::Tensor::from_slice(&floats, &shape, device)
                 .map_err(|e| LoaderError::Backend(e.to_string()))
         }
-
         dtype => {
+            // For quantized types, dequantize
             let floats = crate::weights::quantize::dequantize(data, dtype, info.numel() as usize);
-            // check if it was actually handled or fell through to zeros
-            // add temporarily in loader.rs after the dequantize call
-            if info.name == "blk.0.attn_q.weight" {
-                let first_few: Vec<f32> = floats.iter().take(8).cloned().collect();
-            }
-
-            if matches!(
-                dtype,
-                GgufDType::Q4_0
-                    | GgufDType::Q4_1
-                    | GgufDType::Q8_0
-                    | GgufDType::Q4_K
-                    | GgufDType::Q6_K
-            ) {
-                if info.name == "token_embd.weight" {
-                    let scale_bits = u16::from_le_bytes([data[0], data[1]]);
-                    let scale = half::f16::from_bits(scale_bits).to_f32();
-                }
-                B::Tensor::from_slice(&floats, &shape, device)
-                    .map_err(|e| LoaderError::Backend(e.to_string()))
-            } else {
-                B::Tensor::zeros(&shape, DType::F32, device)
-                    .map_err(|e| LoaderError::Backend(e.to_string()))
-            }
+            B::Tensor::from_slice(&floats, &shape, device)
+                .map_err(|e| LoaderError::Backend(e.to_string()))
         }
     }
 }
@@ -257,6 +241,20 @@ pub fn load_from_gguf<B: Backend>(
 ) -> Result<LlamaModel<B>, LoaderError> {
     let gguf = GgufFile::from_file(path)?;
     let config = config_from_gguf(&gguf)?;
+    eprintln!(
+        "CONFIG: hidden={} heads={} kv_heads={} layers={} vocab={} head_dim={}",
+        config.hidden_size,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        config.num_hidden_layers,
+        config.vocab_size,
+        config.head_dim()
+    );
+    eprintln!("DEBUG rope_theta={}", config.rope_theta);
+    eprintln!(
+        "DEBUG rope_freq_base raw={:?}",
+        gguf.get_f32("llama.rope.freq_base")
+    );
     let mut model =
         LlamaModel::<B>::new(&config, device).map_err(|e| LoaderError::Backend(e.to_string()))?;
 
@@ -268,18 +266,14 @@ pub fn load_from_gguf<B: Backend>(
             Some(k) => k,
             None => continue,
         };
-
         let data = gguf
             .get_tensor_data(name)
             .ok_or_else(|| LoaderError::MissingTensor(name.clone()))?;
         let tensor = load_bytes_as_tensor::<B>(data, info, device)?;
 
-        // track whether we have a separate output weight
         if matches!(kind, LlamaTensor::Output) {
             has_output_weight = true;
         }
-
-        // keep a clone of the embedding tensor for weight tying
         if matches!(kind, LlamaTensor::TokenEmbd) {
             token_embd_tensor = Some(tensor.clone());
         }
@@ -289,14 +283,8 @@ pub fn load_from_gguf<B: Backend>(
             .map_err(|e| LoaderError::Backend(e.to_string()))?;
     }
 
-    // weight tying — if no separate output.weight exists,
-    // lm_head uses the same weights as the token embedding
     if !has_output_weight {
         if let Some(embd) = token_embd_tensor {
-            // embd shape is [2048, 128256] after GGUF shape reversal
-            // Linear::forward does weight.transpose(0,1) → [128256, 2048]
-            // then x @ wt = [batch, seq, 2048] @ [2048, 128256] = [batch, seq, 128256]
-            // so we pass embd directly, no extra transpose needed
             model
                 .set_tensor(&LlamaTensor::Output, embd)
                 .map_err(|e| LoaderError::Backend(e.to_string()))?;

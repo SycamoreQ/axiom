@@ -91,13 +91,13 @@ struct TokenState {
 }
 
 pub struct Bpe {
-    vocab: Arc<Vocab>,
+    vocab: Vocab,
     merges: HashMap<(String, String), usize>, // rank mode
     mode: MergeMode,
 }
 
 impl Bpe {
-    pub fn new(vocab: Arc<Vocab>, merges: Vec<(String, String)>, mode: MergeMode) -> Self {
+    pub fn new(vocab: Vocab, merges: Vec<(String, String)>, mode: MergeMode) -> Self {
         let merges_map = merges
             .into_iter()
             .enumerate()
@@ -237,9 +237,7 @@ mod tests {
             file: TOKENIZER_PATH.to_string(),
         };
         match loader.load().expect("failed to load tokenizer") {
-            LoadedTokenizer::HfVocab(vocab, merges) => {
-                Bpe::new(Arc::new(vocab), merges, MergeMode::Rank)
-            }
+            LoadedTokenizer::HfVocab(vocab, merges) => Bpe::new(vocab, merges, MergeMode::Rank),
             _ => panic!("expected HfVocab"),
         }
     }

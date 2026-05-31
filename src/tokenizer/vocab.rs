@@ -8,6 +8,7 @@ Everything downstream — BPE, the loader, the tokenizer — talks to Vocab thro
 
 pub type TokenID = usize;
 
+#[derive(Debug, Clone)]
 pub struct Vocab {
     tokens: Vec<String>,
     token_ids: HashMap<String, TokenID>,

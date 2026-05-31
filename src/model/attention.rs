@@ -109,17 +109,26 @@ impl<B: Backend> Attention<B> {
         }
 
         // transpose to [batch, heads, seq, head_dim]
-        let q = q.transpose(1, 2)?;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
 
         // scaled dot product attention
         let scores = q
-            .broadcast_matmul(&k.transpose(2, 3)?)?
+            .broadcast_matmul(&k.transpose(2, 3)?.contiguous()?)?
             .scale(self.scale as f64)?;
 
+        // In attention.rs, after applying mask
         let scores = match mask {
-            Some(m) => scores.broadcast_add(m)?,
+            Some(m) => {
+                let masked = scores.broadcast_add(m)?;
+                // Debug: check if scores contain -inf
+                let masked_vec = masked.to_vec_f32()?;
+                if masked_vec.iter().any(|&x| x.is_infinite() && x < 0.0) {
+                    eprintln!("WARNING: mask introduced -inf in scores");
+                }
+                masked
+            }
             None => scores,
         };
 
@@ -127,7 +136,7 @@ impl<B: Backend> Attention<B> {
         let scores_max = scores_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
         let weights = scores.softmax(3)?;
-        let out = weights.broadcast_matmul(&v)?;
+        let out = weights.contiguous()?.broadcast_matmul(&v)?;
 
         // transpose back and reshape
         let out = out.transpose(1, 2)?.contiguous()?.reshape(&Shape::new(&[
