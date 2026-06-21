@@ -27,8 +27,26 @@ pub struct CudarcTensor {
     pub(crate) device: Device,
 }
 
+// todo(), its a stub until hand-written Metal kernels come.
+// Mirrors CudarcTensor's shape — a separate sibling type, not a CandleTensor variant,
+// so MetalBackend never has to route through candle_core at all (unified memory means
+// alloc/copy semantics here will look quite different from both CandleTensor and CudarcTensor).
+#[derive(Debug, Clone)]
+pub struct MetalTensor {
+    // stub — actual MTLBuffer-backed storage lands with the first Metal kernel work
+    pub(crate) shape: Shape,
+    pub(crate) dtype: DType,
+    pub(crate) device: Device,
+}
+
 impl Backend for CudarcBackend {
     type Tensor = CudarcTensor;
+    type Device = Device;
+    type Error = CoreError;
+}
+
+impl Backend for MetalBackend {
+    type Tensor = MetalTensor;
     type Device = Device;
     type Error = CoreError;
 }
@@ -45,6 +63,9 @@ pub struct CandleBackend;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CudarcBackend;
+
+#[derive(Debug, Clone, Copy)]
+pub struct MetalBackend;
 
 impl Backend for CandleBackend {
     type Tensor = CandleTensor;
@@ -84,5 +105,16 @@ impl TopKLastDimOp for CandleTensor {
 impl TopKLastDimOp for CudarcTensor {
     fn topk(&self, _k: usize) -> Result<TopKOutput<Self>> {
         todo!("Phase 4")
+    }
+}
+
+// MoE routing (top-k expert selection) lives on the critical path for the Metal MoE
+// dispatch work — this stub is one of the first real kernels to implement, not an
+// afterthought. CandleTensor's impl (sort + narrow + gather) is a reasonable reference
+// for *what* to compute; the Metal version will likely want a fused threadgroup top-k
+// rather than three separate passes.
+impl TopKLastDimOp for MetalTensor {
+    fn topk(&self, _k: usize) -> Result<TopKOutput<Self>> {
+        todo!("Metal Phase 1")
     }
 }

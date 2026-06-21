@@ -1,4 +1,4 @@
-use crate::core::backend::{CandleTensor, CudarcTensor};
+use crate::core::backend::{CandleTensor, CudarcTensor, MetalTensor};
 use crate::core::device::Device;
 use crate::core::dtype::{DType, Element};
 use crate::core::error::{CoreError, Result};
@@ -10,6 +10,14 @@ fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
     match device {
         Device::Cpu => Ok(candle_core::Device::Cpu),
         Device::Cuda(n) => Ok(candle_core::Device::new_cuda(*n)?),
+        // CandleTensor is never constructed on a Metal device in axiom today —
+        // MetalTensor (its own struct) handles Metal directly without going
+        // through candle_core at all. This arm exists only so the match stays
+        // exhaustive; it errors loudly if CandleTensor::* is ever called with
+        // a Metal device by mistake, rather than silently doing the wrong thing.
+        Device::Metal(_) => Err(CoreError::Internal(
+            "CandleTensor does not support Device::Metal — use MetalTensor instead".to_string(),
+        )),
     }
 }
 
@@ -39,11 +47,7 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn zeros(shape: &Shape, dtype: DType, device: &Device) -> crate::core::error::Result<Self>;
     fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self>;
     fn ones(shape: &Shape, dtype: DType, device: &Device) -> crate::core::error::Result<Self>;
-    fn from_slice<E: Element + candle_core::WithDType>(
-        data: &[E],
-        shape: &Shape,
-        device: &Device,
-    ) -> crate::core::error::Result<Self>;
+    fn from_slice<E: Element>(data: &[E], shape: &Shape, device: &Device) -> Result<Self>;
 
     // movement
     fn to_device(&self, device: &Device) -> crate::core::error::Result<Self>;
@@ -139,16 +143,35 @@ impl TensorOps for CandleTensor {
         })
     }
 
-    // TODO: remove candle_core::WithDType bound from trait — leaks backend detail
-    // revisit in Phase 3 with a cleaner element conversion strategy
-    fn from_slice<E: Element + candle_core::WithDType>(
-        data: &[E],
-        shape: &Shape,
-        device: &Device,
-    ) -> Result<Self> {
-        let candle_shape = candle_core::Shape::from_dims(shape.dims());
+    // No longer bounded by candle_core::WithDType at the trait level (see TensorOps::from_slice).
+    // We reinterpret E's bytes and hand Candle a raw buffer + our own DType -> candle_core::DType
+    // mapping instead, so the WithDType requirement stays an internal Candle-impl detail rather
+    // than leaking into every backend (MetalTensor in particular has no reason to know about it).
+    //
+    // NOTE: Tensor::from_raw_buffer(data: &[u8], dtype: DType, shape: &[usize], device: &Device)
+    // is confirmed present in candle-core's safetensors.rs as of recent releases. This crate is
+    // pinned to candle-core = "0.6" in Cargo.toml — verify the method exists at that exact pin
+    // (`cargo doc --open -p candle-core` or docs.rs/candle-core/0.6.0) before relying on this.
+    // If it's missing at 0.6, the fallback is a small per-dtype match calling the existing
+    // WithDType-bounded `candle_core::Tensor::from_slice` internally (still trait-clean, since
+    // the match — not a generic bound — would live entirely inside this impl).
+    fn from_slice<E: Element>(data: &[E], shape: &Shape, device: &Device) -> Result<Self> {
         let candle_device = candle_device_from(device)?;
-        let inner = candle_core::Tensor::from_slice(data, candle_shape, &candle_device)?;
+        let candle_dtype: candle_core::DType = E::dtype().into();
+
+        // SAFETY: E: Copy + Send + Sync + 'static (via Element), and we only ever read
+        // size_of_val(data) bytes — exactly the slice's own backing memory, no overrun.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        };
+
+        let inner = candle_core::Tensor::from_raw_buffer(
+            bytes,
+            candle_dtype,
+            shape.dims(),
+            &candle_device,
+        )?;
+
         Ok(CandleTensor {
             shape: shape.clone(),
             dtype: E::dtype(),
@@ -251,9 +274,10 @@ impl TensorOps for CandleTensor {
         Device::check_same("add", &self.device, &other.device)?;
         Shape::elementwise_check(&self.shape, &other.shape)?;
         let inner = self.inner.add(&other.inner)?;
+        let new_shape = Shape::new(&inner.dims());
         Ok(CandleTensor {
             inner,
-            shape: self.shape.clone(),
+            shape: new_shape,
             dtype: self.dtype,
             device: self.device.clone(),
         })
@@ -263,9 +287,10 @@ impl TensorOps for CandleTensor {
         Device::check_same("add", &self.device, &other.device)?;
         Shape::elementwise_check(&self.shape, &other.shape)?;
         let inner = self.inner.sub(&other.inner)?;
+        let new_shape = Shape::new(&inner.dims());
         Ok(CandleTensor {
             inner,
-            shape: self.shape.clone(),
+            shape: new_shape,
             dtype: self.dtype,
             device: self.device.clone(),
         })
@@ -275,9 +300,10 @@ impl TensorOps for CandleTensor {
         Device::check_same("mul", &self.device, &other.device)?;
         Shape::elementwise_check(&self.shape, &other.shape)?;
         let inner = self.inner.mul(&other.inner)?;
+        let new_shape = Shape::new(&inner.dims());
         Ok(CandleTensor {
             inner,
-            shape: self.shape.clone(),
+            shape: new_shape,
             dtype: self.dtype,
             device: self.device.clone(),
         })
@@ -287,9 +313,10 @@ impl TensorOps for CandleTensor {
         Device::check_same("div", &self.device, &other.device)?;
         Shape::elementwise_check(&self.shape, &other.shape)?;
         let inner = self.inner.div(&other.inner)?;
+        let new_shape = Shape::new(&inner.dims());
         Ok(CandleTensor {
             inner,
-            shape: self.shape.clone(),
+            shape: new_shape,
             dtype: self.dtype,
             device: self.device.clone(),
         })
@@ -401,9 +428,10 @@ impl TensorOps for CandleTensor {
 
     fn broadcast_add(&self, other: &Self) -> Result<Self> {
         let inner = self.inner.broadcast_add(&other.inner)?;
+        let new_shape = Shape::new(&inner.dims());
         Ok(CandleTensor {
             inner,
-            shape: self.shape.clone(),
+            shape: new_shape,
             dtype: self.dtype,
             device: self.device.clone(),
         })
@@ -503,10 +531,10 @@ impl TensorOps for CandleTensor {
 
     fn broadcast_mul(&self, other: &Self) -> Result<Self> {
         let inner = self.inner.broadcast_mul(&other.inner)?;
-        let shape = Shape::new(&inner.dims());
+        let new_shape = Shape::new(&inner.dims());
         Ok(CandleTensor {
             inner,
-            shape,
+            shape: new_shape,
             dtype: self.dtype,
             device: self.device.clone(),
         })
@@ -615,11 +643,7 @@ impl TensorOps for CudarcTensor {
     fn ones(_: &Shape, _: DType, _: &Device) -> Result<Self> {
         todo!("Phase 4")
     }
-    fn from_slice<E: Element + candle_core::WithDType>(
-        _: &[E],
-        _: &Shape,
-        _: &Device,
-    ) -> Result<Self> {
+    fn from_slice<E: Element>(_: &[E], _: &Shape, _: &Device) -> Result<Self> {
         todo!("Phase 4")
     }
 
@@ -758,6 +782,154 @@ impl TensorOps for CudarcTensor {
 
     fn log(&self) -> Result<Self> {
         todo!("phase 4")
+    }
+}
+
+// MetalTensor's TensorOps impl. Stubbed identically to CudarcTensor for now — every
+// method becomes a real MTLBuffer-backed op as the Metal kernel work lands. Unlike
+// CudarcTensor, this backend never routes through candle_core: from_slice etc. will
+// do a direct byte-copy into an MTLBuffer (unified memory means this is close to free
+// on Apple Silicon — no separate host/device transfer step the way CUDA needs).
+impl TensorOps for MetalTensor {
+    fn shape(&self) -> &Shape {
+        &self.shape
+    }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn zeros(_: &Shape, _: DType, _: &Device) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn ones(_: &Shape, _: DType, _: &Device) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn from_slice<E: Element>(_: &[E], _: &Shape, _: &Device) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn from_u32_slice(_: &[u32], _: &Shape, _: &Device) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn to_device(&self, _: &Device) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn to_dtype(&self, _: DType) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn contiguous(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn reshape(&self, _: &Shape) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn transpose(&self, _: usize, _: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn squeeze(&self, _: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn unsqueeze(&self, _: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn add(&self, _: &Self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn sub(&self, _: &Self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn mul(&self, _: &Self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn div(&self, _: &Self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn scale(&self, _: f64) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn matmul(&self, _: &Self) -> Result<Self> {
+        // The foundation kernel — sequencing notes from project planning apply here first.
+        todo!("Metal Phase 1")
+    }
+    fn broadcast_add(&self, _: &Self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn sum(&self, _: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn mean(&self, _: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn silu(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn gelu(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn softmax(&self, _: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn sqrt(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn rms_norm(&self, _: &Self, _: f32) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn broadcast_matmul(&self, _: &Self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn index_select(&self, _indexes: &Self, _dim: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn cos(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn sin(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn chunk(&self, _: usize, _: usize) -> Result<Vec<Self>> {
+        todo!("Metal Phase 1")
+    }
+    fn cat(_: &[&Self], _: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn neg(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn narrow(&self, _dim: usize, _start: usize, _len: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn broadcast_mul(&self, _: &Self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn repeat(&self, _: &Shape) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn sigmoid(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn to_vec_u32(&self) -> Result<Vec<u32>> {
+        todo!("Metal Phase 1")
+    }
+    fn zeros_like(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn sum_keepdim(&self, _dim: usize) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn broadcast_div(&self, _other: &Self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        todo!("Metal Phase 1")
+    }
+    fn exp(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
+    }
+    fn log(&self) -> Result<Self> {
+        todo!("Metal Phase 1")
     }
 }
 

@@ -50,6 +50,9 @@ pub enum CoreError {
     #[error("cuda error: {0}")]
     Cuda(String),
 
+    #[error("metal error: {0}")]
+    Metal(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }

@@ -330,3 +330,4 @@ TSWLatexianTemp*
 /target 3
 *.gguf
 testdata/*.gguf
+.DS_Store
