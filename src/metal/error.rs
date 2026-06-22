@@ -6,6 +6,7 @@ use thiserror::Error;
 // MTLCommandBuffer calls mostly return Option or set an NSError out-param
 // rather than a uniform Result type the way cudarc does), add a #[from]
 // variant wrapping that here rather than stringly-typing it via Internal.
+
 #[derive(Error, Debug)]
 pub enum MetalError {
     #[error("no Metal device at ordinal {0}")]
