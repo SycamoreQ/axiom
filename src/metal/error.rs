@@ -12,6 +12,12 @@ pub enum MetalError {
     #[error("no Metal device at ordinal {0}")]
     NoDevice(usize),
 
+    #[error("failed to create Metal command queue")]
+    NoCommandQueue,
+
+    #[error("failed to create Metal command buffer")]
+    NoCommandBuffer,
+
     #[error("kernel not loaded: {0}")]
     KernelNotLoaded(&'static str),
 
@@ -35,6 +41,15 @@ pub enum MetalError {
 
     #[error("session not found: {0}")]
     InvalidSession(u64),
+
+    #[error("Metal buffer allocation failed")]
+    AllocationFailed,
+
+    #[error("allocator out of memory: requested {requested} bytes, {available} available")]
+    OutOfMemory { requested: usize, available: usize },
+
+    #[error("cannot build pipeline state")]
+    PipelineStateInvalid,
 }
 
 pub type Result<T> = std::result::Result<T, MetalError>;

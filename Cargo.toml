@@ -46,9 +46,21 @@ cudarc = { version = "0.19", features = ["driver" , "nvrtc" , "cuda-version-from
 # objc2-metal is the actively maintained successor to the original `metal` crate
 # (which is unmaintained as of 2024) — bindgen-style bindings to MTLDevice, MTLBuffer,
 # MTLCommandQueue, MTLComputeCommandEncoder, etc.
-objc2-metal = { version = "0.2", optional = true }
-objc2-foundation = { version = "0.2", optional = true }
-objc2 = { version = "0.5", optional = true }
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice",
+    "MTLBuffer",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePass",
+    "MTLComputePipeline",
+    "MTLFunctionDescriptor",
+    "MTLFunctionHandle",
+    "MTLLibrary",
+], optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2 = { version = "0.6", optional = true }
 
 # Memory-mapped weight files (Phase 8)
 memmap2 = "0.9"

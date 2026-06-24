@@ -53,5 +53,19 @@ pub mod error;
 #[cfg(feature = "metal")]
 pub use error::MetalError;
 
+#[cfg(feature = "metal")]
+pub mod device;
+
+#[cfg(feature = "metal")]
+pub use device::MetalDevice;
 // device.rs, context.rs, allocator.rs, kernels.rs land with the first real
 // Metal kernel work (see core::backend::MetalTensor / MetalBackend stubs).
+
+#[cfg(feature = "metal")]
+pub mod context;
+
+#[cfg(feature = "metal")]
+pub mod allocator;
+
+#[cfg(feature = "metal")]
+pub mod kernels;
