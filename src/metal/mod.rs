@@ -1,16 +1,3 @@
-// src/metal/mod.rs
-//
-// The metal module is gated behind the `metal` feature flag.
-// Add to Cargo.toml:
-//
-// [features]
-// metal = ["dep:objc2-metal", "dep:objc2-foundation", "dep:objc2"]
-//
-// [dependencies]
-// objc2-metal      = { version = "0.2", optional = true }
-// objc2-foundation = { version = "0.2", optional = true }
-// objc2            = { version = "0.5", optional = true }
-//
 // Unlike the cuda module, there is no PTX-style precompile step here yet —
 // Metal Shading Language (.metal) source is compiled to a metallib either at
 // build time (xcrun metal / metallib) or at runtime via
