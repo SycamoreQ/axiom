@@ -1,9 +1,11 @@
+pub mod attention_pv_f16;
 pub mod attention_qk_f16;
 pub mod matmul_f16;
 pub mod rms_norm_f16;
 pub mod rope_f16;
 pub mod swiglu_f16;
 
+pub use attention_pv_f16::AttentionPVKernel;
 pub use attention_qk_f16::AttentionQKKernel;
 pub use matmul_f16::MatmulKernel;
 pub use rms_norm_f16::RmsNormKernel;
@@ -19,6 +21,7 @@ pub struct MetalKernels {
     pub swiglu: SwigluKernel,
     pub matmul: MatmulKernel,
     pub attn_qk: AttentionQKKernel,
+    pub attn_pv: AttentionPVKernel,
 }
 
 impl MetalKernels {
@@ -31,6 +34,7 @@ impl MetalKernels {
             swiglu: SwigluKernel::new(&device)?,
             matmul: MatmulKernel::new(&device)?,
             attn_qk: AttentionQKKernel::new(&device)?,
+            attn_pv: AttentionPVKernel::new(&device)?,
         })
     }
 }
