@@ -15,6 +15,12 @@ pub struct MetalContext {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 }
 
+impl std::fmt::Debug for MetalContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalContext").finish()
+    }
+}
+
 impl MetalContext {
     pub fn new(device: MetalDevice) -> Result<Self> {
         let queue = device

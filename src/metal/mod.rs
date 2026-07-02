@@ -56,3 +56,9 @@ pub mod allocator;
 
 #[cfg(feature = "metal")]
 pub mod kernels;
+
+#[cfg(feature = "metal")]
+pub mod state;
+
+pub use kernels::MetalKernels;
+pub use state::MetalState;

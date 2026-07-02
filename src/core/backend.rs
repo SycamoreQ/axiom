@@ -4,7 +4,13 @@ use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 use crate::core::tensor::{TopKLastDimOp, TopKOutput};
+#[cfg(feature = "metal")]
+use crate::metal::allocator::BlockHandle;
+#[cfg(feature = "metal")]
+use crate::metal::state::MetalState;
+
 use candle_core;
+use std::sync::Arc;
 
 /*
 defines the compile-time abstraction that ties everything together.
@@ -18,37 +24,21 @@ pub struct CandleTensor {
     pub(crate) device: Device,
 }
 
-// todo(), its a stub for until cuda kernels come
 #[derive(Debug, Clone)]
 pub struct CudarcTensor {
-    // stub for Phase 3 — cudarc tensors live here
     pub(crate) shape: Shape,
     pub(crate) dtype: DType,
     pub(crate) device: Device,
 }
 
-// todo(), its a stub until hand-written Metal kernels come.
-// Mirrors CudarcTensor's shape — a separate sibling type, not a CandleTensor variant,
-// so MetalBackend never has to route through candle_core at all (unified memory means
-// alloc/copy semantics here will look quite different from both CandleTensor and CudarcTensor).
-#[derive(Debug, Clone)]
+// FIX: Removed <BlockHandle> so it uses the concrete imported type
+#[derive(Clone)]
 pub struct MetalTensor {
-    // stub — actual MTLBuffer-backed storage lands with the first Metal kernel work
+    pub(crate) state: Arc<MetalState>,
+    pub(crate) block: Arc<BlockHandle>,
     pub(crate) shape: Shape,
     pub(crate) dtype: DType,
     pub(crate) device: Device,
-}
-
-impl Backend for CudarcBackend {
-    type Tensor = CudarcTensor;
-    type Device = Device;
-    type Error = CoreError;
-}
-
-impl Backend for MetalBackend {
-    type Tensor = MetalTensor;
-    type Device = Device;
-    type Error = CoreError;
 }
 
 pub trait Backend: Clone + Send + Sync + 'static {
@@ -57,18 +47,34 @@ pub trait Backend: Clone + Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + From<CoreError>;
 }
 
-// two compile time tags
+// Compile time tags
 #[derive(Debug, Clone, Copy)]
 pub struct CandleBackend;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CudarcBackend;
 
-#[derive(Debug, Clone, Copy)]
-pub struct MetalBackend;
+// FIX: Removed `Copy`, and removed `<MetalState>`
+#[derive(Debug, Clone)]
+pub struct MetalBackend {
+    pub state: Arc<MetalState>,
+}
 
 impl Backend for CandleBackend {
     type Tensor = CandleTensor;
+    type Device = Device;
+    type Error = CoreError;
+}
+
+impl Backend for CudarcBackend {
+    type Tensor = CudarcTensor;
+    type Device = Device;
+    type Error = CoreError;
+}
+
+// FIX: Removed `<MetalState>`
+impl Backend for MetalBackend {
+    type Tensor = MetalTensor;
     type Device = Device;
     type Error = CoreError;
 }
@@ -81,7 +87,6 @@ impl TopKLastDimOp for CandleTensor {
             .contiguous()?;
         let values = self.inner.gather(&topk_indices, candle_core::D::Minus1)?;
 
-        // extract dims BEFORE moving into struct
         let values_dims = values.dims().to_vec();
         let indices_dims = topk_indices.dims().to_vec();
 
@@ -108,11 +113,6 @@ impl TopKLastDimOp for CudarcTensor {
     }
 }
 
-// MoE routing (top-k expert selection) lives on the critical path for the Metal MoE
-// dispatch work — this stub is one of the first real kernels to implement, not an
-// afterthought. CandleTensor's impl (sort + narrow + gather) is a reasonable reference
-// for *what* to compute; the Metal version will likely want a fused threadgroup top-k
-// rather than three separate passes.
 impl TopKLastDimOp for MetalTensor {
     fn topk(&self, _k: usize) -> Result<TopKOutput<Self>> {
         todo!("Metal Phase 1")

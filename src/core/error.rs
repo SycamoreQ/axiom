@@ -58,3 +58,9 @@ pub enum CoreError {
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
+
+impl From<crate::metal::error::MetalError> for CoreError {
+    fn from(e: crate::metal::error::MetalError) -> Self {
+        CoreError::Internal(e.to_string())
+    }
+}

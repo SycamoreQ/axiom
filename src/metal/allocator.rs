@@ -14,6 +14,8 @@ pub struct BlockHandle {
     pub size_bytes: usize,
 }
 
+unsafe impl Sync for BlockHandle {}
+
 unsafe impl Send for BlockHandle {}
 
 pub struct FreeBlock {
@@ -27,6 +29,15 @@ pub struct MetalAllocator {
     current_offset: usize,
     free_list: Vec<FreeBlock>,
 }
+
+impl std::fmt::Debug for MetalAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalAllocator").finish()
+    }
+}
+
+unsafe impl Send for MetalAllocator {}
+unsafe impl Sync for MetalAllocator {}
 
 impl MetalAllocator {
     pub fn new(ctx: &MetalContext, total_size_bytes: usize) -> Result<Self> {
