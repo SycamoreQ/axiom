@@ -3,8 +3,10 @@ use crate::core::device::Device;
 use crate::core::dtype::{DType, Element};
 use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
+use crate::metal::state::global_metal_state;
 use candle_core::{self};
 use candle_nn;
+use std::sync::Arc;
 
 fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
     match device {
@@ -785,11 +787,12 @@ impl TensorOps for CudarcTensor {
     }
 }
 
-// MetalTensor's TensorOps impl. Stubbed identically to CudarcTensor for now — every
-// method becomes a real MTLBuffer-backed op as the Metal kernel work lands. Unlike
-// CudarcTensor, this backend never routes through candle_core: from_slice etc. will
-// do a direct byte-copy into an MTLBuffer (unified memory means this is close to free
-// on Apple Silicon — no separate host/device transfer step the way CUDA needs).
+/*  MetalTensor's TensorOps impl. Unlike
+CudarcTensor, this backend never routes through candle_core: from_slice etc. will
+do a direct byte-copy into an MTLBuffer (unified memory means this is close to free
+on Apple Silicon — no separate host/device transfer step the way CUDA needs).
+*/
+
 impl TensorOps for MetalTensor {
     fn shape(&self) -> &Shape {
         &self.shape
@@ -801,45 +804,208 @@ impl TensorOps for MetalTensor {
         &self.device
     }
 
-    fn zeros(_: &Shape, _: DType, _: &Device) -> Result<Self> {
-        todo!("Metal Phase 1")
+    fn zeros(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
+        let state = global_metal_state()
+            .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
+        let num_bytes = shape.numel() * dtype.size_in_bytes();
+        let block = state.alloc.lock().unwrap().alloc(num_bytes, 16)?;
+        unsafe {
+            std::ptr::write_bytes(block.ptr, 0u8, num_bytes);
+        }
+        Ok(Self {
+            state,
+            block: Arc::new(block),
+            shape: shape.clone(),
+            dtype,
+            device: device.clone(),
+        })
     }
-    fn ones(_: &Shape, _: DType, _: &Device) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn ones(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
+        let t = Self::zeros(shape, dtype, device)?;
+        unsafe {
+            match dtype {
+                DType::F32 => {
+                    let ptr = Arc::as_ptr(&t.block) as *mut f32;
+                    for i in 0..shape.numel() {
+                        ptr.add(i).write(1.0f32);
+                    }
+                }
+                DType::F16 => {
+                    let ptr = Arc::as_ptr(&t.block) as *mut half::f16;
+                    for i in 0..shape.numel() {
+                        ptr.add(i).write(half::f16::from_f32(1.0));
+                    }
+                }
+                _ => return Err(CoreError::Internal("ones: unsupported dtype".into())),
+            }
+        }
+        Ok(t)
     }
-    fn from_slice<E: Element>(_: &[E], _: &Shape, _: &Device) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn from_slice<E: Element>(data: &[E], shape: &Shape, device: &Device) -> Result<Self> {
+        let state = global_metal_state()
+            .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
+        let num_bytes = std::mem::size_of_val(data);
+        let block = state.alloc.lock().unwrap().alloc(num_bytes, 16)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, block.ptr, num_bytes);
+        }
+        Ok(Self {
+            state,
+            block: Arc::new(block),
+            shape: shape.clone(),
+            dtype: E::dtype(),
+            device: device.clone(),
+        })
     }
-    fn from_u32_slice(_: &[u32], _: &Shape, _: &Device) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self> {
+        Self::from_slice(data, shape, device)
     }
-    fn to_device(&self, _: &Device) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn to_device(&self, device: &Device) -> Result<Self> {
+        match device {
+            Device::Metal(_) => Ok(self.clone()),
+            _ => Err(CoreError::Internal(
+                "MetalTensor can only live on Metal device".into(),
+            )),
+        }
     }
-    fn to_dtype(&self, _: DType) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn to_dtype(&self, dtype: DType) -> Result<Self> {
+        let src_f32 = self.to_vec_f32()?;
+        match dtype {
+            DType::F32 => Self::from_slice(&src_f32, &self.shape, &self.device),
+            DType::F16 => {
+                let converted: Vec<half::f16> =
+                    src_f32.iter().map(|&x| half::f16::from_f32(x)).collect();
+                Self::from_slice(&converted, &self.shape, &self.device)
+            }
+            _ => Err(CoreError::Internal("to_dtype: unsupported dtype".into())),
+        }
     }
+
     fn contiguous(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        Ok(self.clone())
     }
-    fn reshape(&self, _: &Shape) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn reshape(&self, shape: &Shape) -> Result<Self> {
+        assert_eq!(
+            shape.numel(),
+            self.shape.numel(),
+            "reshape: element count must match"
+        );
+        Ok(Self {
+            state: self.state.clone(),
+            block: self.block.clone(),
+            shape: shape.clone(),
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
-    fn transpose(&self, _: usize, _: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn transpose(&self, dim1: usize, dim2: usize) -> Result<Self> {
+        // read, transpose in CPU memory, write back
+        // works for 2D case which is all we need for weight transpose
+        let dims = self.shape.dims();
+        assert_eq!(
+            dims.len(),
+            2,
+            "MetalTensor::transpose: only 2D supported for now"
+        );
+        let rows = dims[0];
+        let cols = dims[1];
+        let src_f32 = self.to_vec_f32()?;
+        let mut dst = vec![0.0f32; src_f32.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                dst[c * rows + r] = src_f32[r * cols + c];
+            }
+        }
+        let new_shape = Shape::new(&[cols, rows]);
+        Self::from_slice(&dst, &new_shape, &self.device)
     }
-    fn squeeze(&self, _: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn squeeze(&self, dim: usize) -> Result<Self> {
+        let mut dims = self.shape.dims().to_vec();
+        assert_eq!(dims[dim], 1, "squeeze: dim must be size 1");
+        dims.remove(dim);
+        self.reshape(&Shape::new(&dims))
     }
-    fn unsqueeze(&self, _: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn unsqueeze(&self, dim: usize) -> Result<Self> {
+        let mut dims = self.shape.dims().to_vec();
+        dims.insert(dim, 1);
+        self.reshape(&Shape::new(&dims))
     }
-    fn add(&self, _: &Self) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn add(&self, other: &Self) -> Result<Self> {
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let a = Arc::as_ptr(&self.block) as *const f32;
+                    let b = Arc::as_ptr(&self.block) as *const f32;
+                    let c = Arc::as_ptr(&self.block) as *mut f32;
+                    for i in 0..n {
+                        c.add(i).write(a.add(i).read() + b.add(i).read());
+                    }
+                }
+                DType::F16 => {
+                    let a = Arc::as_ptr(&self.block) as *const half::f16;
+                    let b = Arc::as_ptr(&self.block) as *const half::f16;
+                    let c = Arc::as_ptr(&self.block) as *mut half::f16;
+                    for i in 0..n {
+                        let sum = a.add(i).read().to_f32() + b.add(i).read().to_f32();
+                        c.add(i).write(half::f16::from_f32(sum));
+                    }
+                }
+                _ => return Err(CoreError::Internal("add: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
-    fn sub(&self, _: &Self) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn sub(&self, other: &Self) -> Result<Self> {
+        if self.shape != other.shape {
+            return Err(CoreError::Internal("sub: shape mismatch".into()));
+        }
+
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let a = Arc::as_ptr(&self.block).cast::<f32>();
+                    let b = Arc::as_ptr(&other.block).cast::<f32>();
+                    let c = Arc::as_ptr(&output.block) as *mut f32;
+
+                    for i in 0..n {
+                        let val_a = a.add(i).read();
+                        let val_b = b.add(i).read();
+                        c.add(i).write(val_a - val_b);
+                    }
+                }
+
+                DType::F16 => {
+                    let a = Arc::as_ptr(&self.block).cast::<half::f16>();
+                    let b = Arc::as_ptr(&other.block).cast::<half::f16>();
+                    let c = Arc::as_ptr(&output.block) as *mut half::f16;
+
+                    for i in 0..n {
+                        let diff = a.add(i).read().to_f32() - b.add(i).read().to_f32();
+                        c.add(i).write(half::f16::from_f32(diff));
+                    }
+                }
+                _ => return Err(CoreError::Internal("sub: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
+
     fn mul(&self, _: &Self) -> Result<Self> {
         todo!("Metal Phase 1")
     }
@@ -853,9 +1019,23 @@ impl TensorOps for MetalTensor {
         // The foundation kernel — sequencing notes from project planning apply here first.
         todo!("Metal Phase 1")
     }
-    fn broadcast_add(&self, _: &Self) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn broadcast_add(&self, other: &Self) -> Result<Self> {
+        // other is the bias — shape [N], self is [..., N]
+        let n = self.shape.numel();
+        let bias_len = other.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            let a = Arc::as_ptr(&self.block) as *const f32;
+            let b = Arc::as_ptr(&self.block) as *const f32;
+            let c = Arc::as_ptr(&self.block) as *mut f32;
+            for i in 0..n {
+                c.add(i).write(a.add(i).read() + b.add(i % bias_len).read());
+            }
+        }
+        Ok(output)
     }
+
     fn sum(&self, _: usize) -> Result<Self> {
         todo!("Metal Phase 1")
     }
@@ -863,23 +1043,94 @@ impl TensorOps for MetalTensor {
         todo!("Metal Phase 1")
     }
     fn silu(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            let src = Arc::as_ptr(&self.block) as *const f32;
+            let dst = Arc::as_ptr(&self.block) as *mut f32;
+            for i in 0..n {
+                let x = src.add(i).read();
+                dst.add(i).write(x / (1.0 + (-x).exp()));
+            }
+        }
+        Ok(output)
     }
     fn gelu(&self) -> Result<Self> {
         todo!("Metal Phase 1")
     }
-    fn softmax(&self, _: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn softmax(&self, dim: usize) -> Result<Self> {
+        let dims = self.shape.dims();
+        let row_size = dims[dim];
+        let n = self.shape.numel();
+        let num_rows = n / row_size;
+        let src = self.to_vec_f32()?;
+        let mut dst = vec![0.0f32; n];
+        for r in 0..num_rows {
+            let row = &src[r * row_size..(r + 1) * row_size];
+            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|&x| (x - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (i, &e) in exps.iter().enumerate() {
+                dst[r * row_size + i] = e / sum;
+            }
+        }
+        Self::from_slice(&dst, &self.shape, &self.device)
     }
+
     fn sqrt(&self) -> Result<Self> {
         todo!("Metal Phase 1")
     }
-    fn rms_norm(&self, _: &Self, _: f32) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn rms_norm(&self, weight: &Self, eps: f32) -> Result<Self> {
+        let state = self.state.clone();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        let num_tokens = self.shape.dims()[..self.shape.rank() - 1]
+            .iter()
+            .product::<usize>() as u32;
+        let hidden = *self.shape.dims().last().unwrap() as u32;
+        state.kernels.rms_norm_f16(
+            &state.ctx,
+            &state.alloc.lock().unwrap(),
+            &self.block,
+            &weight.block,
+            &output.block,
+            num_tokens,
+            hidden,
+            eps,
+        )?;
+        Ok(output)
     }
-    fn broadcast_matmul(&self, _: &Self) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
+        // self: [..., M, K]   other: [N, K] (weight stored transposed)
+        // flatten leading dims into M
+        let rank = self.shape.rank();
+        let k = self.shape.dims()[rank - 1];
+        let m: usize = self.shape.dims()[..rank - 1].iter().product();
+        let n = other.shape.dims()[0];
+        // weight is [N, K] but matmul needs [K, N] — transpose other
+        let other_t = other.transpose(0, 1)?;
+        let out_shape_dims: Vec<usize> = self.shape.dims()[..rank - 1]
+            .iter()
+            .cloned()
+            .chain(std::iter::once(n))
+            .collect();
+        let output = Self::zeros(&Shape::new(&out_shape_dims), self.dtype, &self.device)?;
+        let state = self.state.clone();
+        state.kernels.matmul_f16(
+            &state.ctx,
+            &state.alloc.lock().unwrap(),
+            &self.block,
+            &other_t.block,
+            &output.block,
+            m as u32,
+            n as u32,
+            k as u32,
+        )?;
+        Ok(output)
     }
+
     fn index_select(&self, _indexes: &Self, _dim: usize) -> Result<Self> {
         todo!("Metal Phase 1")
     }
@@ -911,20 +1162,54 @@ impl TensorOps for MetalTensor {
         todo!("Metal Phase 1")
     }
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let mut out = vec![0u32; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                Arc::as_ptr(&self.block) as *const u32,
+                out.as_mut_ptr(),
+                n,
+            );
+        }
+        Ok(out)
     }
+
     fn zeros_like(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        Self::zeros(&self.shape, self.dtype, &self.device)
     }
+
     fn sum_keepdim(&self, _dim: usize) -> Result<Self> {
         todo!("Metal Phase 1")
     }
+
     fn broadcast_div(&self, _other: &Self) -> Result<Self> {
         todo!("Metal Phase 1")
     }
+
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let mut out = vec![0.0f32; n];
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    std::ptr::copy_nonoverlapping(
+                        Arc::as_ptr(&self.block) as *const f32,
+                        out.as_mut_ptr(),
+                        n,
+                    );
+                }
+                DType::F16 => {
+                    let ptr = Arc::as_ptr(&self.block) as *const half::f16;
+                    for i in 0..n {
+                        out[i] = ptr.add(i).read().to_f32();
+                    }
+                }
+                _ => return Err(CoreError::Internal("to_vec_f32: unsupported dtype".into())),
+            }
+        }
+        Ok(out)
     }
+
     fn exp(&self) -> Result<Self> {
         todo!("Metal Phase 1")
     }

@@ -46,14 +46,22 @@ impl Element for f32 {
         DType::F32
     }
 }
+
 impl Element for half::f16 {
     fn dtype() -> DType {
         DType::F16
     }
 }
+
 impl Element for half::bf16 {
     fn dtype() -> DType {
         DType::BF16
+    }
+}
+
+impl Element for u32 {
+    fn dtype() -> DType {
+        DType::U32
     }
 }
 
