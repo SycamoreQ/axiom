@@ -3,8 +3,11 @@ use crate::core::device::Device;
 use crate::core::dtype::{DType, Element};
 use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
+use crate::core::tensor;
+use crate::metal::allocator::BlockHandle;
 use crate::metal::state::global_metal_state;
-use candle_core::{self};
+use crate::metal::MetalState;
+use candle_core::{self, Tensor};
 use candle_nn;
 use std::sync::Arc;
 
@@ -20,6 +23,49 @@ fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
         Device::Metal(_) => Err(CoreError::Internal(
             "CandleTensor does not support Device::Metal — use MetalTensor instead".to_string(),
         )),
+    }
+}
+
+impl MetalTensor {
+    //Helper to create a standard, contiguous tensor layout
+    pub(crate) fn new_contiguous(
+        state: Arc<MetalState>,
+        block: Arc<BlockHandle>,
+        shape: Shape,
+        dtype: DType,
+        device: Device,
+    ) -> Self {
+        // Calculate standard row-major strides based on the shape.
+        // (If your Shape struct already has a method for this, use it!)
+        let dims = shape.dims();
+        let mut strides = vec![1; dims.len()];
+        for i in (0..dims.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * dims[i + 1];
+        }
+
+        Self {
+            state,
+            block,
+            shape,
+            strides,
+            offset_bytes: 0,
+            dtype,
+            device,
+        }
+    }
+
+    pub(crate) fn contiguous_copy(&self) -> Result<Self> {
+        // read through strides into a flat f32 vec, write to a fresh allocation
+        let data = self.to_vec_f32()?; // already handles offset_bytes
+        Self::from_slice(&data, &self.shape, &self.device)
+    }
+
+    fn compute_strides(dims: &[usize]) -> Vec<usize> {
+        let mut strides = vec![1; dims.len()];
+        for i in (0..dims.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * dims[i + 1];
+        }
+        strides
     }
 }
 
@@ -797,9 +843,11 @@ impl TensorOps for MetalTensor {
     fn shape(&self) -> &Shape {
         &self.shape
     }
+
     fn dtype(&self) -> DType {
         self.dtype
     }
+
     fn device(&self) -> &Device {
         &self.device
     }
@@ -812,29 +860,30 @@ impl TensorOps for MetalTensor {
         unsafe {
             std::ptr::write_bytes(block.ptr, 0u8, num_bytes);
         }
-        Ok(Self {
+        Ok(Self::new_contiguous(
             state,
-            block: Arc::new(block),
-            shape: shape.clone(),
+            Arc::new(block),
+            shape.clone(),
             dtype,
-            device: device.clone(),
-        })
+            device.clone(),
+        ))
     }
 
     fn ones(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
         let t = Self::zeros(shape, dtype, device)?;
+        let ptr = (*t.block).ptr;
         unsafe {
             match dtype {
                 DType::F32 => {
-                    let ptr = Arc::as_ptr(&t.block) as *mut f32;
+                    let p = ptr as *mut f32;
                     for i in 0..shape.numel() {
-                        ptr.add(i).write(1.0f32);
+                        p.add(i).write(1.0f32);
                     }
                 }
                 DType::F16 => {
-                    let ptr = Arc::as_ptr(&t.block) as *mut half::f16;
+                    let p = ptr as *mut half::f16;
                     for i in 0..shape.numel() {
-                        ptr.add(i).write(half::f16::from_f32(1.0));
+                        p.add(i).write(half::f16::from_f32(1.0));
                     }
                 }
                 _ => return Err(CoreError::Internal("ones: unsupported dtype".into())),
@@ -851,13 +900,13 @@ impl TensorOps for MetalTensor {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, block.ptr, num_bytes);
         }
-        Ok(Self {
+        Ok(Self::new_contiguous(
             state,
-            block: Arc::new(block),
-            shape: shape.clone(),
-            dtype: E::dtype(),
-            device: device.clone(),
-        })
+            Arc::new(block),
+            shape.clone(),
+            E::dtype(),
+            device.clone(),
+        ))
     }
 
     fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self> {
@@ -887,7 +936,12 @@ impl TensorOps for MetalTensor {
     }
 
     fn contiguous(&self) -> Result<Self> {
-        Ok(self.clone())
+        let expected = Self::compute_strides(self.shape.dims());
+        if self.strides == expected && self.offset_bytes == 0 {
+            Ok(self.clone())
+        } else {
+            self.contiguous_copy()
+        }
     }
 
     fn reshape(&self, shape: &Shape) -> Result<Self> {
@@ -896,35 +950,31 @@ impl TensorOps for MetalTensor {
             self.shape.numel(),
             "reshape: element count must match"
         );
-        Ok(Self {
-            state: self.state.clone(),
-            block: self.block.clone(),
-            shape: shape.clone(),
-            dtype: self.dtype,
-            device: self.device.clone(),
-        })
+        Ok(Self::new_contiguous(
+            self.state.clone(),
+            self.block.clone(),
+            shape.clone(),
+            self.dtype,
+            self.device.clone(),
+        ))
     }
 
     fn transpose(&self, dim1: usize, dim2: usize) -> Result<Self> {
-        // read, transpose in CPU memory, write back
-        // works for 2D case which is all we need for weight transpose
-        let dims = self.shape.dims();
-        assert_eq!(
-            dims.len(),
-            2,
-            "MetalTensor::transpose: only 2D supported for now"
-        );
-        let rows = dims[0];
-        let cols = dims[1];
-        let src_f32 = self.to_vec_f32()?;
-        let mut dst = vec![0.0f32; src_f32.len()];
-        for r in 0..rows {
-            for c in 0..cols {
-                dst[c * rows + r] = src_f32[r * cols + c];
-            }
-        }
-        let new_shape = Shape::new(&[cols, rows]);
-        Self::from_slice(&dst, &new_shape, &self.device)
+        let mut new_shape = self.shape.dims().to_vec();
+        let mut new_strides = self.strides.clone();
+
+        new_shape.swap(dim1, dim2);
+        new_strides.swap(dim1, dim2);
+
+        Ok(Self {
+            state: self.state.clone(),
+            block: self.block.clone(),
+            shape: Shape::new(&new_shape),
+            strides: new_strides,
+            offset_bytes: self.offset_bytes,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn squeeze(&self, dim: usize) -> Result<Self> {
@@ -946,17 +996,23 @@ impl TensorOps for MetalTensor {
         unsafe {
             match self.dtype {
                 DType::F32 => {
-                    let a = Arc::as_ptr(&self.block) as *const f32;
-                    let b = Arc::as_ptr(&self.block) as *const f32;
-                    let c = Arc::as_ptr(&self.block) as *mut f32;
+                    let a =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes)
+                        as *const f32;
+                    let c =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
                     for i in 0..n {
                         c.add(i).write(a.add(i).read() + b.add(i).read());
                     }
                 }
                 DType::F16 => {
-                    let a = Arc::as_ptr(&self.block) as *const half::f16;
-                    let b = Arc::as_ptr(&self.block) as *const half::f16;
-                    let c = Arc::as_ptr(&self.block) as *mut half::f16;
+                    let a = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes)
+                        as *const half::f16;
+                    let c = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
                     for i in 0..n {
                         let sum = a.add(i).read().to_f32() + b.add(i).read().to_f32();
                         c.add(i).write(half::f16::from_f32(sum));
@@ -972,29 +1028,28 @@ impl TensorOps for MetalTensor {
         if self.shape != other.shape {
             return Err(CoreError::Internal("sub: shape mismatch".into()));
         }
-
         let n = self.shape.numel();
         let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
-
         unsafe {
             match self.dtype {
                 DType::F32 => {
-                    let a = Arc::as_ptr(&self.block).cast::<f32>();
-                    let b = Arc::as_ptr(&other.block).cast::<f32>();
-                    let c = Arc::as_ptr(&output.block) as *mut f32;
-
+                    let a =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes)
+                        as *const f32;
+                    let c =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
                     for i in 0..n {
-                        let val_a = a.add(i).read();
-                        let val_b = b.add(i).read();
-                        c.add(i).write(val_a - val_b);
+                        c.add(i).write(a.add(i).read() - b.add(i).read());
                     }
                 }
-
                 DType::F16 => {
-                    let a = Arc::as_ptr(&self.block).cast::<half::f16>();
-                    let b = Arc::as_ptr(&other.block).cast::<half::f16>();
-                    let c = Arc::as_ptr(&output.block) as *mut half::f16;
-
+                    let a = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes)
+                        as *const half::f16;
+                    let c = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
                     for i in 0..n {
                         let diff = a.add(i).read().to_f32() - b.add(i).read().to_f32();
                         c.add(i).write(half::f16::from_f32(diff));
@@ -1006,29 +1061,135 @@ impl TensorOps for MetalTensor {
         Ok(output)
     }
 
-    fn mul(&self, _: &Self) -> Result<Self> {
-        todo!("Metal Phase 1")
+    fn mul(&self, other: &Self) -> Result<Self> {
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let a =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes)
+                        as *const f32;
+                    let c =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        c.add(i).write(a.add(i).read() * b.add(i).read());
+                    }
+                }
+                DType::F16 => {
+                    let a = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes)
+                        as *const half::f16;
+                    let c = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        let prod = a.add(i).read().to_f32() * b.add(i).read().to_f32();
+                        c.add(i).write(half::f16::from_f32(prod));
+                    }
+                }
+                _ => return Err(CoreError::Internal("mul: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
-    fn div(&self, _: &Self) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn div(&self, other: &Self) -> Result<Self> {
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let a =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes)
+                        as *const f32;
+                    let c =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        c.add(i).write(a.add(i).read() / b.add(i).read());
+                    }
+                }
+                DType::F16 => {
+                    let a = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes)
+                        as *const half::f16;
+                    let c = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        let div = a.add(i).read().to_f32() / b.add(i).read().to_f32();
+                        c.add(i).write(half::f16::from_f32(div));
+                    }
+                }
+                _ => return Err(CoreError::Internal("div: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
-    fn scale(&self, _: f64) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn scale(&self, scalar: f64) -> Result<Self> {
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        let scalar_f32 = scalar as f32;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        dst.add(i).write(src.add(i).read() * scalar_f32);
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        let scaled = src.add(i).read().to_f32() * scalar_f32;
+                        dst.add(i).write(half::f16::from_f32(scaled));
+                    }
+                }
+                _ => return Err(CoreError::Internal("scale: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
-    fn matmul(&self, _: &Self) -> Result<Self> {
-        // The foundation kernel — sequencing notes from project planning apply here first.
-        todo!("Metal Phase 1")
+
+    fn matmul(&self, other: &Self) -> Result<Self> {
+        let m = self.shape.dims()[0];
+        let k = self.shape.dims()[1];
+        let n = other.shape.dims()[1];
+
+        let a = self.to_vec_f32()?;
+        let b = other.to_vec_f32()?;
+        let mut c = vec![0.0f32; m * n];
+
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for l in 0..k {
+                    sum += a[i * k + l] * b[l * n + j];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+        let out_tensor = Self::from_slice(&c, &Shape::new(&[m, n]), &self.device)?;
+        out_tensor.to_dtype(self.dtype)
     }
 
     fn broadcast_add(&self, other: &Self) -> Result<Self> {
-        // other is the bias — shape [N], self is [..., N]
         let n = self.shape.numel();
         let bias_len = other.shape.numel();
         let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
         unsafe {
-            let a = Arc::as_ptr(&self.block) as *const f32;
-            let b = Arc::as_ptr(&self.block) as *const f32;
-            let c = Arc::as_ptr(&self.block) as *mut f32;
+            let a = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+            let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes) as *const f32;
+            let c = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
             for i in 0..n {
                 c.add(i).write(a.add(i).read() + b.add(i % bias_len).read());
             }
@@ -1036,18 +1197,42 @@ impl TensorOps for MetalTensor {
         Ok(output)
     }
 
-    fn sum(&self, _: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+    fn sum(&self, dim: usize) -> Result<Self> {
+        let src = self.to_vec_f32()?;
+        let dims = self.shape.dims();
+        let mut new_dims = dims.to_vec();
+        new_dims.remove(dim);
+
+        let stride = self.strides[dim];
+        let dim_size = dims[dim];
+        let num_elements = new_dims.iter().product::<usize>();
+
+        let mut dst = vec![0.0f32; num_elements];
+        for i in 0..num_elements {
+            let mut val = 0.0;
+            for j in 0..dim_size {
+                let index = (i / stride) * (stride * dim_size) + (i % stride) + (j * stride);
+                val += src[index];
+            }
+            dst[i] = val;
+        }
+
+        let out_tensor = Self::from_slice(&dst, &Shape::new(&new_dims), &self.device)?;
+        out_tensor.to_dtype(self.dtype)
     }
-    fn mean(&self, _: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn mean(&self, dim: usize) -> Result<Self> {
+        let sum_tensor = self.sum(dim)?;
+        let dim_size = self.shape.dims()[dim] as f64;
+        sum_tensor.scale(1.0 / dim_size)
     }
+
     fn silu(&self) -> Result<Self> {
         let n = self.shape.numel();
         let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
         unsafe {
-            let src = Arc::as_ptr(&self.block) as *const f32;
-            let dst = Arc::as_ptr(&self.block) as *mut f32;
+            let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+            let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
             for i in 0..n {
                 let x = src.add(i).read();
                 dst.add(i).write(x / (1.0 + (-x).exp()));
@@ -1055,8 +1240,38 @@ impl TensorOps for MetalTensor {
         }
         Ok(output)
     }
+
     fn gelu(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        let x = src.add(i).read();
+                        let g = 0.5 * x * (1.0 + f32::tanh(0.797884 * (x + 0.044715 * x * x * x)));
+                        dst.add(i).write(g);
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        let x = src.add(i).read().to_f32();
+                        let g = 0.5 * x * (1.0 + f32::tanh(0.797884 * (x + 0.044715 * x * x * x)));
+                        dst.add(i).write(half::f16::from_f32(g));
+                    }
+                }
+                _ => return Err(CoreError::Internal("gelu: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
 
     fn softmax(&self, dim: usize) -> Result<Self> {
@@ -1075,11 +1290,38 @@ impl TensorOps for MetalTensor {
                 dst[r * row_size + i] = e / sum;
             }
         }
-        Self::from_slice(&dst, &self.shape, &self.device)
+        let out = Self::from_slice(&dst, &self.shape, &self.device)?;
+        out.to_dtype(self.dtype)
     }
 
     fn sqrt(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        dst.add(i).write(src.add(i).read().sqrt());
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        dst.add(i)
+                            .write(half::f16::from_f32(src.add(i).read().to_f32().sqrt()));
+                    }
+                }
+                _ => return Err(CoreError::Internal("sqrt: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
 
     fn rms_norm(&self, weight: &Self, eps: f32) -> Result<Self> {
@@ -1103,21 +1345,21 @@ impl TensorOps for MetalTensor {
     }
 
     fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
-        // self: [..., M, K]   other: [N, K] (weight stored transposed)
-        // flatten leading dims into M
         let rank = self.shape.rank();
         let k = self.shape.dims()[rank - 1];
         let m: usize = self.shape.dims()[..rank - 1].iter().product();
         let n = other.shape.dims()[0];
-        // weight is [N, K] but matmul needs [K, N] — transpose other
-        let other_t = other.transpose(0, 1)?;
+
+        let other_t = other.transpose(0, 1)?.contiguous_copy()?;
         let out_shape_dims: Vec<usize> = self.shape.dims()[..rank - 1]
             .iter()
             .cloned()
             .chain(std::iter::once(n))
             .collect();
+
         let output = Self::zeros(&Shape::new(&out_shape_dims), self.dtype, &self.device)?;
         let state = self.state.clone();
+
         state.kernels.matmul_f16(
             &state.ctx,
             &state.alloc.lock().unwrap(),
@@ -1131,45 +1373,260 @@ impl TensorOps for MetalTensor {
         Ok(output)
     }
 
-    fn index_select(&self, _indexes: &Self, _dim: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+    fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
+        let indices = indexes.to_vec_u32()?;
+        let mut new_dims = self.shape.dims().to_vec();
+        new_dims[dim] = indices.len();
+
+        let output = Self::zeros(&Shape::new(&new_dims), self.dtype, &self.device)?;
+        let src_f32 = self.to_vec_f32()?;
+        let mut dst_f32 = vec![0.0f32; output.shape.numel()];
+
+        let stride = self.strides[dim];
+        let dim_size = self.shape.dims()[dim];
+        let num_elements = new_dims.iter().product::<usize>();
+
+        // Basic element mapping
+        for i in 0..num_elements {
+            let outer = i / (indices.len() * stride);
+            let target_idx = (i / stride) % indices.len();
+            let inner = i % stride;
+
+            let source_idx = indices[target_idx] as usize;
+            let src_index = outer * (dim_size * stride) + source_idx * stride + inner;
+            dst_f32[i] = src_f32[src_index];
+        }
+        let out = Self::from_slice(&dst_f32, &Shape::new(&new_dims), &self.device)?;
+        out.to_dtype(self.dtype)
     }
+
     fn cos(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        dst.add(i).write(src.add(i).read().cos());
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        dst.add(i)
+                            .write(half::f16::from_f32(src.add(i).read().to_f32().cos()));
+                    }
+                }
+                _ => return Err(CoreError::Internal("cos: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
+
     fn sin(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        dst.add(i).write(src.add(i).read().sin());
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        dst.add(i)
+                            .write(half::f16::from_f32(src.add(i).read().to_f32().sin()));
+                    }
+                }
+                _ => return Err(CoreError::Internal("sin: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
-    fn chunk(&self, _: usize, _: usize) -> Result<Vec<Self>> {
-        todo!("Metal Phase 1")
+
+    fn chunk(&self, n: usize, dim: usize) -> Result<Vec<Self>> {
+        let dim_size = self.shape().dims()[dim];
+        let chunk_size = dim_size / n;
+        let remainder = dim_size % n;
+
+        let mut new_chunks = Vec::with_capacity(n);
+        let mut current_offset = 0;
+
+        for i in 0..n {
+            let current_chunk_size = if i < remainder {
+                chunk_size + 1
+            } else {
+                chunk_size
+            };
+            let chunk_tensor = self.narrow(dim, current_offset, current_chunk_size)?;
+            new_chunks.push(chunk_tensor);
+            current_offset += current_chunk_size;
+        }
+
+        Ok(new_chunks)
     }
-    fn cat(_: &[&Self], _: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn cat(tensors: &[&Self], dim: usize) -> Result<Self> {
+        let mut new_dims = tensors[0].shape.dims().to_vec();
+        let total_dim_size: usize = tensors.iter().map(|t| t.shape.dims()[dim]).sum();
+        new_dims[dim] = total_dim_size;
+        let output = Self::zeros(&Shape::new(&new_dims), tensors[0].dtype, &tensors[0].device)?;
+
+        let mut write_offset_bytes = 0usize;
+        for t in tensors {
+            let size_bytes = t.shape.numel() * t.dtype.size_in_bytes();
+            unsafe {
+                let src = (t.block.as_ref().ptr as *const u8).add(t.offset_bytes);
+                let dst = (output.block.as_ref().ptr as *mut u8).add(write_offset_bytes);
+                std::ptr::copy_nonoverlapping(src, dst, size_bytes);
+            }
+            write_offset_bytes += size_bytes;
+        }
+        Ok(output)
     }
+
     fn neg(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        dst.add(i).write(-src.add(i).read());
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        dst.add(i)
+                            .write(half::f16::from_f32(-src.add(i).read().to_f32()));
+                    }
+                }
+                _ => return Err(CoreError::Internal("neg: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
-    fn narrow(&self, _dim: usize, _start: usize, _len: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
+        let current_shape = self.shape.dims();
+        if start + len > current_shape[dim] {
+            return Err(CoreError::OutOfBounds {
+                op: "narrow",
+                index: start + len,
+                size: current_shape[dim],
+            });
+        }
+
+        let element_size = self.dtype.size_in_bytes();
+        let stride = self.strides[dim];
+        let byte_offset = start * stride * element_size;
+
+        let mut new_dims = current_shape.to_vec();
+        new_dims[dim] = len;
+        let new_shape = Shape::new(&new_dims);
+
+        Ok(Self {
+            state: self.state.clone(),
+            block: self.block.clone(),
+            shape: new_shape,
+            strides: self.strides.clone(),
+            offset_bytes: self.offset_bytes + byte_offset,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
-    fn broadcast_mul(&self, _: &Self) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn broadcast_mul(&self, other: &Self) -> Result<Self> {
+        let n = self.shape.numel();
+        let bias_len = other.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            let a = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+            let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes) as *const f32;
+            let c = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+            for i in 0..n {
+                c.add(i).write(a.add(i).read() * b.add(i % bias_len).read());
+            }
+        }
+        Ok(output)
     }
-    fn repeat(&self, _: &Shape) -> Result<Self> {
-        todo!("Metal Phase 1")
+
+    fn repeat(&self, shape: &Shape) -> Result<Self> {
+        // CPU fallback tile/repeat strategy
+        let mut src_f32 = self.to_vec_f32()?;
+        let mut num_repeats = shape.numel() / self.shape.numel();
+
+        let mut repeated: Vec<f32> = Vec::with_capacity(shape.numel());
+        for _ in 0..num_repeats {
+            repeated.extend(&src_f32);
+        }
+
+        let out = Self::from_slice(&repeated, shape, &self.device)?;
+        out.to_dtype(self.dtype)
     }
+
     fn sigmoid(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        let x = src.add(i).read();
+                        dst.add(i).write(1.0 / (1.0 + (-x).exp()));
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        let x = src.add(i).read().to_f32();
+                        dst.add(i)
+                            .write(half::f16::from_f32(1.0 / (1.0 + (-x).exp())));
+                    }
+                }
+                _ => return Err(CoreError::Internal("sigmoid: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
+
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
         let n = self.shape.numel();
         let mut out = vec![0u32; n];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                Arc::as_ptr(&self.block) as *const u32,
-                out.as_mut_ptr(),
-                n,
-            );
+            let ptr = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const u32;
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
         }
         Ok(out)
     }
@@ -1178,12 +1635,26 @@ impl TensorOps for MetalTensor {
         Self::zeros(&self.shape, self.dtype, &self.device)
     }
 
-    fn sum_keepdim(&self, _dim: usize) -> Result<Self> {
-        todo!("Metal Phase 1")
+    fn sum_keepdim(&self, dim: usize) -> Result<Self> {
+        let summed = self.sum(dim)?;
+        let mut dims = self.shape.dims().to_vec();
+        dims[dim] = 1;
+        summed.reshape(&Shape::new(&dims))
     }
 
-    fn broadcast_div(&self, _other: &Self) -> Result<Self> {
-        todo!("Metal Phase 1")
+    fn broadcast_div(&self, other: &Self) -> Result<Self> {
+        let n = self.shape.numel();
+        let bias_len = other.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            let a = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+            let b = (other.block.as_ref().ptr as *const u8).add(other.offset_bytes) as *const f32;
+            let c = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+            for i in 0..n {
+                c.add(i).write(a.add(i).read() / b.add(i % bias_len).read());
+            }
+        }
+        Ok(output)
     }
 
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
@@ -1192,14 +1663,13 @@ impl TensorOps for MetalTensor {
         unsafe {
             match self.dtype {
                 DType::F32 => {
-                    std::ptr::copy_nonoverlapping(
-                        Arc::as_ptr(&self.block) as *const f32,
-                        out.as_mut_ptr(),
-                        n,
-                    );
+                    let ptr =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
                 }
                 DType::F16 => {
-                    let ptr = Arc::as_ptr(&self.block) as *const half::f16;
+                    let ptr = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
                     for i in 0..n {
                         out[i] = ptr.add(i).read().to_f32();
                     }
@@ -1211,10 +1681,63 @@ impl TensorOps for MetalTensor {
     }
 
     fn exp(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        dst.add(i).write(src.add(i).read().exp());
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        dst.add(i)
+                            .write(half::f16::from_f32(src.add(i).read().to_f32().exp()));
+                    }
+                }
+                _ => return Err(CoreError::Internal("exp: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
+
     fn log(&self) -> Result<Self> {
-        todo!("Metal Phase 1")
+        let n = self.shape.numel();
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        unsafe {
+            match self.dtype {
+                DType::F32 => {
+                    let src =
+                        (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
+                    let dst =
+                        (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes) as *mut f32;
+                    for i in 0..n {
+                        dst.add(i).write(src.add(i).read().ln());
+                    }
+                }
+                DType::F16 => {
+                    let src = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                        as *const half::f16;
+                    let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes)
+                        as *mut half::f16;
+                    for i in 0..n {
+                        dst.add(i)
+                            .write(half::f16::from_f32(src.add(i).read().to_f32().ln()));
+                    }
+                }
+                _ => return Err(CoreError::Internal("log: unsupported dtype".into())),
+            }
+        }
+        Ok(output)
     }
 }
 

@@ -31,12 +31,13 @@ pub struct CudarcTensor {
     pub(crate) device: Device,
 }
 
-// FIX: Removed <BlockHandle> so it uses the concrete imported type
 #[derive(Clone)]
 pub struct MetalTensor {
     pub(crate) state: Arc<MetalState>,
     pub(crate) block: Arc<BlockHandle>,
     pub(crate) shape: Shape,
+    pub(crate) strides: Vec<usize>,
+    pub(crate) offset_bytes: usize,
     pub(crate) dtype: DType,
     pub(crate) device: Device,
 }
@@ -47,14 +48,12 @@ pub trait Backend: Clone + Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + From<CoreError>;
 }
 
-// Compile time tags
 #[derive(Debug, Clone, Copy)]
 pub struct CandleBackend;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CudarcBackend;
 
-// FIX: Removed `Copy`, and removed `<MetalState>`
 #[derive(Debug, Clone)]
 pub struct MetalBackend {
     pub state: Arc<MetalState>,
@@ -72,7 +71,6 @@ impl Backend for CudarcBackend {
     type Error = CoreError;
 }
 
-// FIX: Removed `<MetalState>`
 impl Backend for MetalBackend {
     type Tensor = MetalTensor;
     type Device = Device;
