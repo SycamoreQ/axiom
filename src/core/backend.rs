@@ -31,6 +31,7 @@ pub struct CudarcTensor {
     pub(crate) device: Device,
 }
 
+#[cfg(feature = "metal")]
 #[derive(Clone)]
 pub struct MetalTensor {
     pub(crate) state: Arc<MetalState>,
@@ -54,6 +55,7 @@ pub struct CandleBackend;
 #[derive(Debug, Clone, Copy)]
 pub struct CudarcBackend;
 
+#[cfg(feature = "metal")]
 #[derive(Debug, Clone)]
 pub struct MetalBackend {
     pub state: Arc<MetalState>,
@@ -71,6 +73,7 @@ impl Backend for CudarcBackend {
     type Error = CoreError;
 }
 
+#[cfg(feature = "metal")]
 impl Backend for MetalBackend {
     type Tensor = MetalTensor;
     type Device = Device;
@@ -111,6 +114,7 @@ impl TopKLastDimOp for CudarcTensor {
     }
 }
 
+#[cfg(feature = "metal")]
 impl TopKLastDimOp for MetalTensor {
     fn topk(&self, _k: usize) -> Result<TopKOutput<Self>> {
         todo!("Metal Phase 1")

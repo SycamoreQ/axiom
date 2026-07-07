@@ -1,12 +1,13 @@
-use crate::core::backend::{CandleTensor, CudarcTensor, MetalTensor};
+#[cfg(feature = "metal")]
+use crate::core::backend::MetalTensor;
+use crate::core::backend::{CandleTensor, CudarcTensor};
 use crate::core::device::Device;
 use crate::core::dtype::{DType, Element};
 use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
 use crate::core::tensor;
-use crate::metal::allocator::BlockHandle;
-use crate::metal::state::global_metal_state;
-use crate::metal::MetalState;
+#[cfg(feature = "metal")]
+use crate::metal::{allocator::BlockHandle, state::global_metal_state, MetalState};
 use candle_core::{self, Tensor};
 use candle_nn;
 use std::sync::Arc;
@@ -20,12 +21,14 @@ fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
         // through candle_core at all. This arm exists only so the match stays
         // exhaustive; it errors loudly if CandleTensor::* is ever called with
         // a Metal device by mistake, rather than silently doing the wrong thing.
+        #[cfg(feature = "metal")]
         Device::Metal(_) => Err(CoreError::Internal(
             "CandleTensor does not support Device::Metal — use MetalTensor instead".to_string(),
         )),
     }
 }
 
+#[cfg(feature = "metal")]
 impl MetalTensor {
     //Helper to create a standard, contiguous tensor layout
     pub(crate) fn new_contiguous(
@@ -839,6 +842,7 @@ do a direct byte-copy into an MTLBuffer (unified memory means this is close to f
 on Apple Silicon — no separate host/device transfer step the way CUDA needs).
 */
 
+#[cfg(feature = "metal")]
 impl TensorOps for MetalTensor {
     fn shape(&self) -> &Shape {
         &self.shape
@@ -1345,32 +1349,90 @@ impl TensorOps for MetalTensor {
     }
 
     fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
+        eprintln!(
+            "broadcast_matmul: self={:?} other={:?}",
+            self.shape.dims(),
+            other.shape.dims()
+        );
         let rank = self.shape.rank();
-        let k = self.shape.dims()[rank - 1];
+        let other_rank = other.shape.rank();
+
+        // Detect whether other is a weight matrix (rank 2, needs implicit transpose)
+        // or a full tensor already in the right layout (rank > 2, standard matmul)
+        let (k, n, other_k, pre_transposed) = if other_rank == 2 {
+            let k = self.shape.dims()[rank - 1];
+            if other.shape.dims()[1] == k {
+                let n = other.shape.dims()[0];
+                let ok = other.shape.dims()[1];
+                (k, n, ok, false)
+            } else if other.shape.dims()[0] == k {
+                let n = other.shape.dims()[1];
+                let ok = other.shape.dims()[0];
+                (k, n, ok, true)
+            } else {
+                return Err(CoreError::Internal(format!(
+                    "Metal matmul dimension mismatch: k={}, other={:?}",
+                    k,
+                    other.shape.dims()
+                )));
+            }
+        } else {
+            // standard tensor matmul: [..., m, k] @ [..., k, n]
+            let k = self.shape.dims()[rank - 1];
+            let n = other.shape.dims()[other_rank - 1];
+            let ok = other.shape.dims()[other_rank - 2];
+            (k, n, ok, false)
+        };
+
+        let self_f32 = self.to_vec_f32()?;
+        let other_f32 = other.to_vec_f32()?;
+
         let m: usize = self.shape.dims()[..rank - 1].iter().product();
-        let n = other.shape.dims()[0];
+        let batch_self: usize = if rank > 2 {
+            self.shape.dims()[..rank - 2].iter().product()
+        } else {
+            1
+        };
+        let batch_other: usize = if other_rank > 2 {
+            other.shape.dims()[..other_rank - 2].iter().product()
+        } else {
+            1
+        };
+        let batch_out = batch_self.max(batch_other);
+        let m_per = self.shape.dims()[rank - 2]; // rows per batch slice
 
-        let other_t = other.transpose(0, 1)?.contiguous_copy()?;
-        let out_shape_dims: Vec<usize> = self.shape.dims()[..rank - 1]
-            .iter()
-            .cloned()
-            .chain(std::iter::once(n))
-            .collect();
+        let mut out_f32 = vec![0.0f32; batch_out * m_per * n];
 
-        let output = Self::zeros(&Shape::new(&out_shape_dims), self.dtype, &self.device)?;
-        let state = self.state.clone();
+        for b in 0..batch_out {
+            let self_b = if batch_self == 1 { 0 } else { b };
+            let other_b = if batch_other == 1 { 0 } else { b };
+            let self_off = self_b * m_per * k;
+            let other_off = other_b * (if other_rank == 2 { n * k } else { k * n });
+            let out_off = b * m_per * n;
 
-        state.kernels.matmul_f16(
-            &state.ctx,
-            &state.alloc.lock().unwrap(),
-            &self.block,
-            &other_t.block,
-            &output.block,
-            m as u32,
-            n as u32,
-            k as u32,
-        )?;
-        Ok(output)
+            for i in 0..m_per {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for l in 0..k {
+                        let a_val = self_f32[self_off + i * k + l];
+                        let b_val = if other_rank == 2 && !pre_transposed {
+                            other_f32[other_off + j * k + l] // [out, in]: weight[j, l]
+                        } else if other_rank == 2 && pre_transposed {
+                            other_f32[other_off + l * n + j] // [in, out]: weight[l, j]
+                        } else {
+                            other_f32[other_off + l * n + j] // standard tensor matmul
+                        };
+                        sum += a_val * b_val;
+                    }
+                    out_f32[out_off + i * n + j] = sum;
+                }
+            }
+        }
+
+        let mut out_dims: Vec<usize> = self.shape.dims()[..rank - 1].to_vec();
+        out_dims.push(n);
+        let out = Self::from_slice(&out_f32, &Shape::new(&out_dims), &self.device)?;
+        out.to_dtype(self.dtype)
     }
 
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
@@ -1575,17 +1637,34 @@ impl TensorOps for MetalTensor {
         Ok(output)
     }
 
-    fn repeat(&self, shape: &Shape) -> Result<Self> {
-        // CPU fallback tile/repeat strategy
-        let mut src_f32 = self.to_vec_f32()?;
-        let mut num_repeats = shape.numel() / self.shape.numel();
+    fn repeat(&self, repeats: &Shape) -> Result<Self> {
+        let out_dims: Vec<usize> = self
+            .shape
+            .dims()
+            .iter()
+            .zip(repeats.dims().iter())
+            .map(|(&d, &r)| d * r)
+            .collect();
+        let out_shape = Shape::new(&out_dims);
+        let src = self.to_vec_f32()?;
+        let out_strides = MetalTensor::compute_strides(&out_dims);
+        let in_strides = MetalTensor::compute_strides(self.shape.dims());
+        let n = out_shape.numel();
+        let mut dst = vec![0.0f32; n];
 
-        let mut repeated: Vec<f32> = Vec::with_capacity(shape.numel());
-        for _ in 0..num_repeats {
-            repeated.extend(&src_f32);
+        for i in 0..n {
+            let mut remaining = i;
+            let mut src_idx = 0usize;
+            for d in 0..out_dims.len() {
+                let coord = remaining / out_strides[d];
+                remaining %= out_strides[d];
+                let src_coord = coord % self.shape.dims()[d];
+                src_idx += src_coord * in_strides[d];
+            }
+            dst[i] = src[src_idx];
         }
 
-        let out = Self::from_slice(&repeated, shape, &self.device)?;
+        let out = Self::from_slice(&dst, &out_shape, &self.device)?;
         out.to_dtype(self.dtype)
     }
 
@@ -1624,9 +1703,30 @@ impl TensorOps for MetalTensor {
     fn to_vec_u32(&self) -> Result<Vec<u32>> {
         let n = self.shape.numel();
         let mut out = vec![0u32; n];
+        let dims = self.shape.dims();
+        let rank = dims.len();
+
+        let expected_strides = Self::compute_strides(dims);
+        let is_contiguous = self.strides == expected_strides;
+
         unsafe {
-            let ptr = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const u32;
-            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
+            let base_ptr =
+                (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const u32;
+
+            if is_contiguous {
+                std::ptr::copy_nonoverlapping(base_ptr, out.as_mut_ptr(), n);
+            } else {
+                for i in 0..n {
+                    let mut physical_idx = 0;
+                    let mut linear_idx = i;
+                    for d in (0..rank).rev() {
+                        let coord = linear_idx % dims[d];
+                        linear_idx /= dims[d];
+                        physical_idx += coord * self.strides[d];
+                    }
+                    out[i] = base_ptr.add(physical_idx).read();
+                }
+            }
         }
         Ok(out)
     }
@@ -1660,18 +1760,54 @@ impl TensorOps for MetalTensor {
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
         let n = self.shape.numel();
         let mut out = vec![0.0f32; n];
+        let dims = self.shape.dims();
+        let rank = dims.len();
+
+        let expected_strides = Self::compute_strides(dims);
+        let is_contiguous = self.strides == expected_strides;
+
         unsafe {
             match self.dtype {
                 DType::F32 => {
-                    let ptr =
+                    let base_ptr =
                         (self.block.as_ref().ptr as *const u8).add(self.offset_bytes) as *const f32;
-                    std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), n);
+
+                    if is_contiguous {
+                        // Fast path: physical memory matches logical shape
+                        std::ptr::copy_nonoverlapping(base_ptr, out.as_mut_ptr(), n);
+                    } else {
+                        // Slow path: strided physical memory read
+                        for i in 0..n {
+                            let mut physical_idx = 0;
+                            let mut linear_idx = i;
+                            for d in (0..rank).rev() {
+                                let coord = linear_idx % dims[d];
+                                linear_idx /= dims[d];
+                                physical_idx += coord * self.strides[d];
+                            }
+                            out[i] = base_ptr.add(physical_idx).read();
+                        }
+                    }
                 }
                 DType::F16 => {
-                    let ptr = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
+                    let base_ptr = (self.block.as_ref().ptr as *const u8).add(self.offset_bytes)
                         as *const half::f16;
-                    for i in 0..n {
-                        out[i] = ptr.add(i).read().to_f32();
+
+                    if is_contiguous {
+                        for i in 0..n {
+                            out[i] = base_ptr.add(i).read().to_f32();
+                        }
+                    } else {
+                        for i in 0..n {
+                            let mut physical_idx = 0;
+                            let mut linear_idx = i;
+                            for d in (0..rank).rev() {
+                                let coord = linear_idx % dims[d];
+                                linear_idx /= dims[d];
+                                physical_idx += coord * self.strides[d];
+                            }
+                            out[i] = base_ptr.add(physical_idx).read().to_f32();
+                        }
                     }
                 }
                 _ => return Err(CoreError::Internal("to_vec_f32: unsupported dtype".into())),

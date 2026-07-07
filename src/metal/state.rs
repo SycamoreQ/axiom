@@ -39,3 +39,23 @@ impl MetalState {
         })
     }
 }
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metal_state_initialization() {
+        let pool_size = 1024 * 1024;
+        let state = init_global_metal_state(pool_size).unwrap();
+        assert!(global_metal_state().is_some());
+    }
+
+    #[test]
+    fn test_allocator_mutex() {
+        let state = global_metal_state().unwrap();
+        let mut alloc = state.alloc.lock().unwrap();
+        let block = alloc.alloc(128, 16).unwrap();
+        assert!(!block.ptr.is_null());
+    }
+}

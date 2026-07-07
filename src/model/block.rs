@@ -307,3 +307,134 @@ mod tests {
         assert!(matches!(block_2.ffn, FeedForwardLayer::Moe(_)));
     }
 }
+
+#[cfg(feature = "metal")]
+#[cfg(test)]
+mod metal_tests {
+    use super::*;
+    use crate::core::backend::{MetalBackend, MetalTensor};
+    use crate::core::device::Device;
+    use crate::core::dtype::DType;
+    use crate::core::shape::Shape;
+    use crate::core::tensor::TensorOps;
+
+    // Helper to safely initialize and retrieve the global Metal state for tests.
+    fn ensure_metal_device() -> Device {
+        if crate::metal::state::global_metal_state().is_none() {
+            let pool_size = 1024 * 1024 * 100; // 100 MB
+            let _ = crate::metal::state::init_global_metal_state(pool_size);
+        }
+        Device::Metal(0)
+    }
+
+    fn make_dense_config() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            intermediate_size: 128,
+            vocab_size: 1000,
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            hidden_act: "silu".to_string(),
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            num_local_experts: None,
+            num_experts_per_tok: None,
+            num_shared_experts: None,
+            expert_interval: None,
+            prefetch_threshold: None,
+            torch_dtype: "float32".to_string(),
+            architectures: None,
+            model_type: Some("llama".to_string()),
+        }
+    }
+
+    fn make_moe_config() -> ModelConfig {
+        let mut config = make_dense_config();
+        config.num_local_experts = Some(4);
+        config.num_experts_per_tok = Some(2);
+        config.num_shared_experts = Some(1);
+        config.expert_interval = Some(1);
+        config.model_type = Some("deepseek".to_string());
+        config
+    }
+
+    #[test]
+    fn test_metal_dense_block_forward() {
+        let device = ensure_metal_device();
+        let config = make_dense_config();
+        let mut block = Block::<MetalBackend>::new(&config, 0, &device)
+            .expect("Failed to create Metal Dense Block");
+
+        let x = MetalTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &device).unwrap();
+
+        let (out, k, v) = block
+            .forward(&x, None, None, 0)
+            .expect("Metal block forward failed");
+
+        assert_eq!(out.shape(), &Shape::new(&[1, 4, 64]));
+        assert_eq!(k.shape().dim(0).unwrap(), 1);
+        assert_eq!(v.shape().dim(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_metal_moe_block_forward() {
+        let device = ensure_metal_device();
+        let config = make_moe_config();
+        let mut block = Block::<MetalBackend>::new(&config, 0, &device)
+            .expect("Failed to create Metal MoE Block");
+
+        let x = MetalTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &device).unwrap();
+
+        let (out, _, _) = block
+            .forward(&x, None, None, 0)
+            .expect("Metal MoE forward failed");
+        assert_eq!(out.shape(), &Shape::new(&[1, 4, 64]));
+    }
+
+    #[test]
+    fn test_metal_block_with_mask() {
+        let device = ensure_metal_device();
+        let config = make_dense_config();
+        let mut block = Block::<MetalBackend>::new(&config, 0, &device).unwrap();
+
+        let x = MetalTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &device).unwrap();
+        let mask = MetalTensor::zeros(&Shape::new(&[1, 1, 4, 4]), DType::F32, &device).unwrap();
+
+        let (out, _, _) = block.forward(&x, Some(&mask), None, 0).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[1, 4, 64]));
+    }
+
+    #[test]
+    fn test_metal_block_kv_cache() {
+        let device = ensure_metal_device();
+        let config = make_dense_config();
+        let mut block = Block::<MetalBackend>::new(&config, 0, &device).unwrap();
+
+        // Initial prefill phase (4 tokens)
+        let x_prefill = MetalTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &device).unwrap();
+        let (_, k_cache, v_cache) = block.forward(&x_prefill, None, None, 0).unwrap();
+
+        // Decode phase (1 token), using the cache from the prefill phase
+        let x_decode = MetalTensor::zeros(&Shape::new(&[1, 1, 64]), DType::F32, &device).unwrap();
+        let (out_decode, new_k, new_v) = block
+            .forward(&x_decode, None, Some((&k_cache, &v_cache)), 4)
+            .expect("KV Cache forward pass failed on Metal");
+
+        assert_eq!(out_decode.shape(), &Shape::new(&[1, 1, 64]));
+
+        // The KV cache should now hold 5 tokens (4 from prefill + 1 from decode)
+        assert_eq!(
+            new_k.shape().dim(1).unwrap(),
+            5,
+            "Metal KV Cache did not concatenate correctly"
+        );
+        assert_eq!(
+            new_v.shape().dim(1).unwrap(),
+            5,
+            "Metal KV Cache did not concatenate correctly"
+        );
+    }
+}

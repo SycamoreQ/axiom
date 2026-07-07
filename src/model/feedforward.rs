@@ -1,4 +1,6 @@
 use crate::core::backend::Backend;
+#[cfg(feature = "metal")]
+use crate::core::backend::MetalTensor;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
 use crate::core::error::Result;
@@ -32,7 +34,8 @@ impl<B: Backend> FeedForward<B> {
     }
 
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
-        let gate = self.gate_proj.forward(x)?.silu()?;
+        let gate = self.gate_proj.forward(x)?;
+        let gate = gate.silu()?;
         let up = self.up_proj.forward(x)?;
         let fused = gate.mul(&up)?;
         self.down_proj.forward(&fused)
@@ -56,7 +59,7 @@ impl<B: Backend> FeedForward<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::backend::{CandleBackend, CandleTensor};
+    use crate::core::backend::{CandleBackend, CandleTensor, MetalBackend, MetalTensor};
     use crate::core::device::Device;
     use crate::core::dtype::DType;
     use crate::core::shape::Shape;
@@ -143,5 +146,146 @@ mod tests {
             let out = ff.forward(&x).unwrap();
             assert_eq!(out.shape(), &Shape::new(&[batch, 4, 64]));
         }
+    }
+}
+
+#[cfg(feature = "metal")]
+#[cfg(test)]
+mod metal_tests {
+    use super::*;
+    use crate::core::device::Device;
+    use crate::core::dtype::DType;
+
+    use crate::core::shape::Shape;
+    use std::sync::Arc;
+
+    // Helper to safely initialize and retrieve the global Metal state for tests.
+    fn ensure_metal_device() -> Device {
+        if crate::metal::state::global_metal_state().is_none() {
+            let pool_size = 1024 * 1024 * 100; // 100 MB
+            let _ = crate::metal::state::init_global_metal_state(pool_size);
+        }
+        Device::Metal(0)
+    }
+
+    // Helper to quickly create an F32 MetalTensor
+    fn make_metal_tensor(data: &[f32], shape: &[usize]) -> MetalTensor {
+        let device = ensure_metal_device();
+        MetalTensor::from_slice(data, &Shape::new(shape), &device)
+            .expect("Failed to create MetalTensor from slice")
+    }
+
+    #[test]
+    fn test_metal_zeros_and_ones() {
+        let device = ensure_metal_device();
+        let shape = Shape::new(&[2, 3]);
+
+        let z = MetalTensor::zeros(&shape, DType::F32, &device).unwrap();
+        let z_vec = z.to_vec_f32().unwrap();
+        assert_eq!(z_vec, vec![0.0; 6]);
+
+        let o = MetalTensor::ones(&shape, DType::F32, &device).unwrap();
+        let o_vec = o.to_vec_f32().unwrap();
+        assert_eq!(o_vec, vec![1.0; 6]);
+    }
+
+    #[test]
+    fn test_metal_arithmetic() {
+        let a = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let b = make_metal_tensor(&[2.0, 2.0, 2.0, 2.0], &[2, 2]);
+        let add = a.add(&b).unwrap().to_vec_f32().unwrap();
+        assert_eq!(add, vec![3.0, 4.0, 5.0, 6.0]);
+
+        let sub = a.sub(&b).unwrap().to_vec_f32().unwrap();
+        assert_eq!(sub, vec![-1.0, 0.0, 1.0, 2.0]);
+
+        let mul = a.mul(&b).unwrap().to_vec_f32().unwrap();
+        assert_eq!(mul, vec![2.0, 4.0, 6.0, 8.0]);
+
+        let div = a.div(&b).unwrap().to_vec_f32().unwrap();
+        assert_eq!(div, vec![0.5, 1.0, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn test_metal_transpose_and_contiguous() {
+        let a = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        let transposed = a.transpose(0, 1).unwrap();
+        assert_eq!(transposed.shape(), &Shape::new(&[3, 2]));
+
+        let contig = transposed.contiguous().unwrap();
+        let vec = contig.to_vec_f32().unwrap();
+        assert_eq!(vec, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn test_metal_matmul() {
+        let a = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let b = make_metal_tensor(&[7.0, 8.0, 9.0, 1.0, 2.0, 3.0], &[3, 2]);
+
+        let c = a.matmul(&b).unwrap();
+        assert_eq!(c.shape(), &Shape::new(&[2, 2]));
+
+        let c_vec = c.to_vec_f32().unwrap();
+        assert_eq!(c_vec, vec![31.0, 19.0, 85.0, 55.0]);
+    }
+
+    #[test]
+    fn test_metal_broadcast_add() {
+        let a = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]); // Matrix
+        let b = make_metal_tensor(&[10.0, 20.0], &[2]); // Bias
+
+        let c = a.broadcast_add(&b).unwrap();
+        let c_vec = c.to_vec_f32().unwrap();
+        assert_eq!(c_vec, vec![11.0, 22.0, 13.0, 24.0]);
+    }
+
+    #[test]
+    fn test_metal_reductions() {
+        let a = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+
+        // Sum along columns (dim 1)
+        let sum = a.sum(1).unwrap();
+        assert_eq!(sum.shape(), &Shape::new(&[2]));
+        assert_eq!(sum.to_vec_f32().unwrap(), vec![6.0, 15.0]); // 1+2+3, 4+5+6
+
+        // Mean along rows (dim 0)
+        let mean = a.mean(0).unwrap();
+        assert_eq!(mean.shape(), &Shape::new(&[3]));
+        assert_eq!(mean.to_vec_f32().unwrap(), vec![2.5, 3.5, 4.5]); // (1+4)/2, (2+5)/2, (3+6)/2
+    }
+
+    #[test]
+    fn test_metal_narrow_and_cat() {
+        let a = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+
+        // Narrow: take 1 element along dim 0, starting at index 1 (second row)
+        let narrow = a.narrow(0, 1, 1).unwrap();
+        assert_eq!(narrow.shape(), &Shape::new(&[1, 2]));
+        assert_eq!(narrow.to_vec_f32().unwrap(), vec![3.0, 4.0]);
+
+        // Cat: concatenate a and narrow along dim 0
+        let tensors = vec![&a, &narrow];
+        let cat = MetalTensor::cat(&tensors, 0).unwrap();
+        assert_eq!(cat.shape(), &Shape::new(&[3, 2]));
+        assert_eq!(
+            cat.to_vec_f32().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn test_metal_activations() {
+        let a = make_metal_tensor(&[0.0, 1.0, -1.0], &[3]);
+
+        // Sigmoid
+        let sig = a.sigmoid().unwrap().to_vec_f32().unwrap();
+        assert!((sig[0] - 0.5).abs() < 1e-5);
+        assert!((sig[1] - 0.73105).abs() < 1e-4);
+
+        // Exp
+        let e = a.exp().unwrap().to_vec_f32().unwrap();
+        assert!((e[0] - 1.0).abs() < 1e-5);
+        assert!((e[1] - std::f32::consts::E).abs() < 1e-4);
     }
 }

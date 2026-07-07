@@ -4,7 +4,8 @@ use candle_core;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Device {
     Cpu,
-    Cuda(usize),  // ordinal — which GPU, 0-indexed
+    Cuda(usize), // ordinal — which GPU, 0-indexed
+    #[cfg(feature = "metal")]
     Metal(usize), // ordinal — which GPU, 0-indexed (Apple Silicon typically has one)
 }
 
@@ -18,6 +19,7 @@ impl Device {
         matches!(self, Device::Cuda(_))
     }
 
+    #[cfg(feature = "metal")]
     pub fn is_metal(&self) -> bool {
         matches!(self, Device::Metal(_))
     }
@@ -30,6 +32,7 @@ impl Device {
         }
     }
 
+    #[cfg(feature = "metal")]
     pub fn metal_ordinal(&self) -> Option<usize> {
         if let Self::Metal(id) = self {
             Some(*id)
@@ -42,6 +45,7 @@ impl Device {
         Self::Cuda(ordinal)
     }
 
+    #[cfg(feature = "metal")]
     pub fn metal(ordinal: usize) -> Self {
         Self::Metal(ordinal)
     }
@@ -50,6 +54,7 @@ impl Device {
         match self {
             Device::Cpu => "cpu".to_string(),
             Device::Cuda(n) => format!("cuda:{}", n),
+            #[cfg(feature = "metal")]
             Device::Metal(n) => format!("metal:{}", n),
         }
     }
@@ -77,11 +82,16 @@ impl TryFrom<candle_core::Device> for Device {
         match device {
             candle_core::Device::Cpu => Ok(Device::Cpu),
             candle_core::Device::Cuda(_d) => Ok(Device::Cuda(0)),
-            // NOTE: axiom's MetalTensor/MetalBackend do not route through candle_core at all —
-            // this arm only matters if a CandleTensor is ever constructed on Candle's own Metal
-            // backend, which axiom does not currently do. Kept permissive rather than erroring
-            // since there's no longer a structural reason to reject it.
+
+            #[cfg(feature = "metal")]
             candle_core::Device::Metal(_) => Ok(Device::Metal(0)),
+
+            #[cfg(not(feature = "metal"))]
+            candle_core::Device::Metal(_) => Err(CoreError::DeviceMismatch {
+                op: "try_from",
+                lhs: "candle_metal".to_string(),
+                rhs: "axiom_metal_disabled".to_string(),
+            }),
         }
     }
 }
@@ -104,6 +114,7 @@ mod tests {
         assert!(!Device::Metal(0).is_cuda());
     }
 
+    #[cfg(feature = "metal")]
     #[test]
     fn test_is_metal() {
         assert!(Device::Metal(0).is_metal());
@@ -119,6 +130,7 @@ mod tests {
         assert_eq!(Device::Cpu.cuda_ordinal(), None);
     }
 
+    #[cfg(feature = "metal")]
     #[test]
     fn test_metal_ordinal() {
         assert_eq!(Device::Metal(0).metal_ordinal(), Some(0));
@@ -132,6 +144,7 @@ mod tests {
         assert_eq!(Device::cuda(3), Device::Cuda(3));
     }
 
+    #[cfg(feature = "metal")]
     #[test]
     fn test_metal_constructor() {
         assert_eq!(Device::metal(0), Device::Metal(0));
@@ -143,6 +156,7 @@ mod tests {
         assert_eq!(Device::Cpu.name(), "cpu");
         assert_eq!(Device::Cuda(0).name(), "cuda:0");
         assert_eq!(Device::Cuda(2).name(), "cuda:2");
+        #[cfg(feature = "metal")]
         assert_eq!(Device::Metal(0).name(), "metal:0");
     }
 
@@ -174,6 +188,7 @@ mod tests {
         assert_eq!(dev, Device::Cpu);
     }
 
+    #[cfg(feature = "metal")]
     #[test]
     fn test_candle_metal_conversion() {
         // axiom's MetalTensor does not route through candle_core, but the

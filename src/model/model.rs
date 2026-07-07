@@ -402,3 +402,131 @@ mod tests {
         assert_eq!(model.config.vocab_size, 256);
     }
 }
+
+#[cfg(feature = "metal")]
+#[cfg(test)]
+mod metal_tests {
+    use super::*;
+    use crate::core::backend::MetalBackend;
+    use crate::core::device::Device;
+    use crate::core::dtype::DType;
+    use crate::core::shape::Shape;
+    use crate::core::tensor::TensorOps;
+
+    fn ensure_metal_device() -> Device {
+        if crate::metal::state::global_metal_state().is_none() {
+            let _ = crate::metal::state::init_global_metal_state(512 * 1024 * 1024);
+            // 512MB
+        }
+        Device::Metal(0)
+    }
+
+    fn make_config() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            intermediate_size: 128,
+            vocab_size: 256,
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            hidden_act: "silu".to_string(),
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            num_local_experts: None,
+            num_experts_per_tok: None,
+            num_shared_experts: None,
+            expert_interval: None,
+            prefetch_threshold: None,
+            torch_dtype: "float32".to_string(),
+            architectures: None,
+            model_type: Some("llama".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_metal_model_construction() {
+        let device = ensure_metal_device();
+        let config = make_config();
+        let model = LlamaModel::<MetalBackend>::new(&config, &device);
+        assert!(
+            model.is_ok(),
+            "Metal model construction failed: {:?}",
+            model.err()
+        );
+    }
+
+    #[test]
+    fn test_metal_forward_single_token() {
+        let device = ensure_metal_device();
+        let config = make_config();
+        let mut model =
+            LlamaModel::<MetalBackend>::new(&config, &device).expect("model construction failed");
+        let logits = model.forward(&[42u32], None, 0);
+        assert!(logits.is_ok(), "Metal forward failed: {:?}", logits.err());
+        let logits = logits.unwrap();
+        assert_eq!(logits.shape().dim(0).unwrap(), 1);
+        assert_eq!(logits.shape().dim(1).unwrap(), 1);
+        assert_eq!(*logits.shape().dims().last().unwrap(), 256);
+    }
+
+    #[test]
+    fn test_metal_forward_multi_token() {
+        let device = ensure_metal_device();
+        let config = make_config();
+        let mut model =
+            LlamaModel::<MetalBackend>::new(&config, &device).expect("model construction failed");
+        let logits = model.forward(&[1u32, 2, 3, 4], None, 0);
+        assert!(
+            logits.is_ok(),
+            "Metal multi-token forward failed: {:?}",
+            logits.err()
+        );
+        let logits = logits.unwrap();
+        assert_eq!(logits.shape().dim(1).unwrap(), 4);
+        assert_eq!(*logits.shape().dims().last().unwrap(), 256);
+    }
+
+    #[test]
+    fn test_metal_forward_with_kv_cache() {
+        let device = ensure_metal_device();
+        let config = make_config();
+        let mut model =
+            LlamaModel::<MetalBackend>::new(&config, &device).expect("model construction failed");
+
+        // prefill
+        let mut cache: Vec<(
+            crate::core::backend::MetalTensor,
+            crate::core::backend::MetalTensor,
+        )> = Vec::new();
+        let _ = model
+            .forward(&[1u32, 2, 3, 4], Some(&mut cache), 0)
+            .expect("prefill failed");
+        assert_eq!(cache.len(), config.num_hidden_layers);
+
+        // decode
+        let logits = model
+            .forward(&[5u32], Some(&mut cache), 4)
+            .expect("decode failed");
+        assert_eq!(logits.shape().dim(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_metal_logits_are_finite() {
+        // most important numerical sanity check —
+        // if any kernel is producing NaN/inf the logits will reflect it
+        let device = ensure_metal_device();
+        let config = make_config();
+        let mut model =
+            LlamaModel::<MetalBackend>::new(&config, &device).expect("model construction failed");
+        let logits = model
+            .forward(&[1u32, 2, 3], None, 0)
+            .expect("forward failed");
+        let values = logits.to_vec_f32().expect("readback failed");
+        let has_nan = values.iter().any(|x| x.is_nan());
+        let has_inf = values.iter().any(|x| x.is_infinite());
+        assert!(!has_nan, "logits contain NaN");
+        assert!(!has_inf, "logits contain Inf");
+    }
+}

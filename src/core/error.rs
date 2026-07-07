@@ -2,7 +2,6 @@ use candle_core;
 use thiserror::Error;
 
 use crate::core::dtype::DType;
-
 /*
 Errors that might pop up during tensor ops
 */
@@ -59,6 +58,7 @@ pub enum CoreError {
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
+#[cfg(feature = "metal")]
 impl From<crate::metal::error::MetalError> for CoreError {
     fn from(e: crate::metal::error::MetalError) -> Self {
         CoreError::Internal(e.to_string())
