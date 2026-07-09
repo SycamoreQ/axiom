@@ -1,4 +1,7 @@
+#[cfg(not(feature = "metal"))]
 use axiom::core::backend::CandleBackend;
+#[cfg(feature = "metal")]
+use axiom::core::backend::MetalBackend;
 use axiom::core::device::Device;
 use axiom::inference::engine::Engine;
 use axiom::inference::sampler::SamplerConfig;
@@ -11,63 +14,93 @@ fn main() {
     let gguf_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "testdata/tinyllama.gguf".to_string());
-
     let tokenizer_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "testdata/tokenizer.json".to_string());
-
     let prompt = std::env::args()
         .nth(3)
         .unwrap_or_else(|| "The quick brown fox".to_string());
-
     let max_new_tokens: usize = std::env::args()
         .nth(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
-    println!("Axiom Smoke Test");
+    println!("Axiom Inference Engine");
     println!("Model    : {}", gguf_path);
     println!("Tokenizer: {}", tokenizer_path);
     println!("Prompt   : {:?}", prompt);
     println!("Max new  : {}", max_new_tokens);
+
+    #[cfg(feature = "metal")]
+    println!("Backend  : Metal (Apple Silicon)");
+    #[cfg(not(feature = "metal"))]
+    println!("Backend  : CPU (Candle)");
     println!("---");
-
     std::io::stdout().flush().unwrap();
-    let mut tokenizer = Tokenizer::from_file(&tokenizer_path).expect("failed to load tokenizer");
-    println!("ok  (vocab {})", tokenizer.vocab().size());
 
-    let check_tokens = vec![18403usize, 117734, 75580, 123905, 21886];
-    for t in &check_tokens {
-        eprintln!(
-            "DEBUG token {} = {:?}",
-            t,
-            tokenizer.vocab().id_to_token(*t)
-        );
-    }
+    // tokenizer
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("failed to load tokenizer");
+    println!("Tokenizer: ok (vocab {})", tokenizer.vocab().size());
 
-    // ── model ──
-    print!("Loading model (this takes a few seconds)... ");
-    std::io::stdout().flush().unwrap();
-    let device = Device::Cpu;
-    let model = load_from_gguf::<CandleBackend>(Path::new(&gguf_path), &device)
-        .expect("failed to load model");
-    println!("ok");
+    // model + engine — backend selected at compile time
+    #[cfg(feature = "metal")]
+    let engine = {
+        print!("Initializing Metal... ");
+        std::io::stdout().flush().unwrap();
 
-    let model_vocab = model.config().vocab_size;
-    let tokenizer_vocab = tokenizer.vocab().size();
+        // 8GB pool — covers Llama 3.2 1B comfortably at any quant
+        // increase to 20GB for Qwen3-30B-A3B
+        axiom::metal::state::init_global_metal_state(3 * 1024 * 1024 * 1024)
+            .expect("failed to initialize Metal state");
+        println!("ok");
 
-    // ── engine ──
-    let sampler_config = SamplerConfig {
-        temperature: 0.0,
-        top_p: Some(0.9),
-        top_k: Some(50),
-        seed: Some(42),
-        max_new_tokens,
-        repetition_penalty: 1.4,
-        vocab_size: Some(model_vocab),
+        let device = Device::Metal(0);
+        print!("Loading model... ");
+        std::io::stdout().flush().unwrap();
+
+        let model = load_from_gguf::<MetalBackend>(Path::new(&gguf_path), &device)
+            .expect("failed to load model");
+        println!("ok");
+
+        let vocab_size = model.config().vocab_size;
+        let sampler_config = SamplerConfig {
+            temperature: 0.0,
+            top_p: Some(0.9),
+            top_k: Some(50),
+            seed: Some(42),
+            max_new_tokens,
+            repetition_penalty: 1.4,
+            vocab_size: Some(vocab_size),
+        };
+
+        Engine::<MetalBackend>::new(model, tokenizer, sampler_config, 1, device)
     };
 
-    let mut engine = Engine::new(model, tokenizer, sampler_config, 1, device);
+    #[cfg(not(feature = "metal"))]
+    let engine = {
+        let device = Device::Cpu;
+        print!("Loading model... ");
+        std::io::stdout().flush().unwrap();
+
+        let model = load_from_gguf::<CandleBackend>(Path::new(&gguf_path), &device)
+            .expect("failed to load model");
+        println!("ok");
+
+        let vocab_size = model.config().vocab_size;
+        let sampler_config = SamplerConfig {
+            temperature: 0.0,
+            top_p: Some(0.9),
+            top_k: Some(50),
+            seed: Some(42),
+            max_new_tokens,
+            repetition_penalty: 1.4,
+            vocab_size: Some(vocab_size),
+        };
+
+        Engine::<CandleBackend>::new(model, tokenizer, sampler_config, 1, device)
+    };
+
+    let mut engine = engine;
 
     let formatted_prompt = format!(
         "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
@@ -85,17 +118,15 @@ fn main() {
         )
         .expect("failed to submit prompt");
 
-    println!("\nOutput   : {}", prompt);
-    print!("          ");
+    println!("\nOutput:");
+    print!("  ");
     std::io::stdout().flush().unwrap();
 
-    // ── generation loop ──
     let mut steps = 0;
     let start = std::time::Instant::now();
 
     loop {
         let results = engine.step().expect("step failed");
-
         for (sid, token) in &results {
             if *sid == session_id {
                 let text = engine.tokenizer().decode(&[*token as usize]);
@@ -104,25 +135,18 @@ fn main() {
                 steps += 1;
             }
         }
-
         if engine.batch.active_sessions().is_empty() || steps >= max_new_tokens {
             break;
         }
     }
 
     let elapsed = start.elapsed();
-    let tok_per_sec = steps as f64 / elapsed.as_secs_f64();
-
     println!();
     println!("---");
     println!(
         "Generated {} tokens in {:.2}s ({:.1} tok/s)",
         steps,
         elapsed.as_secs_f64(),
-        tok_per_sec
+        steps as f64 / elapsed.as_secs_f64()
     );
-
-    println!("\nFull output:");
-    let full = engine.decode_output(session_id).unwrap_or_default();
-    println!("{}{}", prompt, full);
 }
