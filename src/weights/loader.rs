@@ -250,11 +250,6 @@ pub fn load_from_gguf<B: Backend>(
         config.vocab_size,
         config.head_dim()
     );
-    eprintln!("DEBUG rope_theta={}", config.rope_theta);
-    eprintln!(
-        "DEBUG rope_freq_base raw={:?}",
-        gguf.get_f32("llama.rope.freq_base")
-    );
     let mut model =
         LlamaModel::<B>::new(&config, device).map_err(|e| LoaderError::Backend(e.to_string()))?;
 

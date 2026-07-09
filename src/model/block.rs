@@ -65,21 +65,6 @@ impl<B: Backend> Block<B> {
         kv_cache: Option<(&B::Tensor, &B::Tensor)>,
         offset: usize,
     ) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
-        if self.layer_idx == 0 && !BLOCK0_CHECKED.swap(true, Ordering::Relaxed) {
-            let ffn_out_check = self.ffn_norm.weight().to_vec_f32()?;
-            eprintln!(
-                "DEBUG blk0 ffn_norm weight first 4: {:?}",
-                &ffn_out_check[..4]
-            );
-
-            match &self.ffn {
-                FeedForwardLayer::Dense(ff) => {
-                    let gate_w = ff.gate_proj.weight().to_vec_f32()?;
-                    eprintln!("DEBUG blk0 ffn_gate first 4: {:?}", &gate_w[..4]);
-                }
-                _ => {}
-            }
-        }
         //attention with pre-norm and residual
         let h = self.attn_norm.forward(x)?;
         let (attn_out, new_k, new_v) = self.attn.forward(&h, mask, kv_cache, offset)?;

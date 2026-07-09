@@ -41,17 +41,9 @@ impl<B: Backend> Generator<B> {
             device: device,
         }
     }
-    //One step of autoregressive generation:
+
     pub fn step(&mut self, session: &mut Session<B>) -> Result<u32, GeneratorError> {
         let session_tokens = session.next_input_tokens().to_vec();
-        eprintln!(
-            "DEBUG step: offset={} num_generated={} tokens_len={} tokens={:?}",
-            session.offset,
-            session.generated_tokens.len(),
-            session_tokens.len(),
-            &session_tokens[..session_tokens.len().min(5)]
-        );
-
         let logits =
             self.model
                 .forward(&session_tokens, Some(&mut session.kv_cache), session.offset)?;

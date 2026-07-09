@@ -122,18 +122,10 @@ impl<B: Backend> Attention<B> {
         let scores = match mask {
             Some(m) => {
                 let masked = scores.broadcast_add(m)?;
-                // Debug: check if scores contain -inf
-                let masked_vec = masked.to_vec_f32()?;
-                if masked_vec.iter().any(|&x| x.is_infinite() && x < 0.0) {
-                    eprintln!("WARNING: mask introduced -inf in scores");
-                }
                 masked
             }
             None => scores,
         };
-
-        let scores_vec = scores.to_vec_f32()?;
-        let scores_max = scores_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
         let weights = scores.softmax(3)?;
         let out = weights.contiguous()?.broadcast_matmul(&v)?;
@@ -146,9 +138,6 @@ impl<B: Backend> Attention<B> {
         ]))?;
 
         let out = self.o_proj.forward(&out)?;
-
-        let out_vec = out.to_vec_f32()?;
-        let out_max = out_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
         use std::sync::atomic::{AtomicUsize, Ordering};
         static ATTN_CALL: AtomicUsize = AtomicUsize::new(0);

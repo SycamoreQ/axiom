@@ -112,54 +112,11 @@ impl<B: Backend> LlamaModel<B> {
             }
         }
 
-        // check hidden state after all blocks
-        static MODEL_CHECKED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !MODEL_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let x_vec = x.to_vec_f32()?;
-            let x_max = x_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let x_min = x_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-            eprintln!(
-                "DEBUG post-all-blocks max={:.4} min={:.4} first4={:?}",
-                x_max,
-                x_min,
-                &x_vec[..4]
-            );
-
-            // also check embedding output for comparison
-            let emb = self.embedding.forward(&[token_ids[0]])?;
-            let emb_vec = emb.to_vec_f32()?;
-            eprintln!("DEBUG embedding[0] first4={:?}", &emb_vec[..4]);
-        }
-
-        let norm_w = self.norm.weight().to_vec_f32()?;
-        eprintln!("DEBUG output_norm first 4: {:?}", &norm_w[..4]);
+        // also check embedding output for comparison
+        let emb = self.embedding.forward(&[token_ids[0]])?;
         let x = self.norm.forward(&x)?;
 
-        // temporary
-        static LM_CHECKED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !LM_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
-                "DEBUG lm_head weight shape: {:?}",
-                self.lm_head.weight().shape()
-            );
-        }
-
         let logits = self.lm_head.forward(&x)?;
-
-        static LOGIT_CHECKED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !LOGIT_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let l_vec = logits.to_vec_f32()?;
-            let seq = logits.shape().dim(1)?;
-            let vocab = logits.shape().dim(2)?;
-            // last token logits
-            let last = &l_vec[(seq - 1) * vocab..seq * vocab];
-            let mut indexed: Vec<(usize, f32)> = last.iter().cloned().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            eprintln!("DEBUG top5 logits: {:?}", &indexed[..5]);
-        }
 
         Ok(logits)
     }

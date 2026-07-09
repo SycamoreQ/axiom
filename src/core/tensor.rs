@@ -1,4 +1,3 @@
-#[cfg(feature = "metal")]
 use crate::core::backend::MetalTensor;
 use crate::core::backend::{CandleTensor, CudarcTensor};
 use crate::core::device::Device;
@@ -69,6 +68,53 @@ impl MetalTensor {
             strides[i] = strides[i + 1] * dims[i + 1];
         }
         strides
+    }
+
+    pub(crate) fn from_bytes_direct(
+        state: Arc<MetalState>,
+        data: &[u8],
+        shape: Shape,
+        dtype: DType,
+        device: Device,
+    ) -> Result<Self> {
+        use objc2::rc::Retained;
+        use objc2_metal::MTLBuffer;
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+        use std::ptr::NonNull;
+
+        let raw_device = state.ctx.device.raw();
+
+        let buffer = unsafe {
+            raw_device.newBufferWithBytes_length_options(
+                NonNull::new_unchecked(data.as_ptr() as *mut std::ffi::c_void),
+                data.len(),
+                MTLResourceOptions(0), // StorageModeShared = 0
+            )
+        }
+        .ok_or_else(|| {
+            CoreError::Metal(format!(
+                "MTLBuffer allocation failed for {} bytes",
+                data.len()
+            ))
+        })?;
+
+        let ptr = unsafe { buffer.contents().as_ptr() as *mut u8 };
+
+        let block = BlockHandle {
+            index: 0,
+            ptr,
+            offset_bytes: 0,
+            size_bytes: data.len(),
+            owned_buffer: Some(buffer),
+        };
+
+        Ok(Self::new_contiguous(
+            state,
+            Arc::new(block),
+            shape,
+            dtype,
+            device,
+        ))
     }
 }
 
@@ -857,60 +903,55 @@ impl TensorOps for MetalTensor {
     }
 
     fn zeros(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
+        let n = shape.numel() * dtype.size_in_bytes();
+        let data = vec![0u8; n];
         let state = global_metal_state()
             .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
-        let num_bytes = shape.numel() * dtype.size_in_bytes();
-        let block = state.alloc.lock().unwrap().alloc(num_bytes, 16)?;
-        unsafe {
-            std::ptr::write_bytes(block.ptr, 0u8, num_bytes);
-        }
-        Ok(Self::new_contiguous(
-            state,
-            Arc::new(block),
-            shape.clone(),
-            dtype,
-            device.clone(),
-        ))
+        Self::from_bytes_direct(state, &data, shape.clone(), dtype, device.clone())
     }
 
     fn ones(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
-        let t = Self::zeros(shape, dtype, device)?;
-        let ptr = (*t.block).ptr;
-        unsafe {
-            match dtype {
-                DType::F32 => {
-                    let p = ptr as *mut f32;
-                    for i in 0..shape.numel() {
-                        p.add(i).write(1.0f32);
+        let n = shape.numel();
+        let state = global_metal_state()
+            .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
+
+        let bytes: Vec<u8> = match dtype {
+            DType::F32 => {
+                let mut buf = vec![0u8; n * 4];
+                let ptr = buf.as_mut_ptr() as *mut f32;
+                unsafe {
+                    for i in 0..n {
+                        ptr.add(i).write(1.0f32);
                     }
                 }
-                DType::F16 => {
-                    let p = ptr as *mut half::f16;
-                    for i in 0..shape.numel() {
-                        p.add(i).write(half::f16::from_f32(1.0));
-                    }
-                }
-                _ => return Err(CoreError::Internal("ones: unsupported dtype".into())),
+                buf
             }
-        }
-        Ok(t)
+            DType::F16 => {
+                let mut buf = vec![0u8; n * 2];
+                let ptr = buf.as_mut_ptr() as *mut half::f16;
+                unsafe {
+                    for i in 0..n {
+                        ptr.add(i).write(half::f16::from_f32(1.0));
+                    }
+                }
+                buf
+            }
+            _ => return Err(CoreError::Internal("ones: unsupported dtype".into())),
+        };
+
+        Self::from_bytes_direct(state, &bytes, shape.clone(), dtype, device.clone())
     }
 
     fn from_slice<E: Element>(data: &[E], shape: &Shape, device: &Device) -> Result<Self> {
         let state = global_metal_state()
             .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
-        let num_bytes = std::mem::size_of_val(data);
-        let block = state.alloc.lock().unwrap().alloc(num_bytes, 16)?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, block.ptr, num_bytes);
-        }
-        Ok(Self::new_contiguous(
-            state,
-            Arc::new(block),
-            shape.clone(),
-            E::dtype(),
-            device.clone(),
-        ))
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        };
+        let tensor =
+            Self::from_bytes_direct(state, bytes, shape.clone(), E::dtype(), device.clone())?;
+
+        Ok(tensor)
     }
 
     fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self> {
@@ -1335,25 +1376,34 @@ impl TensorOps for MetalTensor {
             .iter()
             .product::<usize>() as u32;
         let hidden = *self.shape.dims().last().unwrap() as u32;
-        state.kernels.rms_norm_f16(
-            &state.ctx,
-            &state.alloc.lock().unwrap(),
-            &self.block,
-            &weight.block,
-            &output.block,
-            num_tokens,
-            hidden,
-            eps,
-        )?;
+
+        match self.dtype {
+            DType::F16 => state.kernels.rms_norm_f16(
+                &state.ctx,
+                &state.alloc.lock().unwrap(),
+                &self.block,
+                &weight.block,
+                &output.block,
+                num_tokens,
+                hidden,
+                eps,
+            )?,
+            DType::F32 => state.kernels.rms_norm_f32(
+                &state.ctx,
+                &state.alloc.lock().unwrap(),
+                &self.block,
+                &weight.block,
+                &output.block,
+                num_tokens,
+                hidden,
+                eps,
+            )?,
+            _ => return Err(CoreError::Internal("rms_norm: unsupported dtype".into())),
+        }
         Ok(output)
     }
 
     fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
-        eprintln!(
-            "broadcast_matmul: self={:?} other={:?}",
-            self.shape.dims(),
-            other.shape.dims()
-        );
         let rank = self.shape.rank();
         let other_rank = other.shape.rank();
 
@@ -1402,6 +1452,8 @@ impl TensorOps for MetalTensor {
         let m_per = self.shape.dims()[rank - 2]; // rows per batch slice
 
         let mut out_f32 = vec![0.0f32; batch_out * m_per * n];
+        let nonzero = out_f32.iter().filter(|&&x| x != 0.0).count();
+        let maxval = out_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
         for b in 0..batch_out {
             let self_b = if batch_self == 1 { 0 } else { b };
@@ -1431,35 +1483,43 @@ impl TensorOps for MetalTensor {
 
         let mut out_dims: Vec<usize> = self.shape.dims()[..rank - 1].to_vec();
         out_dims.push(n);
+        let nonzero = out_f32.iter().filter(|&&x| x != 0.0).count();
+        let maxval = out_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let out = Self::from_slice(&out_f32, &Shape::new(&out_dims), &self.device)?;
         out.to_dtype(self.dtype)
     }
 
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
-        let indices = indexes.to_vec_u32()?;
-        let mut new_dims = self.shape.dims().to_vec();
-        new_dims[dim] = indices.len();
+        let idx = indexes.to_vec_u32()?;
+        let src = self.to_vec_f32()?;
+        let dims = self.shape.dims();
+        let slice_size: usize = dims[dim + 1..].iter().product();
+        let outer_size: usize = dims[..dim].iter().product();
 
-        let output = Self::zeros(&Shape::new(&new_dims), self.dtype, &self.device)?;
-        let src_f32 = self.to_vec_f32()?;
-        let mut dst_f32 = vec![0.0f32; output.shape.numel()];
+        let out_len = outer_size * idx.len() * slice_size;
+        let mut out = vec![0.0f32; out_len];
 
-        let stride = self.strides[dim];
-        let dim_size = self.shape.dims()[dim];
-        let num_elements = new_dims.iter().product::<usize>();
-
-        // Basic element mapping
-        for i in 0..num_elements {
-            let outer = i / (indices.len() * stride);
-            let target_idx = (i / stride) % indices.len();
-            let inner = i % stride;
-
-            let source_idx = indices[target_idx] as usize;
-            let src_index = outer * (dim_size * stride) + source_idx * stride + inner;
-            dst_f32[i] = src_f32[src_index];
+        for o in 0..outer_size {
+            for (out_i, &idx_val) in idx.iter().enumerate() {
+                let src_offset = (o * dims[dim] + idx_val as usize) * slice_size;
+                let dst_offset = (o * idx.len() + out_i) * slice_size;
+                out[dst_offset..dst_offset + slice_size]
+                    .copy_from_slice(&src[src_offset..src_offset + slice_size]);
+            }
         }
-        let out = Self::from_slice(&dst_f32, &Shape::new(&new_dims), &self.device)?;
-        out.to_dtype(self.dtype)
+
+        let mut out_dims = dims.to_vec();
+        out_dims[dim] = idx.len();
+        let nonzero = out.iter().filter(|&&x| x != 0.0).count();
+        eprintln!(
+            "index_select: idx={:?} out_shape={:?} nonzero={}/{}",
+            &idx[..idx.len().min(4)],
+            out_dims,
+            nonzero,
+            out.len()
+        );
+
+        Self::from_slice(&out, &Shape::new(&out_dims), &self.device)
     }
 
     fn cos(&self) -> Result<Self> {

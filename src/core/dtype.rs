@@ -1,5 +1,6 @@
 use crate::core::error::CoreError;
 use half;
+use std::fmt::Debug;
 
 /*
 Types of quantizations and their implementations
@@ -13,7 +14,7 @@ pub enum DType {
     BF16,
 }
 
-pub trait Element: Copy + Send + Sync + 'static {
+pub trait Element: Debug + Copy + Send + Sync + 'static {
     fn dtype() -> DType;
 }
 

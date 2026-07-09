@@ -12,11 +12,11 @@ pub struct BlockHandle {
     pub ptr: *mut u8,
     pub offset_bytes: usize,
     pub size_bytes: usize,
+    pub owned_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
-unsafe impl Sync for BlockHandle {}
-
 unsafe impl Send for BlockHandle {}
+unsafe impl Sync for BlockHandle {}
 
 pub struct FreeBlock {
     pub offset_bytes: usize,
@@ -86,6 +86,7 @@ impl MetalAllocator {
                 offset_bytes: start_offset,
                 size_bytes: size,
                 ptr,
+                owned_buffer: None, // pool-backed, buffer owned by allocator
             });
         }
 
@@ -114,6 +115,7 @@ impl MetalAllocator {
             offset_bytes: start_offset,
             size_bytes: size,
             ptr: block_ptr,
+            owned_buffer: None, 
         })
     }
 

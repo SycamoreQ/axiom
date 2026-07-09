@@ -12,6 +12,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 const RMS_NORM_MSL: &str = include_str!("kernels/rms_norm_f16.metal");
+const RMS_NORM_F32_MSL: &str = include_str!("kernels/rms_norm_f32.metal");
 const ROPE_MSL: &str = include_str!("kernels/rope_f16.metal");
 const SWIGLU_MSL: &str = include_str!("kernels/swiglu_f16.metal");
 const MATMUL_MSL: &str = include_str!("kernels/matmul_f16.metal");
@@ -20,6 +21,7 @@ const ATTN_PV_MSL: &str = include_str!("kernels/attention_pv_f16.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub rms_norm_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rope_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub swiglu_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub matmul_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -31,6 +33,7 @@ impl std::fmt::Debug for MetalKernels {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetalKernels")
             .field("rms_norm_pipeline", &"MTLComputePipelineState")
+            .field("rm_norm_f32_pipeline", &"MTLComputePipelineState")
             .field("rope_pipeline", &"MTLComputePipelineState")
             .field("swiglu_pipeline", &"MTLComputePipelineState")
             .field("matmul_pipeline", &"MTLComputePipelineState")
@@ -66,6 +69,7 @@ impl MetalKernels {
 
         Ok(Self {
             rms_norm_pipeline: build_pipeline(RMS_NORM_MSL, "rms_norm_f16")?,
+            rms_norm_f32_pipeline: build_pipeline(RMS_NORM_F32_MSL, "rms_norm_f32")?,
             rope_pipeline: build_pipeline(ROPE_MSL, "rope_f16")?,
             swiglu_pipeline: build_pipeline(SWIGLU_MSL, "swiglu_f16")?,
             matmul_pipeline: build_pipeline(MATMUL_MSL, "matmul_f16")?,
@@ -131,6 +135,63 @@ impl MetalKernels {
         Ok(())
     }
 
+    pub fn rms_norm_f32(
+        &self,
+        ctx: &MetalContext,
+        allocator: &MetalAllocator,
+        input: &BlockHandle,
+        weight: &BlockHandle,
+        output: &BlockHandle,
+        num_tokens: u32,
+        hidden: u32,
+        eps: f32,
+    ) -> Result<()> {
+        let cmd_buf = ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
+
+        encoder.setComputePipelineState(&self.rms_norm_f32_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), input.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), weight.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), output.offset_bytes, 2);
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&hidden as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&eps as *const f32 as *mut c_void),
+                std::mem::size_of::<f32>(),
+                4,
+            );
+        }
+
+        let grid = MTLSize {
+            width: num_tokens as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+
+        cmd_buf.waitUntilCompleted();
+
+        Ok(())
+    }
     pub fn rope_f16(
         &self,
         ctx: &MetalContext,

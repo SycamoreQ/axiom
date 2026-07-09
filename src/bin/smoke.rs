@@ -50,7 +50,9 @@ fn main() {
 
         // 8GB pool — covers Llama 3.2 1B comfortably at any quant
         // increase to 20GB for Qwen3-30B-A3B
-        axiom::metal::state::init_global_metal_state(3 * 1024 * 1024 * 1024)
+        let pool_size = 8usize * 1024 * 1024 * 1024;
+        println!("Metal pool: {} GB", pool_size / 1024 / 1024 / 1024);
+        axiom::metal::state::init_global_metal_state(pool_size)
             .expect("failed to initialize Metal state");
         println!("ok");
 
@@ -129,6 +131,11 @@ fn main() {
         let results = engine.step().expect("step failed");
         for (sid, token) in &results {
             if *sid == session_id {
+                eprintln!(
+                    "DEBUG token={} text={:?}",
+                    token,
+                    engine.tokenizer().decode(&[*token as usize])
+                );
                 let text = engine.tokenizer().decode(&[*token as usize]);
                 print!("{}", text);
                 std::io::stdout().flush().unwrap();
