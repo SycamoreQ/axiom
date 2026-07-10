@@ -95,6 +95,16 @@ impl<B: Backend> Engine<B> {
             .iter()
             .map(|&id| id as u32)
             .collect();
+
+        eprintln!("full prompt tokens: {:?}", prompt_ids);
+        for &id in &prompt_ids {
+            eprintln!(
+                "  {} -> {:?}",
+                id,
+                self.generator.tokenizer().decode(&[id as usize])
+            );
+        }
+
         let eos_id = self.generator.tokenizer().eos_id().map(|id| id as u32);
         self.submit(prompt_ids, max_new_tokens, eos_id)
     }
