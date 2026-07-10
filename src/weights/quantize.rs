@@ -185,19 +185,26 @@ fn dequantize_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
 
         let sc = &block[4..16];
         let qs = &block[16..144];
-
         // scale/min unpacking — this part was already correct, unchanged
         let mut scales = [0u8; 8];
         let mut mins = [0u8; 8];
-        for i in 0..4 {
-            scales[i] = sc[i] & 0x3F;
-            mins[i] = sc[i + 4] & 0x3F;
-        }
-        for i in 0..4 {
-            scales[4 + i] = (sc[8 + i] & 0x0F) | ((sc[i] >> 6) << 4);
-            mins[4 + i] = (sc[8 + i] >> 4) | ((sc[i + 4] >> 6) << 4);
-        }
+        scales[0] = sc[0] & 0x3F;
+        scales[1] = sc[1] & 0x3F;
+        scales[2] = sc[2] & 0x3F;
+        scales[3] = sc[3] & 0x3F;
+        scales[4] = (sc[8] & 0x0F) | ((sc[0] >> 6) << 4);
+        scales[5] = (sc[9] & 0x0F) | ((sc[1] >> 6) << 4);
+        scales[6] = (sc[10] & 0x0F) | ((sc[2] >> 6) << 4);
+        scales[7] = (sc[11] & 0x0F) | ((sc[3] >> 6) << 4);
 
+        mins[0] = sc[4] & 0x3F;
+        mins[1] = sc[5] & 0x3F;
+        mins[2] = sc[6] & 0x3F;
+        mins[3] = sc[7] & 0x3F;
+        mins[4] = (sc[8] >> 4) | ((sc[4] >> 6) << 4);
+        mins[5] = (sc[9] >> 4) | ((sc[5] >> 6) << 4);
+        mins[6] = (sc[10] >> 4) | ((sc[6] >> 6) << 4);
+        mins[7] = (sc[11] >> 4) | ((sc[7] >> 6) << 4);
         // 4 chunks of 32 bytes -> 64 elements each, alternating scale pairs
         let mut is = 0;
         for c in 0..4 {

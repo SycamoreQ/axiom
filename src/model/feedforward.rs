@@ -35,10 +35,18 @@ impl<B: Backend> FeedForward<B> {
 
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = gate.silu()?;
         let up = self.up_proj.forward(x)?;
-        let fused = gate.mul(&up)?;
-        self.down_proj.forward(&fused)
+
+        // CPU SwiGLU – remove the Metal kernel usage
+        let gate_vec = gate.to_vec_f32()?;
+        let up_vec = up.to_vec_f32()?;
+        let mut fused = vec![0.0f32; gate_vec.len()];
+        for i in 0..gate_vec.len() {
+            let silu = gate_vec[i] / (1.0 + (-gate_vec[i]).exp());
+            fused[i] = silu * up_vec[i];
+        }
+        let fused_tensor = B::Tensor::from_slice(&fused, &gate.shape(), &x.device())?;
+        self.down_proj.forward(&fused_tensor)
     }
 
     pub fn set_gate(&mut self, l: Linear<B>) {

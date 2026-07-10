@@ -65,6 +65,9 @@ fn main() {
             .expect("failed to load model");
         println!("ok");
 
+        let embd = model.embedding.weight().to_vec_f32().unwrap();
+        println!("token_embd[0..10]: {:?}", &embd[..10]);
+
         let vocab_size = model.config().vocab_size;
         let sampler_config = SamplerConfig {
             temperature: 0.0,

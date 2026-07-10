@@ -314,6 +314,8 @@ pub fn load_from_gguf<B: Backend>(
         }
     }
 
+    eprintln!("has_output_weight={}", has_output_weight);
+
     Ok(model)
 }
 

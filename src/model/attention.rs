@@ -16,6 +16,7 @@ pub struct Attention<B: Backend> {
     rope: RotaryEmbedding<B>,
     num_heads: usize,
     num_kv_heads: usize,
+    rope_theta: f64,
     head_dim: usize,
     scale: f32, // 1/sqrt(head_dim) — precomputed
 }
@@ -44,6 +45,7 @@ impl<B: Backend> Attention<B> {
             device,
         )?;
         let scale = 1.0 / (head_dim as f32).sqrt();
+        let rope_theta = config.rope_theta;
 
         Ok(Self {
             q_proj,
@@ -54,8 +56,39 @@ impl<B: Backend> Attention<B> {
             num_heads,
             num_kv_heads,
             head_dim,
+            rope_theta,
             scale,
         })
+    }
+
+    // --- CPU RoPE fallback (replace the Metal rope call) ---
+    pub fn apply_cpu_rope(
+        x: &B::Tensor,
+        offset: usize,
+        theta: f64,
+        head_dim: usize,
+    ) -> Result<B::Tensor> {
+        let seq_len = x.shape().dim(1)?;
+        let n_heads = x.shape().dim(2)?;
+        let data = x.to_vec_f32()?;
+        let mut out = vec![0.0f32; data.len()];
+        for token in 0..seq_len {
+            for head in 0..n_heads {
+                let idx = (token * n_heads + head) * head_dim;
+                for i in 0..head_dim / 2 {
+                    let freq = 1.0f64 / theta.powf((2 * i) as f64 / head_dim as f64);
+                    let angle = (offset + token) as f64 * freq;
+                    let (sin_a, cos_a) = angle.sin_cos();
+                    let sin_a = sin_a as f32;
+                    let cos_a = cos_a as f32;
+                    let x0 = data[idx + i];
+                    let x1 = data[idx + i + head_dim / 2];
+                    out[idx + i] = x0 * cos_a - x1 * sin_a;
+                    out[idx + i + head_dim / 2] = x0 * sin_a + x1 * cos_a;
+                }
+            }
+        }
+        B::Tensor::from_slice(&out, &x.shape(), &x.device())
     }
 
     pub fn forward(
@@ -87,8 +120,10 @@ impl<B: Backend> Attention<B> {
             self.head_dim,
         ]))?;
 
-        let q = self.rope.forward(&q, offset)?;
-        let k = self.rope.forward(&k, offset)?;
+        //let q = self.rope.forward(&q, offset)?;
+        //let k = self.rope.forward(&k, offset)?;
+        let q = Self::apply_cpu_rope(&q, offset, self.rope_theta, self.head_dim)?;
+        let k = Self::apply_cpu_rope(&k, offset, self.rope_theta, self.head_dim)?;
 
         let (mut k, mut v) = match kv_cache {
             Some((past_k, past_v)) => (

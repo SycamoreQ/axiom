@@ -65,25 +65,75 @@ impl<B: Backend> Block<B> {
         kv_cache: Option<(&B::Tensor, &B::Tensor)>,
         offset: usize,
     ) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
-        //attention with pre-norm and residual
+        // We only want to dump for layer 0, on the very first forward pass (offset == 0).
+        let is_layer_0 = self.layer_idx == 0;
+        let is_first_token = offset == 0;
+        let should_dump = is_layer_0 && is_first_token;
+
+        // A helper closure that handles the Tensor extraction and slicing for us
+        let dump = |label: &str, t: &B::Tensor| -> Result<()> {
+            if !should_dump {
+                return Ok(());
+            }
+
+            // Get the last dimension (hidden_size) so we can slice just the first token
+            let hidden_size = *t.shape().dims().last().unwrap();
+            let mut v = t.to_vec_f32()?;
+
+            // If seq_len > 1 (prefill), this ensures we ONLY look at the first token's stats
+            v.truncate(hidden_size);
+
+            let n = v.len() as f32;
+            let mean = v.iter().sum::<f32>() / n;
+            let var = v.iter().map(|val| (val - mean).powi(2)).sum::<f32>() / n;
+            let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
+            let nan_count = v.iter().filter(|val| val.is_nan()).count();
+            let std = var.sqrt();
+
+            eprintln!(
+                "{label}: mean={mean:.4} std={std:.4} min={min:.4} max={max:.4} nan={nan_count}"
+            );
+            Ok(())
+        };
+
+        // 1. Raw embedding output (input to the block)
+        dump("Layer 0 [1] - Raw Input", x)?;
+
+        // attention with pre-norm and residual
         let h = self.attn_norm.forward(x)?;
+
+        // 2. h after attn_norm
+        dump("Layer 0 [2] - After Attn Norm", &h)?;
+
         let (attn_out, new_k, new_v) = self.attn.forward(&h, mask, kv_cache, offset)?;
 
-        let ao_vec = attn_out.to_vec_f32()?;
-        let ao_max = ao_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let ao_min = ao_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+        // 3. attn_out
+        dump("Layer 0 [3] - Attn Out", &attn_out)?;
 
         let x = x.add(&attn_out)?;
 
-        let after_vec = x.to_vec_f32()?;
-        let after_max = after_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        //ffn with pre-norm and residual
+        // 4. x after attention residual
+        dump("Layer 0 [4] - After Attn Residual", &x)?;
+
+        // ffn with pre-norm and residual
         let h = self.ffn_norm.forward(&x)?;
+
+        // 5. h after ffn_norm
+        dump("Layer 0 [5] - After FFN Norm", &h)?;
+
         let ffn_out = match &mut self.ffn {
             FeedForwardLayer::Dense(ff) => ff.forward(&h)?,
             FeedForwardLayer::Moe(moe) => moe.forward(&h, offset)?.hidden_states,
         };
+
+        // 6. ffn_out
+        dump("Layer 0 [6] - FFN Out", &ffn_out)?;
+
         let x = x.add(&ffn_out)?;
+
+        // 7. x after FFN residual
+        dump("Layer 0 [7] - After FFN Residual", &x)?;
 
         Ok((x, new_k, new_v))
     }
