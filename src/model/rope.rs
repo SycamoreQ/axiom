@@ -24,11 +24,16 @@ impl<B: Backend> RotaryEmbedding<B> {
         head_dim: usize,
         max_seq_len: usize,
         rope_theta: f64,
+        rope_freqs: Option<&[f32]>,
         device: &Device,
     ) -> Result<Self> {
         let mut freqs: Vec<f32> = Vec::new();
         for i in 0..head_dim / 2 {
-            freqs.push((1.0 / rope_theta.powf((2 * i) as f64 / head_dim as f64)) as f32);
+            let mut f = (1.0 / rope_theta.powf((2 * i) as f64 / head_dim as f64)) as f32;
+            if let Some(factors) = rope_freqs {
+                f /= factors[i];
+            }
+            freqs.push(f);
         }
 
         let mut angles: Vec<f32> = Vec::new();

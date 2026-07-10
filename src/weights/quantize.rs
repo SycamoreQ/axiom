@@ -180,17 +180,15 @@ fn dequantize_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
             break;
         }
 
-        // super‑block scale and min (both f16)
         let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
         let dmin = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
 
-        let sc = &block[4..16]; // 12 bytes of packed 6‑bit scales and mins
-        let qs = &block[16..144]; // 128 bytes of 4‑bit values
+        let sc = &block[4..16];
+        let qs = &block[16..144];
 
-        // Unpack 8 scales and 8 mins (each 6 bits)
+        // scale/min unpacking — this part was already correct, unchanged
         let mut scales = [0u8; 8];
         let mut mins = [0u8; 8];
-
         for i in 0..4 {
             scales[i] = sc[i] & 0x3F;
             mins[i] = sc[i + 4] & 0x3F;
@@ -200,34 +198,33 @@ fn dequantize_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
             mins[4 + i] = (sc[8 + i] >> 4) | ((sc[i + 4] >> 6) << 4);
         }
 
-        // 8 sub‑blocks of 32 elements each
-        for s in 0..8 {
-            let scale = scales[s] as f32 * d; // scale for this sub‑block
-            let magic = mins[s] as f32 * dmin; // offset (not scaled by d)
+        // 4 chunks of 32 bytes -> 64 elements each, alternating scale pairs
+        let mut is = 0;
+        for c in 0..4 {
+            let q = &qs[c * 32..(c + 1) * 32];
 
-            let qblock = &qs[s * 16..(s + 1) * 16];
+            let d1 = d * scales[is] as f32;
+            let m1 = dmin * mins[is] as f32;
+            let d2 = d * scales[is + 1] as f32;
+            let m2 = dmin * mins[is + 1] as f32;
 
-            // Low nibbles → elements 0..15
-            for j in 0..16 {
+            for l in 0..32 {
                 if out_idx >= numel {
                     break;
                 }
-                let nibble = (qblock[j] & 0x0F) as f32 - 32.0;
-                out[out_idx] = scale * nibble - magic;
+                out[out_idx] = d1 * (q[l] & 0x0F) as f32 - m1;
                 out_idx += 1;
             }
-            // High nibbles → elements 16..31
-            for j in 0..16 {
+            for l in 0..32 {
                 if out_idx >= numel {
                     break;
                 }
-                let nibble = (qblock[j] >> 4) as f32 - 32.0;
-                out[out_idx] = scale * nibble - magic;
+                out[out_idx] = d2 * (q[l] >> 4) as f32 - m2;
                 out_idx += 1;
             }
+            is += 2;
         }
     }
-
     out
 }
 //
@@ -250,39 +247,50 @@ const Q6_K_BLOCK_BYTES: usize = 128 + 64 + 16 + 2; // 210 bytes
 
 fn dequantize_q6_k(data: &[u8], numel: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; numel];
-    let mut out_idx = 0;
 
-    for block in data.chunks_exact(Q6_K_BLOCK_BYTES) {
-        if out_idx >= numel {
+    for (block_idx, block) in data.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
+        let block_base = block_idx * Q6_K_BLOCK_SIZE;
+        if block_base >= numel {
             break;
         }
 
-        let d_bits = u16::from_le_bytes([block[208], block[209]]);
-        let d = half::f16::from_bits(d_bits).to_f32();
+        let d = half::f16::from_bits(u16::from_le_bytes([block[208], block[209]])).to_f32();
+        let ql_all = &block[0..128];
+        let qh_all = &block[128..192];
+        let sc_all = &block[192..208];
 
-        let ql = &block[0..128];
-        let qh = &block[128..192];
-        let scales = &block[192..208];
+        for g in 0..2 {
+            let ql = &ql_all[g * 64..(g + 1) * 64];
+            let qh = &qh_all[g * 32..(g + 1) * 32];
+            let sc = &sc_all[g * 8..(g + 1) * 8];
+            let base = block_base + g * 128;
 
-        for i in 0..Q6_K_BLOCK_SIZE {
-            if out_idx >= numel {
-                break;
+            for l in 0..32 {
+                let is = l / 16;
+
+                let q1 = ((ql[l] & 0x0F) as i32 | (((qh[l] as i32 >> 0) & 3) << 4)) - 32;
+                let q2 = ((ql[l + 32] & 0x0F) as i32 | (((qh[l] as i32 >> 2) & 3) << 4)) - 32;
+                let q3 = ((ql[l] >> 4) as i32 | (((qh[l] as i32 >> 4) & 3) << 4)) - 32;
+                let q4 = ((ql[l + 32] >> 4) as i32 | (((qh[l] as i32 >> 6) & 3) << 4)) - 32;
+
+                let s1 = sc[is] as i8 as f32;
+                let s2 = sc[is + 2] as i8 as f32;
+                let s3 = sc[is + 4] as i8 as f32;
+                let s4 = sc[is + 6] as i8 as f32;
+
+                if base + l < numel {
+                    out[base + l] = d * s1 * q1 as f32;
+                }
+                if base + l + 32 < numel {
+                    out[base + l + 32] = d * s2 * q2 as f32;
+                }
+                if base + l + 64 < numel {
+                    out[base + l + 64] = d * s3 * q3 as f32;
+                }
+                if base + l + 96 < numel {
+                    out[base + l + 96] = d * s4 * q4 as f32;
+                }
             }
-
-            let lower = if i % 2 == 0 {
-                (ql[i / 2] & 0x0F) as i32
-            } else {
-                ((ql[i / 2] >> 4) & 0x0F) as i32
-            };
-
-            let shift = (i % 4) * 2;
-            let upper = ((qh[i / 4] >> shift) & 0x03) as i32;
-
-            let q = (lower | (upper << 4)) - 32;
-            let scale = scales[i / 16] as i8 as f32;
-
-            out[out_idx] = q as f32 * scale * d;
-            out_idx += 1;
         }
     }
 

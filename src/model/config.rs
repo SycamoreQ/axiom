@@ -51,6 +51,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub prefetch_threshold: Option<f32>, // confidence threshold for pre-gating
 
+    #[serde(default)]
+    pub rope_freqs: Option<Vec<f32>>,
     //dtype
     #[serde(default = "default_dtype")]
     pub torch_dtype: String, // "float32", "float16", "bfloat16"

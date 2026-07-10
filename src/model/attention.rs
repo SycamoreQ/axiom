@@ -40,6 +40,7 @@ impl<B: Backend> Attention<B> {
             head_dim,
             config.max_position_embeddings,
             config.rope_theta,
+            config.rope_freqs.as_deref(),
             device,
         )?;
         let scale = 1.0 / (head_dim as f32).sqrt();

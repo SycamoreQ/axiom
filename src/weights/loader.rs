@@ -144,6 +144,21 @@ pub fn config_from_gguf(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
             ))),
         }
     };
+    let rope_freqs = gguf.tensors.get("rope_freqs.weight").and_then(|info| {
+        let data = gguf.get_tensor_data("rope_freqs.weight")?;
+        let floats = match info.dtype {
+            GgufDType::F32 => data
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+            GgufDType::F16 => data
+                .chunks_exact(2)
+                .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+                .collect(),
+            dtype => crate::weights::quantize::dequantize(data, dtype, info.numel() as usize),
+        };
+        Some(floats)
+    });
 
     // Read vocab_size - DON'T fall back to token array
     let vocab_size = get_u32("llama.vocab_size")?;
@@ -162,6 +177,7 @@ pub fn config_from_gguf(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
         torch_dtype: "float32".to_string(),
         num_local_experts: None,
         num_experts_per_tok: None,
+        rope_freqs: rope_freqs,
         num_shared_experts: None,
         expert_interval: None,
         prefetch_threshold: None,
@@ -257,10 +273,22 @@ pub fn load_from_gguf<B: Backend>(
     let mut token_embd_tensor: Option<B::Tensor> = None;
 
     for (name, info) in &gguf.tensors {
+        if LlamaTensor::parse(name).is_none() {
+            eprintln!("SKIPPED TENSOR: {}", name);
+        }
         let kind = match LlamaTensor::parse(name) {
             Some(k) => k,
             None => continue,
         };
+
+        if name == "token_embd.weight"
+            || name == "output.weight"
+            || name.contains("attn_v.weight")
+            || name.contains("ffn_down.weight")
+        {
+            eprintln!("TENSOR DTYPE: {:<30} {:?}", name, info.dtype);
+        }
+
         let data = gguf
             .get_tensor_data(name)
             .ok_or_else(|| LoaderError::MissingTensor(name.clone()))?;
