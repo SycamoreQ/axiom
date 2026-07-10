@@ -6,7 +6,7 @@ use objc2_metal::MTLBuffer;
 use objc2_metal::MTLDevice;
 use objc2_metal::MTLResourceOptions;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BlockHandle {
     pub index: usize,
     pub ptr: *mut u8,
@@ -115,7 +115,7 @@ impl MetalAllocator {
             offset_bytes: start_offset,
             size_bytes: size,
             ptr: block_ptr,
-            owned_buffer: None, 
+            owned_buffer: None,
         })
     }
 

@@ -9,7 +9,7 @@ use crate::model::linear::Linear;
 use crate::model::rope::RotaryEmbedding;
 
 pub struct Attention<B: Backend> {
-    q_proj: Linear<B>,
+    pub q_proj: Linear<B>,
     k_proj: Linear<B>,
     v_proj: Linear<B>,
     o_proj: Linear<B>,
@@ -57,12 +57,11 @@ impl<B: Backend> Attention<B> {
         })
     }
 
-    // (output, new_k, new_v)
     pub fn forward(
         &self,
-        x: &B::Tensor,                              // [batch, seq_len, hidden_size]
-        mask: Option<&B::Tensor>,                   // [batch, 1, seq_len, seq_len] causal mask
-        kv_cache: Option<(&B::Tensor, &B::Tensor)>, // (past_k, past_v)
+        x: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        kv_cache: Option<(&B::Tensor, &B::Tensor)>,
         offset: usize,
     ) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
         let batch = x.shape().dim(0)?;
@@ -91,46 +90,50 @@ impl<B: Backend> Attention<B> {
         let k = self.rope.forward(&k, offset)?;
 
         let (mut k, mut v) = match kv_cache {
-            Some((past_k, past_v)) => {
-                let k = B::Tensor::cat(&[past_k, &k], 1)?;
-                let v = B::Tensor::cat(&[past_v, &v], 1)?;
-                (k, v)
-            }
+            Some((past_k, past_v)) => (
+                B::Tensor::cat(&[past_k, &k], 1)?,
+                B::Tensor::cat(&[past_v, &v], 1)?,
+            ),
             None => (k, v),
         };
-
         let k_cache = k.clone();
         let v_cache = v.clone();
 
         let repeat_factor = self.num_heads / self.num_kv_heads;
         if repeat_factor > 1 {
-            k = k.repeat(&Shape::new(&[1, 1, repeat_factor, 1]))?;
-            v = v.repeat(&Shape::new(&[1, 1, repeat_factor, 1]))?;
+            let (b, s, kvh, d) = (
+                k.shape().dim(0)?,
+                k.shape().dim(1)?,
+                k.shape().dim(2)?,
+                k.shape().dim(3)?,
+            );
+            k = k
+                .unsqueeze(3)?
+                .repeat(&Shape::new(&[1, 1, 1, repeat_factor, 1]))?
+                .reshape(&Shape::new(&[b, s, kvh * repeat_factor, d]))?;
+            v = v
+                .unsqueeze(3)?
+                .repeat(&Shape::new(&[1, 1, 1, repeat_factor, 1]))?
+                .reshape(&Shape::new(&[b, s, kvh * repeat_factor, d]))?;
         }
 
-        // transpose to [batch, heads, seq, head_dim]
         let q = q.transpose(1, 2)?.contiguous()?;
         let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        // scaled dot product attention
         let scores = q
             .broadcast_matmul(&k.transpose(2, 3)?.contiguous()?)?
             .scale(self.scale as f64)?;
 
-        // In attention.rs, after applying mask
         let scores = match mask {
-            Some(m) => {
-                let masked = scores.broadcast_add(m)?;
-                masked
-            }
+            Some(m) => scores.broadcast_add(m)?,
             None => scores,
         };
 
         let weights = scores.softmax(3)?;
+
         let out = weights.contiguous()?.broadcast_matmul(&v)?;
 
-        // transpose back and reshape
         let out = out.transpose(1, 2)?.contiguous()?.reshape(&Shape::new(&[
             batch,
             seq_len,
@@ -139,12 +142,7 @@ impl<B: Backend> Attention<B> {
 
         let out = self.o_proj.forward(&out)?;
 
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static ATTN_CALL: AtomicUsize = AtomicUsize::new(0);
-        let call_idx = ATTN_CALL.fetch_add(1, Ordering::Relaxed);
-        if call_idx < 2 {}
-
-        Ok((out, k_cache, v_cache)) // (output, new_k, new_v)
+        Ok((out, k_cache, v_cache))
     }
 
     pub fn set_q_proj(&mut self, l: Linear<B>) {

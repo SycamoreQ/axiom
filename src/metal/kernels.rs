@@ -16,6 +16,7 @@ const RMS_NORM_F32_MSL: &str = include_str!("kernels/rms_norm_f32.metal");
 const ROPE_MSL: &str = include_str!("kernels/rope_f16.metal");
 const SWIGLU_MSL: &str = include_str!("kernels/swiglu_f16.metal");
 const MATMUL_MSL: &str = include_str!("kernels/matmul_f16.metal");
+const MATMUL_F32_MSL: &str = include_str!("kernels/matmul_f32.metal");
 const ATTN_QK_MSL: &str = include_str!("kernels/attention_qk_f16.metal");
 const ATTN_PV_MSL: &str = include_str!("kernels/attention_pv_f16.metal");
 
@@ -25,6 +26,7 @@ pub struct MetalKernels {
     pub rope_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub swiglu_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub matmul_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub matmul_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_qk_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_pv_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
@@ -37,6 +39,7 @@ impl std::fmt::Debug for MetalKernels {
             .field("rope_pipeline", &"MTLComputePipelineState")
             .field("swiglu_pipeline", &"MTLComputePipelineState")
             .field("matmul_pipeline", &"MTLComputePipelineState")
+            .field("matmul_f32_pipeline", &"MTLComputePipelineState")
             .field("attention_qk_pipeline", &"MTLComputePipelineState")
             .field("attention_pv_pipeline", &"MTLComputePipelineState")
             .finish()
@@ -73,6 +76,7 @@ impl MetalKernels {
             rope_pipeline: build_pipeline(ROPE_MSL, "rope_f16")?,
             swiglu_pipeline: build_pipeline(SWIGLU_MSL, "swiglu_f16")?,
             matmul_pipeline: build_pipeline(MATMUL_MSL, "matmul_f16")?,
+            matmul_f32_pipeline: build_pipeline(MATMUL_F32_MSL, "matmul_f32")?,
             attention_qk_pipeline: build_pipeline(ATTN_QK_MSL, "attention_qk_f16")?,
             attention_pv_pipeline: build_pipeline(ATTN_PV_MSL, "attention_pv_float")?,
         })
@@ -130,7 +134,7 @@ impl MetalKernels {
 
         encoder.endEncoding();
         cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
+        ////cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -188,7 +192,7 @@ impl MetalKernels {
         encoder.endEncoding();
         cmd_buf.commit();
 
-        cmd_buf.waitUntilCompleted();
+        ////cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -251,7 +255,7 @@ impl MetalKernels {
 
         encoder.endEncoding();
         cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
+        ////cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -301,7 +305,7 @@ impl MetalKernels {
 
         encoder.endEncoding();
         cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
+        ////cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -364,9 +368,78 @@ impl MetalKernels {
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
             encoder.endEncoding();
             cmd_buf.commit();
-            cmd_buf.waitUntilCompleted();
+            //cmd_buf.waitUntilCompleted();
             Ok(())
         }
+    }
+
+    pub fn matmul_f32(
+        &self,
+        ctx: &MetalContext,
+        allocator: &MetalAllocator,
+        a: &BlockHandle,
+        b: &BlockHandle,
+        c: &BlockHandle,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<()> {
+        let cmd_buf = ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
+
+        encoder.setComputePipelineState(&self.matmul_f32_pipeline);
+
+        unsafe {
+            // Bind the tensor buffers
+            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), a.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), b.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), c.offset_bytes, 2);
+
+            // Bind the matrix dimensions
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&m as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&k as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+        }
+        let block_size = 16;
+
+        let threads_per_threadgroup = MTLSize {
+            width: block_size as usize,
+            height: block_size as usize,
+            depth: 1,
+        };
+
+        let threadgroups_per_grid = MTLSize {
+            width: ((n + block_size - 1) / block_size) as usize,
+            height: ((m + block_size - 1) / block_size) as usize,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                threadgroups_per_grid,
+                threads_per_threadgroup,
+            );
+        }
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        //cmd_buf.waitUntilCompleted();
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -430,7 +503,7 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
             encoder.endEncoding();
             cmd_buf.commit();
-            cmd_buf.waitUntilCompleted();
+            //cmd_buf.waitUntilCompleted();
             Ok(())
         }
     }
@@ -497,7 +570,7 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
             encoder.endEncoding();
             cmd_buf.commit();
-            cmd_buf.waitUntilCompleted();
+            //cmd_buf.waitUntilCompleted();
             Ok(())
         }
     }

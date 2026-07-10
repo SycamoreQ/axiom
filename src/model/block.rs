@@ -21,7 +21,7 @@ pub enum FeedForwardLayer<B: Backend> {
 
 pub struct Block<B: Backend> {
     attn_norm: RmsNorm<B>,
-    attn: Attention<B>,
+    pub attn: Attention<B>,
     ffn_norm: RmsNorm<B>,
     ffn: FeedForwardLayer<B>,
     layer_idx: usize,
@@ -71,12 +71,12 @@ impl<B: Backend> Block<B> {
 
         let ao_vec = attn_out.to_vec_f32()?;
         let ao_max = ao_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let ao_min = ao_vec.iter().cloned().fold(f32::INFINITY, f32::min);
 
         let x = x.add(&attn_out)?;
 
         let after_vec = x.to_vec_f32()?;
         let after_max = after_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
         //ffn with pre-norm and residual
         let h = self.ffn_norm.forward(&x)?;
         let ffn_out = match &mut self.ffn {
@@ -99,12 +99,15 @@ impl<B: Backend> Block<B> {
     pub fn set_attn_q(&mut self, w: B::Tensor) {
         self.attn.set_q_proj(Linear::new(w, None));
     }
+
     pub fn set_attn_k(&mut self, w: B::Tensor) {
         self.attn.set_k_proj(Linear::new(w, None));
     }
+
     pub fn set_attn_v(&mut self, w: B::Tensor) {
         self.attn.set_v_proj(Linear::new(w, None));
     }
+
     pub fn set_attn_o(&mut self, w: B::Tensor) {
         self.attn.set_o_proj(Linear::new(w, None));
     }
@@ -125,6 +128,12 @@ impl<B: Backend> Block<B> {
             FeedForwardLayer::Dense(ff) => ff.set_down(Linear::new(w, None)),
             FeedForwardLayer::Moe(_) => {}
         }
+    }
+    pub fn attn_norm_weight(&self) -> &B::Tensor {
+        &self.attn_norm.weight
+    }
+    pub fn ffn_norm_weight(&self) -> &B::Tensor {
+        &self.ffn_norm.weight
     }
 }
 

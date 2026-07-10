@@ -180,63 +180,49 @@ fn dequantize_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
             break;
         }
 
-        // super-block scale and min
+        // super‑block scale and min (both f16)
         let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
         let dmin = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
 
-        let sc = &block[4..16]; // 12 bytes of packed 6-bit scales/mins
-        let qs = &block[16..144]; // 128 bytes of 4-bit values
+        let sc = &block[4..16]; // 12 bytes of packed 6‑bit scales and mins
+        let qs = &block[16..144]; // 128 bytes of 4‑bit values
 
-        // Unpack 8 scales and 8 mins from 12 bytes.
-        // Layout from ggml-quants.c get_scale_min_k4():
-        //   For i in 0..4:
-        //     scales[i]   =  sc[i]        & 0x3F
-        //     scales[i+4] = (sc[i+4]      & 0x0F) | ((sc[i]   >> 6) << 4)
-        //     mins[i]     =  sc[i+6]      & 0x3F
-        //     mins[i+4]   = (sc[i+10]     & 0x0F) | ((sc[i+6] >> 6) << 4)
+        // Unpack 8 scales and 8 mins (each 6 bits)
         let mut scales = [0u8; 8];
         let mut mins = [0u8; 8];
 
-        scales[0] = sc[0] & 0x3F;
-        scales[1] = sc[1] & 0x3F;
-        scales[2] = sc[2] & 0x3F;
-        scales[3] = sc[3] & 0x3F;
-        scales[4] = (sc[4] & 0x0F) | ((sc[0] >> 6) << 4);
-        scales[5] = (sc[5] & 0x0F) | ((sc[1] >> 6) << 4);
-        scales[6] = (sc[4] >> 4) | ((sc[2] >> 6) << 4);
-        scales[7] = (sc[5] >> 4) | ((sc[3] >> 6) << 4);
+        for i in 0..4 {
+            scales[i] = sc[i] & 0x3F;
+            mins[i] = sc[i + 4] & 0x3F;
+        }
+        for i in 0..4 {
+            scales[4 + i] = (sc[8 + i] & 0x0F) | ((sc[i] >> 6) << 4);
+            mins[4 + i] = (sc[8 + i] >> 4) | ((sc[i + 4] >> 6) << 4);
+        }
 
-        mins[0] = sc[6] & 0x3F;
-        mins[1] = sc[7] & 0x3F;
-        mins[2] = sc[8] & 0x3F;
-        mins[3] = sc[9] & 0x3F;
-        mins[4] = (sc[10] & 0x0F) | ((sc[6] >> 6) << 4);
-        mins[5] = (sc[11] & 0x0F) | ((sc[7] >> 6) << 4);
-        mins[6] = (sc[10] >> 4) | ((sc[8] >> 6) << 4);
-        mins[7] = (sc[11] >> 4) | ((sc[9] >> 6) << 4);
+        // 8 sub‑blocks of 32 elements each
+        for s in 0..8 {
+            let scale = scales[s] as f32 * d; // scale for this sub‑block
+            let magic = mins[s] as f32 * dmin; // offset (not scaled by d)
 
-        // 8 sub-blocks of 32 elements each; nibbles stored as 16 bytes per sub-block
-        for s in 0..8usize {
-            let scale = scales[s] as f32 * d;
-            let min = mins[s] as f32 * dmin;
-
-            // Each sub-block uses 16 bytes of qs (bytes s*16 .. s*16+16)
             let qblock = &qs[s * 16..(s + 1) * 16];
 
-            // Low nibbles → elements 0..15 of this sub-block
+            // Low nibbles → elements 0..15
             for j in 0..16 {
                 if out_idx >= numel {
                     break;
                 }
-                out[out_idx] = (qblock[j] & 0x0F) as f32 * scale - min;
+                let nibble = (qblock[j] & 0x0F) as f32 - 32.0;
+                out[out_idx] = scale * nibble - magic;
                 out_idx += 1;
             }
-            // High nibbles → elements 16..31 of this sub-block
+            // High nibbles → elements 16..31
             for j in 0..16 {
                 if out_idx >= numel {
                     break;
                 }
-                out[out_idx] = (qblock[j] >> 4) as f32 * scale - min;
+                let nibble = (qblock[j] >> 4) as f32 - 32.0;
+                out[out_idx] = scale * nibble - magic;
                 out_idx += 1;
             }
         }
@@ -244,7 +230,6 @@ fn dequantize_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
 
     out
 }
-
 //
 // Super-block of 256 elements.
 // Block layout (210 bytes):

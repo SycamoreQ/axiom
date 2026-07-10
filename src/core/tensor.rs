@@ -5,10 +5,11 @@ use crate::core::dtype::{DType, Element};
 use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
 use crate::core::tensor;
-#[cfg(feature = "metal")]
 use crate::metal::{allocator::BlockHandle, state::global_metal_state, MetalState};
 use candle_core::{self, Tensor};
 use candle_nn;
+#[cfg(feature = "metal")]
+use objc2_metal::MTLCommandBuffer;
 use std::sync::Arc;
 
 fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
@@ -1369,124 +1370,104 @@ impl TensorOps for MetalTensor {
         Ok(output)
     }
 
+    /// NON APPLE FOR NOW
     fn rms_norm(&self, weight: &Self, eps: f32) -> Result<Self> {
-        let state = self.state.clone();
-        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
-        let num_tokens = self.shape.dims()[..self.shape.rank() - 1]
-            .iter()
-            .product::<usize>() as u32;
-        let hidden = *self.shape.dims().last().unwrap() as u32;
+        let hidden = *self.shape.dims().last().unwrap();
+        let num_tokens = self.shape.numel() / hidden;
+        let src = self.to_vec_f32()?;
+        let wgt = weight.to_vec_f32()?;
 
-        match self.dtype {
-            DType::F16 => state.kernels.rms_norm_f16(
-                &state.ctx,
-                &state.alloc.lock().unwrap(),
-                &self.block,
-                &weight.block,
-                &output.block,
-                num_tokens,
-                hidden,
-                eps,
-            )?,
-            DType::F32 => state.kernels.rms_norm_f32(
-                &state.ctx,
-                &state.alloc.lock().unwrap(),
-                &self.block,
-                &weight.block,
-                &output.block,
-                num_tokens,
-                hidden,
-                eps,
-            )?,
-            _ => return Err(CoreError::Internal("rms_norm: unsupported dtype".into())),
+        let mut out = vec![0.0f32; src.len()];
+        for t in 0..num_tokens {
+            let row_start = t * hidden;
+            let row = &src[row_start..row_start + hidden];
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+            let rms = (ms + eps).sqrt();
+            for i in 0..hidden {
+                out[row_start + i] = row[i] * wgt[i] / rms;
+            }
         }
-        Ok(output)
+        Self::from_slice(&out, &self.shape, &self.device)
     }
 
     fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
+        // Read both tensors into CPU memory
+        let a = self.to_vec_f32()?;
+        let w_orig = other.to_vec_f32()?;
+
         let rank = self.shape.rank();
         let other_rank = other.shape.rank();
 
-        // Detect whether other is a weight matrix (rank 2, needs implicit transpose)
-        // or a full tensor already in the right layout (rank > 2, standard matmul)
-        let (k, n, other_k, pre_transposed) = if other_rank == 2 {
-            let k = self.shape.dims()[rank - 1];
+        // Inner dimension
+        let k = self.shape.dims()[rank - 1];
+
+        // Determine N and whether other is already [K, N] or [N, K]
+        let (n, w_is_transposed) = if other_rank == 2 {
             if other.shape.dims()[1] == k {
-                let n = other.shape.dims()[0];
-                let ok = other.shape.dims()[1];
-                (k, n, ok, false)
+                // other is [N, K]
+                (other.shape.dims()[0], false)
             } else if other.shape.dims()[0] == k {
-                let n = other.shape.dims()[1];
-                let ok = other.shape.dims()[0];
-                (k, n, ok, true)
+                // other is [K, N]
+                (other.shape.dims()[1], true)
             } else {
-                return Err(CoreError::Internal(format!(
-                    "Metal matmul dimension mismatch: k={}, other={:?}",
-                    k,
-                    other.shape.dims()
-                )));
+                return Err(CoreError::Internal("matmul shape mismatch".into()));
             }
         } else {
-            // standard tensor matmul: [..., m, k] @ [..., k, n]
-            let k = self.shape.dims()[rank - 1];
-            let n = other.shape.dims()[other_rank - 1];
-            let ok = other.shape.dims()[other_rank - 2];
-            (k, n, ok, false)
+            // batched: last two dims are [..., K, N]
+            (other.shape.dims()[other_rank - 1], true)
         };
 
-        let self_f32 = self.to_vec_f32()?;
-        let other_f32 = other.to_vec_f32()?;
-
-        let m: usize = self.shape.dims()[..rank - 1].iter().product();
-        let batch_self: usize = if rank > 2 {
-            self.shape.dims()[..rank - 2].iter().product()
-        } else {
-            1
-        };
+        let m_per = self.shape.dims()[rank - 2];
+        let batch_self: usize = self.shape.dims()[..rank - 2].iter().product();
         let batch_other: usize = if other_rank > 2 {
             other.shape.dims()[..other_rank - 2].iter().product()
         } else {
             1
         };
         let batch_out = batch_self.max(batch_other);
-        let m_per = self.shape.dims()[rank - 2]; // rows per batch slice
 
-        let mut out_f32 = vec![0.0f32; batch_out * m_per * n];
-        let nonzero = out_f32.iter().filter(|&&x| x != 0.0).count();
-        let maxval = out_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut out = vec![0.0f32; batch_out * m_per * n];
 
-        for b in 0..batch_out {
-            let self_b = if batch_self == 1 { 0 } else { b };
-            let other_b = if batch_other == 1 { 0 } else { b };
-            let self_off = self_b * m_per * k;
-            let other_off = other_b * (if other_rank == 2 { n * k } else { k * n });
-            let out_off = b * m_per * n;
+        for batch_idx in 0..batch_out {
+            let self_b = if batch_self == 1 { 0 } else { batch_idx };
+            let other_b = if batch_other == 1 { 0 } else { batch_idx };
+
+            let a_offset = self_b * m_per * k;
+            let w_offset = other_b * k * n; // only used when w_is_transposed
+            let c_offset = batch_idx * m_per * n;
 
             for i in 0..m_per {
                 for j in 0..n {
-                    let mut sum = 0.0f32;
-                    for l in 0..k {
-                        let a_val = self_f32[self_off + i * k + l];
-                        let b_val = if other_rank == 2 && !pre_transposed {
-                            other_f32[other_off + j * k + l] // [out, in]: weight[j, l]
-                        } else if other_rank == 2 && pre_transposed {
-                            other_f32[other_off + l * n + j] // [in, out]: weight[l, j]
+                    let mut sum = 0.0;
+                    for p in 0..k {
+                        let a_val = a[a_offset + i * k + p];
+                        let w_val = if w_is_transposed {
+                            // w_orig is [..., K, N] → element (p, j) is at w_offset + p * n + j
+                            w_orig[w_offset + p * n + j]
                         } else {
-                            other_f32[other_off + l * n + j] // standard tensor matmul
+                            // w_orig is [N, K] → element (p, j) is at other_b * (n*k) + j * k + p
+                            w_orig[other_b * n * k + j * k + p]
                         };
-                        sum += a_val * b_val;
+                        sum += a_val * w_val;
                     }
-                    out_f32[out_off + i * n + j] = sum;
+                    out[c_offset + i * n + j] = sum;
                 }
             }
         }
 
-        let mut out_dims: Vec<usize> = self.shape.dims()[..rank - 1].to_vec();
-        out_dims.push(n);
-        let nonzero = out_f32.iter().filter(|&&x| x != 0.0).count();
-        let maxval = out_f32.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let out = Self::from_slice(&out_f32, &Shape::new(&out_dims), &self.device)?;
-        out.to_dtype(self.dtype)
+        // Determine output shape
+        let mut final_shape = Vec::new();
+        if batch_out > 1 {
+            final_shape.extend(self.shape.dims()[..rank - 2].iter());
+            if final_shape.is_empty() {
+                final_shape.push(batch_out);
+            }
+        }
+        final_shape.push(m_per);
+        final_shape.push(n);
+        let shape = Shape::new(&final_shape);
+
+        Self::from_slice(&out, &shape, &self.device)
     }
 
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
@@ -1818,6 +1799,11 @@ impl TensorOps for MetalTensor {
     }
 
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
+        if let Some(state) = crate::metal::state::global_metal_state() {
+            let cmd_buf = state.ctx.command_buffer()?;
+            cmd_buf.commit(); // 1. Flush all previous work to the GPU
+            cmd_buf.waitUntilCompleted(); // 2. Safely wait for it all to finish
+        }
         let n = self.shape.numel();
         let mut out = vec![0.0f32; n];
         let dims = self.shape.dims();

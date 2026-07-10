@@ -3,7 +3,7 @@ use crate::core::error::Result;
 use crate::core::tensor::TensorOps;
 
 pub struct RmsNorm<B: Backend> {
-    weight: B::Tensor,
+    pub weight: B::Tensor,
     eps: f32,
 }
 

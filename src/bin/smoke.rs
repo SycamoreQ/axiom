@@ -3,6 +3,7 @@ use axiom::core::backend::CandleBackend;
 #[cfg(feature = "metal")]
 use axiom::core::backend::MetalBackend;
 use axiom::core::device::Device;
+use axiom::core::tensor::TensorOps;
 use axiom::inference::engine::Engine;
 use axiom::inference::sampler::SamplerConfig;
 use axiom::tokenizer::tokenizer::{EncodeOptions, Tokenizer};
@@ -127,23 +128,38 @@ fn main() {
     let mut steps = 0;
     let start = std::time::Instant::now();
 
+    // 1. Declare it out here so it stays in scope for the entire function
+    let mut stop_reason = None;
+
     loop {
         let results = engine.step().expect("step failed");
         for (sid, token) in &results {
             if *sid == session_id {
+                let t = *token as u32;
                 eprintln!(
                     "DEBUG token={} text={:?}",
                     token,
                     engine.tokenizer().decode(&[*token as usize])
                 );
+                if t == 128255 || t == 128001 || t == 128009 || t == 2 {
+                    stop_reason = Some("Stop token generated");
+                    break;
+                }
                 let text = engine.tokenizer().decode(&[*token as usize]);
                 print!("{}", text);
                 std::io::stdout().flush().unwrap();
                 steps += 1;
             }
         }
-        if engine.batch.active_sessions().is_empty() || steps >= max_new_tokens {
-            break;
+
+        if stop_reason.is_some()
+            || engine.batch.active_sessions().is_empty()
+            || steps >= max_new_tokens
+        {
+            if let Some(reason) = stop_reason {
+                println!("\n\n[{}]", reason);
+            }
+            break; // Breaks the outer 'loop'
         }
     }
 

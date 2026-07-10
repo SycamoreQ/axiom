@@ -9,9 +9,10 @@ use crate::model::config::ModelConfig;
 use crate::model::embedding::Embedding;
 use crate::model::linear::Linear;
 use crate::model::norm::RmsNorm;
+
 pub struct LlamaModel<B: Backend> {
-    embedding: Embedding<B>,
-    blocks: Vec<Block<B>>,
+    pub embedding: Embedding<B>,
+    pub blocks: Vec<Block<B>>,
     norm: RmsNorm<B>,
     lm_head: Linear<B>,
     config: ModelConfig,
@@ -40,13 +41,13 @@ impl<B: Backend> LlamaModel<B> {
                 DType::F32,
                 device,
             )?,
-            None, // no bias
-        ); // [vocab_size , hidden_size]
+            None,
+        );
 
         Ok(Self {
-            embedding: embedding,
+            embedding,
             blocks,
-            norm: norm,
+            norm,
             lm_head,
             config: config.clone(),
         })
@@ -80,18 +81,11 @@ impl<B: Backend> LlamaModel<B> {
         let seq_len = token_ids.len();
         let x = self.embedding.forward(token_ids)?;
         let mut x = x.unsqueeze(0)?;
-        let emb_vec = x.to_vec_f32()?;
-        let emb_max = emb_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let emb_min = emb_vec.iter().cloned().fold(f32::INFINITY, f32::min);
         let device = x.device().clone();
         let mask = self.causal_mask(seq_len, &device)?;
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
-            if i == 0 {
-                let b_vec = x.to_vec_f32()?;
-                let b_max = b_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let b_min = b_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-            }
+            let t0 = std::time::Instant::now();
 
             let cache = kv_cache
                 .as_deref()
@@ -112,11 +106,42 @@ impl<B: Backend> LlamaModel<B> {
             }
         }
 
-        // also check embedding output for comparison
-        let emb = self.embedding.forward(&[token_ids[0]])?;
-        let x = self.norm.forward(&x)?;
+        // ---- CPU fallback for final norm + LM head (working) ----
+        let t0 = std::time::Instant::now();
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
 
-        let logits = self.lm_head.forward(&x)?;
+        let x_pre_norm = x.to_vec_f32()?;
+        let w_norm = self.norm.weight().to_vec_f32()?;
+        let eps = self.norm.eps();
+
+        // CPU RMS norm
+        let mut normed = vec![0.0f32; x_pre_norm.len()];
+        for i in 0..x_pre_norm.len() {
+            let row_start = (i / hidden_size) * hidden_size;
+            let row = &x_pre_norm[row_start..row_start + hidden_size];
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / hidden_size as f32;
+            let rms = (ms + eps).sqrt();
+            normed[i] = x_pre_norm[i] * w_norm[i % hidden_size] / rms;
+        }
+
+        let w_lm_head = self.lm_head.weight().to_vec_f32()?;
+        let seq_len = x.shape().dim(1).unwrap();
+        let mut logits_cpu = vec![0.0f32; seq_len * vocab_size];
+        for pos in 0..seq_len {
+            let hidden_start = pos * hidden_size;
+            let hidden_row = &normed[hidden_start..hidden_start + hidden_size];
+            let offset_logits = pos * vocab_size;
+            for v in 0..vocab_size {
+                let mut sum = 0.0;
+                for d in 0..hidden_size {
+                    sum += hidden_row[d] * w_lm_head[v * hidden_size + d];
+                }
+                logits_cpu[offset_logits + v] = sum;
+            }
+        }
+        let logits_shape = Shape::new(&[1, seq_len, vocab_size]);
+        let logits = B::Tensor::from_slice(&logits_cpu, &logits_shape, &device)?;
 
         Ok(logits)
     }
@@ -133,8 +158,6 @@ impl<B: Backend> LlamaModel<B> {
 
         match kind {
             LlamaTensor::TokenEmbd => {
-                // GGUF shape after reversal is [hidden, vocab] = [2048, 128256]
-                // Embedding::forward needs [vocab, hidden] = [128256, 2048]
                 let tensor = if tensor.shape().dim(0)? < tensor.shape().dim(1)? {
                     tensor.transpose(0, 1)?.contiguous()?
                 } else {
@@ -143,7 +166,6 @@ impl<B: Backend> LlamaModel<B> {
                 self.embedding = Embedding::new(tensor);
             }
             LlamaTensor::OutputNorm => {
-                // RmsNorm::new takes (weight, eps) — keep existing eps
                 let eps = self.norm.eps();
                 self.norm = RmsNorm::new(tensor, eps);
             }
