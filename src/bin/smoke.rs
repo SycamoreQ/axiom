@@ -25,6 +25,10 @@ fn main() {
         .nth(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+    let temperature: f32 = std::env::args()
+        .nth(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
 
     println!("Axiom Inference Engine");
     println!("Model    : {}", gguf_path);
@@ -42,7 +46,10 @@ fn main() {
     // tokenizer
     let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("failed to load tokenizer");
     println!("Tokenizer: ok (vocab {})", tokenizer.vocab().size());
-
+    let ids_a = tokenizer.encode("A", EncodeOptions::default());
+    let ids_space_a = tokenizer.encode(" A", EncodeOptions::default());
+    eprintln!("'A' -> {:?}", ids_a);
+    eprintln!("' A' -> {:?}", ids_space_a);
     // model + engine — backend selected at compile time
     #[cfg(feature = "metal")]
     let engine = {
@@ -70,7 +77,7 @@ fn main() {
 
         let vocab_size = model.config().vocab_size;
         let sampler_config = SamplerConfig {
-            temperature: 0.0,
+            temperature,
             top_p: Some(0.9),
             top_k: Some(50),
             seed: Some(42),

@@ -1,15 +1,15 @@
-0.00.673.753 I 
-0.00.673.792 I system_info: n_threads = 4 (n_threads_batch = 4) / 10 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | SME = 1 | ACCELERATE = 1 | OPENMP = 1 | REPACK = 1 | 
-0.00.673.793 I 
-0.00.673.954 I number of input tokens = 8
-0.00.673.956 I   128000
-0.00.673.957 I   849
-0.00.673.957 I   21435
-0.00.673.957 I   1148
-0.00.673.957 I   264
-0.00.673.957 I   30828
-0.00.673.957 I   4009
-0.00.673.958 I   374
+0.01.077.948 I 
+0.01.077.975 I system_info: n_threads = 4 (n_threads_batch = 4) / 10 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | SME = 1 | ACCELERATE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.01.077.975 I 
+0.01.078.027 I number of input tokens = 8
+0.01.078.027 I   128000
+0.01.078.027 I   849
+0.01.078.027 I   21435
+0.01.078.027 I   1148
+0.01.078.027 I   264
+0.01.078.028 I   30828
+0.01.078.028 I   4009
+0.01.078.028 I   374
 common_debug_cb_eval:                     embd = (f32)   GET_ROWS(token_embd.weight{2048, 128256, 1, 1}, inp_tokens{8, 1, 1, 1}}) = {2048, 8, 1, 1}
     [
         [

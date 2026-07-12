@@ -285,6 +285,12 @@ fn parse_gguf_mmap(mmap: Mmap) -> Result<GgufFile, GgufError> {
         for _ in 0..n_dims {
             shape.push(cursor.read_u64::<LittleEndian>()?);
         }
+        // GGUF stores dims as ggml's ne[], where ne[0] is the fastest-varying
+        // (innermost) dimension. Our Shape/stride machinery assumes standard
+        // row-major order, where the LAST dimension is fastest-varying.
+        // Reverse here, once, at the source, so every downstream consumer of
+        // `shape` gets dims consistent with the actual physical byte layout.
+        shape.reverse();
         let dtype_raw = cursor.read_u32::<LittleEndian>()?;
         let dtype = GgufDType::from_u32(dtype_raw).ok_or(GgufError::UnknownDType(dtype_raw))?;
         let offset = cursor.read_u64::<LittleEndian>()?;
@@ -356,6 +362,11 @@ pub fn parse_gguf(buffer: &[u8]) -> Result<GgufFile, GgufError> {
         for _ in 0..n_dims {
             shape.push(cursor.read_u64::<LittleEndian>()?);
         }
+        // See comment in the other parse function: GGUF's ne[] is
+        // fastest-dim-first (ggml-native); reverse to standard row-major
+        // (fastest-dim-last) so Shape/stride math downstream is consistent
+        // with the actual physical byte layout.
+        shape.reverse();
         let dtype_raw = cursor.read_u32::<LittleEndian>()?;
         let dtype = GgufDType::from_u32(dtype_raw).ok_or(GgufError::UnknownDType(dtype_raw))?;
         let offset = cursor.read_u64::<LittleEndian>()?;

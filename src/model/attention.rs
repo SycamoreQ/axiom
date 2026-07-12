@@ -101,7 +101,43 @@ impl<B: Backend> Attention<B> {
         let batch = x.shape().dim(0)?;
         let seq_len = x.shape().dim(1)?;
 
-        let q = self.q_proj.forward(x)?.reshape(&Shape::new(&[
+        let q_pre_reshape = self.q_proj.forward(x)?;
+        if offset == 0 {
+            let qv = q_pre_reshape.to_vec_f32()?;
+            let hs = self.num_heads * self.head_dim;
+            eprintln!(
+                "Qcur ROW0 (pre-RoPE) first3={:?} last3={:?}",
+                &qv[0..3],
+                &qv[hs - 3..hs]
+            );
+
+            // Manual matmul bypassing Linear::forward's transpose()+broadcast_matmul
+            // entirely, to isolate: is attn_q.weight's data wrong, or is the
+            // transpose/broadcast_matmul path wrong? Assumes weight is stored
+            // [out_features, in_features] row-major, W_raw[o*in + i].
+            let w = self.q_proj.weight().to_vec_f32()?;
+            let x_row0 = x.to_vec_f32()?;
+            let hidden = x.shape().dims()[x.shape().rank() - 1];
+            let manual: Vec<f32> = (0..3)
+                .map(|o| {
+                    (0..hidden)
+                        .map(|i| x_row0[i] * w[o * hidden + i])
+                        .sum::<f32>()
+                })
+                .collect();
+            let manual_last: Vec<f32> = (hs - 3..hs)
+                .map(|o| {
+                    (0..hidden)
+                        .map(|i| x_row0[i] * w[o * hidden + i])
+                        .sum::<f32>()
+                })
+                .collect();
+            eprintln!(
+                "Qcur ROW0 MANUAL (raw weight, no transpose()) first3={:?} last3={:?}",
+                manual, manual_last
+            );
+        }
+        let q = q_pre_reshape.reshape(&Shape::new(&[
             batch,
             seq_len,
             self.num_heads,

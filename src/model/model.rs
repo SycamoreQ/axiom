@@ -193,11 +193,9 @@ impl<B: Backend> LlamaModel<B> {
 
         match kind {
             LlamaTensor::TokenEmbd => {
-                let tensor = if tensor.shape().dim(0)? < tensor.shape().dim(1)? {
-                    tensor.transpose(0, 1)?.contiguous()?
-                } else {
-                    tensor
-                };
+                // Shape is now correctly row-major at the source (gguf.rs
+                // reverses ne[] on parse), so no orientation heuristic is
+                // needed or safe here anymore — trust the shape as-is.
                 self.embedding = Embedding::new(tensor);
                 let raw = self.embedding.weight().to_vec_f32()?;
                 eprintln!(

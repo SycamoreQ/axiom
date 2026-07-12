@@ -87,6 +87,11 @@ impl<B: Backend> Block<B> {
             eprintln!(
                 "{label}: mean={mean:.4} std={std:.4} min={min:.4} max={max:.4} nan={nan_count}"
             );
+            eprintln!(
+                "{label} ROW0 first3={:?} last3={:?}",
+                &v[0..3],
+                &v[v.len() - 3..]
+            );
             Ok(())
         };
 

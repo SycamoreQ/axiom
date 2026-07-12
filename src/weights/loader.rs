@@ -307,16 +307,10 @@ pub fn load_from_gguf<B: Backend>(
             has_output_weight = true;
         }
         if matches!(kind, LlamaTensor::TokenEmbd) {
-            let normalized = if tensor.shape().dim(0)? < tensor.shape().dim(1)? {
-                tensor.transpose(0, 1)?.contiguous()?
-            } else {
-                tensor.clone()
-            };
-            eprintln!(
-                "token_embd normalized shape: {:?}",
-                normalized.shape().dims()
-            );
-            token_embd_tensor = Some(normalized);
+            // Shape is correct at the source now (see gguf.rs) — no
+            // orientation heuristic needed here either.
+            eprintln!("token_embd normalized shape: {:?}", tensor.shape().dims());
+            token_embd_tensor = Some(tensor.clone());
         }
 
         model
