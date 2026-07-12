@@ -1401,21 +1401,27 @@ impl TensorOps for MetalTensor {
         // Inner dimension
         let k = self.shape.dims()[rank - 1];
 
-        // Determine N and whether other is already [K, N] or [N, K]
-        let (n, w_is_transposed) = if other_rank == 2 {
-            if other.shape.dims()[1] == k {
-                // other is [N, K]
-                (other.shape.dims()[0], false)
-            } else if other.shape.dims()[0] == k {
-                // other is [K, N]
-                (other.shape.dims()[1], true)
-            } else {
-                return Err(CoreError::Internal("matmul shape mismatch".into()));
+        // `other` is always expected in [..., K, N] form — every call site in
+        // this codebase (Linear::forward, attention QK^T/softmax@V) already
+        // explicitly transposes its second operand into this form before
+        // calling broadcast_matmul. The previous version tried to guess
+        // orientation by comparing shape dims against k, which is genuinely
+        // ambiguous whenever K == N (e.g. attn_q/attn_o's square 2048x2048
+        // weight) and silently picked the wrong branch in that case.
+        let n = if other_rank == 2 {
+            if other.shape.dims()[0] != k {
+                return Err(CoreError::Internal(format!(
+                    "matmul shape mismatch: self.shape={:?} (k={}), other.shape={:?}",
+                    self.shape.dims(),
+                    k,
+                    other.shape.dims()
+                )));
             }
+            other.shape.dims()[1]
         } else {
-            // batched: last two dims are [..., K, N]
-            (other.shape.dims()[other_rank - 1], true)
+            other.shape.dims()[other_rank - 1]
         };
+        let w_is_transposed = true;
 
         let m_per = self.shape.dims()[rank - 2];
         let batch_self: usize = self.shape.dims()[..rank - 2].iter().product();

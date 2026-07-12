@@ -61,7 +61,6 @@ impl<B: Backend> Attention<B> {
         })
     }
 
-    // --- CPU RoPE fallback (replace the Metal rope call) ---
     pub fn apply_cpu_rope(
         x: &B::Tensor,
         offset: usize,
@@ -81,10 +80,10 @@ impl<B: Backend> Attention<B> {
                     let (sin_a, cos_a) = angle.sin_cos();
                     let sin_a = sin_a as f32;
                     let cos_a = cos_a as f32;
-                    let x0 = data[idx + i];
-                    let x1 = data[idx + i + head_dim / 2];
-                    out[idx + i] = x0 * cos_a - x1 * sin_a;
-                    out[idx + i + head_dim / 2] = x0 * sin_a + x1 * cos_a;
+                    let x0 = data[idx + 2 * i];
+                    let x1 = data[idx + 2 * i + 1];
+                    out[idx + 2 * i] = x0 * cos_a - x1 * sin_a;
+                    out[idx + 2 * i + 1] = x0 * sin_a + x1 * cos_a;
                 }
             }
         }

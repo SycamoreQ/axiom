@@ -63,13 +63,17 @@ impl<B: Backend> Block<B> {
         offset: usize,
     ) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
         let is_layer_0 = self.layer_idx == 0;
+        let is_mid_layer = self.layer_idx == 11;
+        let is_last_layer = self.layer_idx == 15;
         let is_first_token = offset == 0;
-        let should_dump = is_layer_0 && is_first_token;
+        let should_dump = (is_layer_0 || is_mid_layer || is_last_layer) && is_first_token;
+        let layer_idx = self.layer_idx;
 
         let dump = |label: &str, t: &B::Tensor| -> Result<()> {
             if !should_dump {
                 return Ok(());
             }
+            let label = format!("Layer {layer_idx} {label}");
 
             let hidden_size = *t.shape().dims().last().unwrap();
             let mut v = t.to_vec_f32()?;
@@ -96,27 +100,27 @@ impl<B: Backend> Block<B> {
         };
 
         // 1. Raw embedding output incoming to the layer block
-        dump("Layer 0 [1] - Raw Input", x)?;
+        dump("[1] - Raw Input", x)?;
 
         let h = self.attn_norm.forward(x)?;
 
         // 2. State metrics right after layer 0 input RmsNorm
-        dump("Layer 0 [2] - After Attn Norm", &h)?;
+        dump("[2] - After Attn Norm", &h)?;
 
         let (attn_out, new_k, new_v) = self.attn.forward(&h, mask, kv_cache, offset)?;
 
         // 3. Post-attention projection output
-        dump("Layer 0 [3] - Attn Out", &attn_out)?;
+        dump("[3] - Attn Out", &attn_out)?;
 
         let x = x.add(&attn_out)?;
 
         // 4. State metrics after adding attention residual context
-        dump("Layer 0 [4] - After Attn Residual", &x)?;
+        dump("[4] - After Attn Residual", &x)?;
 
         let h = self.ffn_norm.forward(&x)?;
 
         // 5. State metrics post-FFN input norm normalization step
-        dump("Layer 0 [5] - After FFN Norm", &h)?;
+        dump("[5] - After FFN Norm", &h)?;
 
         let ffn_out = match &mut self.ffn {
             FeedForwardLayer::Dense(ff) => ff.forward(&h)?,
@@ -124,12 +128,12 @@ impl<B: Backend> Block<B> {
         };
 
         // 6. Dense SwiGLU FFN layer evaluation context
-        dump("Layer 0 [6] - FFN Out", &ffn_out)?;
+        dump("[6] - FFN Out", &ffn_out)?;
 
         let x = x.add(&ffn_out)?;
 
         // 7. Complete single layer block evaluation with both residual paths merged
-        dump("Layer 0 [7] - After FFN Residual", &x)?;
+        dump("[7] - After FFN Residual", &x)?;
 
         Ok((x, new_k, new_v))
     }

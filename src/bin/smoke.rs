@@ -82,7 +82,7 @@ fn main() {
             top_k: Some(50),
             seed: Some(42),
             max_new_tokens,
-            repetition_penalty: 1.4,
+            repetition_penalty: 1.0,
             vocab_size: Some(vocab_size),
         };
 
