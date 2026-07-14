@@ -245,7 +245,7 @@ mod tests {
         Device::Cpu
     }
 
-    fn make_config() -> ModelConfig {
+    pub(super) fn make_config() -> ModelConfig {
         ModelConfig {
             hidden_size: 64,
             num_hidden_layers: 2,
@@ -257,6 +257,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             hidden_act: "silu".to_string(),
             rope_theta: 10000.0,
+            rope_freqs: None,
             rope_scaling: None,
             num_local_experts: None,
             num_experts_per_tok: None,
@@ -317,5 +318,29 @@ mod tests {
         let x = CandleTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &cpu()).unwrap();
         let (out, _, _) = attn.forward(&x, None, None, 0).unwrap();
         assert_eq!(out.shape(), &Shape::new(&[1, 4, 64]));
+    }
+
+    #[test]
+    fn test_apply_cpu_rope_matches_llama_cpp_ground_truth() {
+        let head_dim = 64usize;
+        let mut data = vec![0.0f32; 2 * head_dim]; // seq_len=2, n_heads=1
+        data[head_dim] = 0.4288; // position 1, channel 0 (pre-RoPE Q)
+        data[head_dim + 1] = -0.2099; // position 1, channel 1 (pre-RoPE Q)
+        data[head_dim + 2] = 1.1587; // position 1, channel 2
+
+        let x = CandleTensor::from_slice(&data, &Shape::new(&[1, 2, 1, head_dim]), &cpu()).unwrap();
+        let out = Attention::<CandleBackend>::apply_cpu_rope(&x, 0, 500000.0, head_dim).unwrap();
+        let out = out.to_vec_f32().unwrap();
+
+        assert!(
+            (out[head_dim] - 0.4083).abs() < 1e-3,
+            "channel 0 @ pos 1: got {}, want 0.4083",
+            out[head_dim]
+        );
+        assert!(
+            (out[head_dim + 1] - 0.2474).abs() < 1e-3,
+            "channel 1 @ pos 1: got {}, want 0.2474",
+            out[head_dim + 1]
+        );
     }
 }

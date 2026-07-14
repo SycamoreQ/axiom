@@ -608,18 +608,18 @@ mod tests {
         theta: f32,
     ) -> Vec<f32> {
         let mut out = input.to_vec();
-        for token in 0..seq_len {
+        for pos in 0..seq_len {
             for head in 0..n_heads {
-                let idx = (token * n_heads + head) * head_dim;
-                let row = &mut out[idx..idx + head_dim];
+                let row = &mut out[(pos * n_heads + head) * head_dim..];
                 for i in 0..head_dim / 2 {
                     let freq = 1.0f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
-                    let angle = token as f32 * freq;
+                    let angle = pos as f32 * freq;
                     let (sin_a, cos_a) = angle.sin_cos();
-                    let x0 = row[i];
-                    let x1 = row[i + head_dim / 2];
-                    row[i] = x0 * cos_a - x1 * sin_a;
-                    row[i + head_dim / 2] = x0 * sin_a + x1 * cos_a;
+                    // BUGFIX: Interleaved pairing (2i, 2i+1)
+                    let x0 = row[2 * i];
+                    let x1 = row[2 * i + 1];
+                    row[2 * i] = x0 * cos_a - x1 * sin_a;
+                    row[2 * i + 1] = x0 * sin_a + x1 * cos_a;
                 }
             }
         }
@@ -1265,6 +1265,78 @@ mod tests {
                 let got = out_ptr.add(i).read().to_f32();
                 assert!((got - expected_out[i]).abs() < 0.05);
             }
+        }
+    }
+
+    #[test]
+    fn test_rope_ref_matches_llama_cpp_ground_truth() {
+        let head_dim = 8usize;
+        let seq_len = 2usize;
+        let n_heads = 1usize;
+        let mut input = vec![0.0f32; seq_len * n_heads * head_dim];
+        input[head_dim] = 0.4288; // position 1, channel 0 (pre-RoPE Q)
+        input[head_dim + 1] = -0.2099; // position 1, channel 1 (pre-RoPE Q)
+
+        let out = rope_ref(&input, seq_len, n_heads, head_dim, 500000.0);
+
+        assert!(
+            (out[head_dim] - 0.4083).abs() < 1e-3,
+            "channel 0 @ pos 1: got {}, want 0.4083 (llama.cpp ground truth)",
+            out[head_dim]
+        );
+        assert!(
+            (out[head_dim + 1] - 0.2474).abs() < 1e-3,
+            "channel 1 @ pos 1: got {}, want 0.2474 (llama.cpp ground truth)",
+            out[head_dim + 1]
+        );
+    }
+
+    #[test]
+    fn test_rope_f16_kernel_matches_llama_cpp_ground_truth() {
+        let (ctx, mut alloc, kernels) = setup();
+        let n_heads = 1usize;
+        let head_dim = 8usize;
+        let seq_len = 2usize;
+
+        let mut input_f32 = vec![0.0f32; seq_len * n_heads * head_dim];
+        input_f32[head_dim] = 0.4288;
+        input_f32[head_dim + 1] = -0.2099;
+
+        let block_size = input_f32.len() * std::mem::size_of::<f16>();
+        let x_block = alloc.alloc(block_size, 16).unwrap();
+        unsafe {
+            let ptr = x_block.ptr as *mut f16;
+            for i in 0..input_f32.len() {
+                ptr.add(i).write(f16::from_f32(input_f32[i]));
+            }
+        }
+
+        kernels
+            .rope_f16(
+                &ctx,
+                &alloc,
+                &x_block,
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                500000.0,
+            )
+            .unwrap();
+
+        unsafe {
+            let ptr = x_block.ptr as *const f16;
+            let got0 = ptr.add(head_dim).read().to_f32();
+            let got1 = ptr.add(head_dim + 1).read().to_f32();
+            assert!(
+                (got0 - 0.4083).abs() < 1e-2,
+                "channel 0 @ pos 1: got {}, want 0.4083",
+                got0
+            );
+            assert!(
+                (got1 - 0.2474).abs() < 1e-2,
+                "channel 1 @ pos 1: got {}, want 0.2474",
+                got1
+            );
         }
     }
 }

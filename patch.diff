@@ -1,0 +1,173 @@
+diff --git a/src/metal/kernels.rs b/src/metal/kernels.rs
+index f5acc77..9ee3ce6 100644
+--- a/src/metal/kernels.rs
++++ b/src/metal/kernels.rs
+@@ -600,6 +600,13 @@ mod tests {
+             .collect()
+     }
+ 
++    // BUGFIX: this used to rotate split-half pairs (i, i+head_dim/2) -- the
++    // exact same wrong convention the rope_f16 kernel it validates also had.
++    // A "reference" with the identical bug as the thing it checks proves
++    // nothing; test_rope_multi_token was passing for the wrong reason.
++    // Interleaved pairing (2i, 2i+1) is what GGUF-loaded Llama weights
++    // actually need -- see attention::apply_cpu_rope for the derivation
++    // and the ground_truth.txt cross-check.
+     fn rope_ref(
+         input: &[f32],
+         seq_len: usize,
+@@ -616,10 +623,10 @@ mod tests {
+                     let freq = 1.0f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
+                     let angle = token as f32 * freq;
+                     let (sin_a, cos_a) = angle.sin_cos();
+-                    let x0 = row[i];
+-                    let x1 = row[i + head_dim / 2];
+-                    row[i] = x0 * cos_a - x1 * sin_a;
+-                    row[i + head_dim / 2] = x0 * sin_a + x1 * cos_a;
++                    let x0 = row[2 * i];
++                    let x1 = row[2 * i + 1];
++                    row[2 * i] = x0 * cos_a - x1 * sin_a;
++                    row[2 * i + 1] = x0 * sin_a + x1 * cos_a;
+                 }
+             }
+         }
+@@ -945,6 +952,95 @@ mod tests {
+         }
+     }
+ 
++    // --- External ground-truth pins ---
++    //
++    // Everything above only checks internal agreement (kernel vs rope_ref,
++    // or "does something change"). None of it can catch a channel-pairing
++    // convention that's wrong in the same way everywhere -- which is
++    // literally what happened here. These two pin against llama.cpp's
++    // actual output for blk.0, position 1, head 0 (ground_truth.txt),
++    // theta=500000.0 (Llama 3's real rope_theta). freq for pair i=0 is
++    // theta^0=1.0 regardless of theta or head_dim, and interleaved pairing
++    // puts i=0 on channels (0,1) regardless of head_dim, so head_dim=8 here
++    // is fine -- it's still testing the real convention, just cheaply.
++
++    #[test]
++    fn test_rope_ref_matches_llama_cpp_ground_truth() {
++        let head_dim = 8usize;
++        let seq_len = 2usize;
++        let n_heads = 1usize;
++        let mut input = vec![0.0f32; seq_len * n_heads * head_dim];
++        input[head_dim] = 0.4288; // position 1, channel 0 (pre-RoPE Q)
++        input[head_dim + 1] = -0.2099; // position 1, channel 1 (pre-RoPE Q)
++
++        let out = rope_ref(&input, seq_len, n_heads, head_dim, 500000.0);
++
++        assert!(
++            (out[head_dim] - 0.4083).abs() < 1e-3,
++            "channel 0 @ pos 1: got {}, want 0.4083 (llama.cpp ground truth)",
++            out[head_dim]
++        );
++        assert!(
++            (out[head_dim + 1] - 0.2474).abs() < 1e-3,
++            "channel 1 @ pos 1: got {}, want 0.2474 (llama.cpp ground truth)",
++            out[head_dim + 1]
++        );
++    }
++
++    #[test]
++    fn test_rope_f16_kernel_matches_llama_cpp_ground_truth() {
++        // EXPECTED TO FAIL until rope_f16.metal gets the interleaved-pairing
++        // fix (still uses row[i]/row[i+head_dim/2] as of this test being
++        // added). Un-ignore nothing -- leave this red on purpose; it's the
++        // checklist item for that fix. See apply_cpu_rope in attention.rs
++        // for the already-landed CPU-side version of the same change.
++        let (ctx, mut alloc, kernels) = setup();
++        let n_heads = 1usize;
++        let head_dim = 8usize;
++        let seq_len = 2usize;
++
++        let mut input_f32 = vec![0.0f32; seq_len * n_heads * head_dim];
++        input_f32[head_dim] = 0.4288;
++        input_f32[head_dim + 1] = -0.2099;
++
++        let block_size = input_f32.len() * std::mem::size_of::<f16>();
++        let x_block = alloc.alloc(block_size, 16).unwrap();
++        unsafe {
++            let ptr = x_block.ptr as *mut f16;
++            for i in 0..input_f32.len() {
++                ptr.add(i).write(f16::from_f32(input_f32[i]));
++            }
++        }
++
++        kernels
++            .rope_f16(
++                &ctx,
++                &alloc,
++                &x_block,
++                seq_len as u32,
++                n_heads as u32,
++                head_dim as u32,
++                500000.0,
++            )
++            .unwrap();
++
++        unsafe {
++            let ptr = x_block.ptr as *const f16;
++            let got0 = ptr.add(head_dim).read().to_f32();
++            let got1 = ptr.add(head_dim + 1).read().to_f32();
++            assert!(
++                (got0 - 0.4083).abs() < 1e-2,
++                "channel 0 @ pos 1: got {}, want 0.4083 (llama.cpp ground truth)",
++                got0
++            );
++            assert!(
++                (got1 - 0.2474).abs() < 1e-2,
++                "channel 1 @ pos 1: got {}, want 0.2474 (llama.cpp ground truth)",
++                got1
++            );
++        }
++    }
++
+     #[test]
+     fn test_rope_different_positions_differ() {
+         let (ctx, mut alloc, kernels) = setup();
+diff --git a/src/model/attention.rs b/src/model/attention.rs
+index 5d8eefc..4694df1 100644
+--- a/src/model/attention.rs
++++ b/src/model/attention.rs
+@@ -309,4 +309,40 @@ mod tests {
+         let (out, _, _) = attn.forward(&x, None, None, 0).unwrap();
+         assert_eq!(out.shape(), &Shape::new(&[1, 4, 64]));
+     }
++
++    // External ground-truth pin, counterpart to
++    // metal::kernels::tests::test_rope_ref_matches_llama_cpp_ground_truth.
++    //
++    // Every other test in this module uses CandleTensor::zeros() as input.
++    // Rotating an all-zero vector gives zero back under ANY pairing
++    // convention, correct or not -- so none of those tests could have
++    // caught the split-half/interleaved bug even in principle, regardless
++    // of what they asserted on. This one uses real, non-zero pre-RoPE Q
++    // values pulled from llama.cpp's ground_truth.txt (blk.0, position 1,
++    // head 0) and checks against llama.cpp's actual post-RoPE output,
++    // theta=500000.0 (Llama 3's real rope_theta).
++    #[test]
++    fn test_apply_cpu_rope_matches_llama_cpp_ground_truth() {
++        let head_dim = 64usize;
++        let mut data = vec![0.0f32; 2 * head_dim]; // seq_len=2, n_heads=1
++        data[head_dim] = 0.4288; // position 1, channel 0 (pre-RoPE Q)
++        data[head_dim + 1] = -0.2099; // position 1, channel 1 (pre-RoPE Q)
++        data[head_dim + 2] = 1.1587; // position 1, channel 2 (pre-RoPE Q, untouched by pair i=0)
++
++        let x =
++            CandleTensor::from_slice(&data, &Shape::new(&[1, 2, 1, head_dim]), &cpu()).unwrap();
++        let out = Attention::<CandleBackend>::apply_cpu_rope(&x, 0, 500000.0, head_dim).unwrap();
++        let out = out.to_vec_f32().unwrap();
++
++        assert!(
++            (out[head_dim] - 0.4083).abs() < 1e-3,
++            "channel 0 @ pos 1: got {}, want 0.4083 (llama.cpp ground truth)",
++            out[head_dim]
++        );
++        assert!(
++            (out[head_dim + 1] - 0.2474).abs() < 1e-3,
++            "channel 1 @ pos 1: got {}, want 0.2474 (llama.cpp ground truth)",
++            out[head_dim + 1]
++        );
++    }

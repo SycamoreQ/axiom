@@ -197,7 +197,7 @@ mod tests {
         Device::Cpu
     }
 
-    fn make_dense_config() -> ModelConfig {
+    pub(super) fn make_dense_config() -> ModelConfig {
         ModelConfig {
             hidden_size: 64,
             num_hidden_layers: 4,
@@ -209,6 +209,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             hidden_act: "silu".to_string(),
             rope_theta: 10000.0,
+            rope_freqs: None,
             rope_scaling: None,
             num_local_experts: None,
             num_experts_per_tok: None,
@@ -233,6 +234,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             hidden_act: "silu".to_string(),
             rope_theta: 10000.0,
+            rope_freqs: None,
             rope_scaling: None,
             num_local_experts: Some(4),
             num_experts_per_tok: Some(2),

@@ -206,6 +206,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             hidden_act: "silu".to_string(),
             rope_theta: 10000.0,
+            rope_freqs: None,
             rope_scaling: None,
             num_local_experts: None,
             num_experts_per_tok: None,

@@ -831,6 +831,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             hidden_act: "silu".to_string(),
             rope_theta: 10000.0,
+            rope_freqs: None,
             rope_scaling: None,
             num_local_experts: Some(4),
             num_experts_per_tok: Some(2),
@@ -842,9 +843,6 @@ mod tests {
             model_type: Some("deepseek".to_string()),
         }
     }
-
-    // --- PreGateBuffer ---
-
     #[test]
     fn test_pregate_buffer_write_read() {
         let mut buf = PreGateBuffer::new(16);

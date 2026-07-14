@@ -109,7 +109,7 @@ mod tests {
     }
 
     fn make_rope(head_dim: usize, max_seq_len: usize) -> RotaryEmbedding<CandleBackend> {
-        RotaryEmbedding::new(head_dim, max_seq_len, 10000.0, &cpu()).unwrap()
+        RotaryEmbedding::new(head_dim, max_seq_len, 10000.0, None, &cpu()).unwrap()
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn test_different_rope_theta() {
         // LLaMA 3 uses 500000.0
-        let rope = RotaryEmbedding::<CandleBackend>::new(64, 128, 500000.0, &cpu()).unwrap();
+        let rope = RotaryEmbedding::<CandleBackend>::new(64, 128, 500000.0, None, &cpu()).unwrap();
         let x = CandleTensor::ones(&Shape::new(&[1, 4, 4, 64]), DType::F32, &cpu()).unwrap();
         let out = rope.forward(&x, 0).unwrap();
         assert_eq!(out.shape(), &Shape::new(&[1, 4, 4, 64]));
