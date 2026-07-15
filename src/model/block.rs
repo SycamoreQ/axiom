@@ -98,13 +98,9 @@ impl<B: Backend> Block<B> {
             );
             Ok(())
         };
-
-        // 1. Raw embedding output incoming to the layer block
         dump("[1] - Raw Input", x)?;
 
         let h = self.attn_norm.forward(x)?;
-
-        // 2. State metrics right after layer 0 input RmsNorm
         dump("[2] - After Attn Norm", &h)?;
 
         let (attn_out, new_k, new_v) = self.attn.forward(&h, mask, kv_cache, offset)?;

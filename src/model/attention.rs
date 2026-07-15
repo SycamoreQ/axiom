@@ -297,14 +297,11 @@ mod tests {
         let attn = Attention::<CandleBackend>::new(&config, &cpu()).unwrap();
         let x = CandleTensor::zeros(&Shape::new(&[1, 4, 64]), DType::F32, &cpu()).unwrap();
 
-        // first forward — no cache
         let (_, k, v) = attn.forward(&x, None, None, 0).unwrap();
 
-        // second forward — with cache, single new token
         let x2 = CandleTensor::zeros(&Shape::new(&[1, 1, 64]), DType::F32, &cpu()).unwrap();
         let (out2, k2, v2) = attn.forward(&x2, None, Some((&k, &v)), 4).unwrap();
         assert_eq!(out2.shape(), &Shape::new(&[1, 1, 64]));
-        // kv cache should now have 5 positions
         assert_eq!(k2.shape().dim(1).unwrap(), 5);
         assert_eq!(v2.shape().dim(1).unwrap(), 5);
     }

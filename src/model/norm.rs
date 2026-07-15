@@ -13,6 +13,18 @@ impl<B: Backend> RmsNorm<B> {
     }
 
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
+        // TEMP DEBUG - remove once the zero-norm-weight question is settled
+        let w = self.weight.to_vec_f32()?;
+        let (wmin, wmax) = w
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
+        eprintln!(
+            "RmsNorm::forward weight dtype={:?} shape={:?} min={} max={}",
+            self.weight.dtype(),
+            self.weight.shape().dims(),
+            wmin,
+            wmax
+        );
         x.rms_norm(&self.weight, self.eps)
     }
 

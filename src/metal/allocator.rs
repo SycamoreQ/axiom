@@ -18,6 +18,29 @@ pub struct BlockHandle {
 unsafe impl Send for BlockHandle {}
 unsafe impl Sync for BlockHandle {}
 
+impl BlockHandle {
+    /// The MTLBuffer this block's data actually lives in.
+    ///
+    /// Blocks from the pooled MetalAllocator (Self::zeros/ones, and anything
+    /// allocated via alloc.alloc directly) live inside allocator.buffer() at
+    /// offset_bytes. Blocks created by from_bytes_direct -- which is every
+    /// GGUF-loaded weight, since that's what Tensor::from_slice and the
+    /// loader route through -- get their own dedicated MTLBuffer instead,
+    /// stored here, with offset_bytes always 0 *relative to that buffer*,
+    /// not the pool. Kernel wrappers must bind the right one of these two,
+    /// not unconditionally the pool -- binding the pool for an owned-buffer
+    /// block reads whatever unrelated data sits at that pool offset instead
+    /// of this block's actual contents.
+    pub fn metal_buffer<'a>(
+        &'a self,
+        allocator: &'a MetalAllocator,
+    ) -> &'a ProtocolObject<dyn MTLBuffer> {
+        self.owned_buffer
+            .as_deref()
+            .unwrap_or_else(|| allocator.buffer())
+    }
+}
+
 pub struct FreeBlock {
     pub offset_bytes: usize,
     pub size: usize,

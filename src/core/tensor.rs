@@ -1207,25 +1207,11 @@ impl TensorOps for MetalTensor {
     }
 
     fn matmul(&self, other: &Self) -> Result<Self> {
-        let m = self.shape.dims()[0];
-        let k = self.shape.dims()[1];
-        let n = other.shape.dims()[1];
-
-        let a = self.to_vec_f32()?;
-        let b = other.to_vec_f32()?;
-        let mut c = vec![0.0f32; m * n];
-
-        for i in 0..m {
-            for j in 0..n {
-                let mut sum = 0.0;
-                for l in 0..k {
-                    sum += a[i * k + l] * b[l * n + j];
-                }
-                c[i * n + j] = sum;
-            }
-        }
-        let out_tensor = Self::from_slice(&c, &Shape::new(&[m, n]), &self.device)?;
-        out_tensor.to_dtype(self.dtype)
+        // 2D matmul is just the batch_out=1 case of broadcast_matmul, and
+        // the orientation convention (other in [K,N] form) is identical --
+        // delegating avoids maintaining two separate Metal dispatch paths
+        // for the same op that could silently drift apart.
+        self.broadcast_matmul(other)
     }
 
     fn broadcast_add(&self, other: &Self) -> Result<Self> {
@@ -1370,44 +1356,49 @@ impl TensorOps for MetalTensor {
         Ok(output)
     }
 
-    /// NON APPLE FOR NOW
     fn rms_norm(&self, weight: &Self, eps: f32) -> Result<Self> {
         let hidden = *self.shape.dims().last().unwrap();
         let num_tokens = self.shape.numel() / hidden;
-        let src = self.to_vec_f32()?;
-        let wgt = weight.to_vec_f32()?;
 
-        let mut out = vec![0.0f32; src.len()];
-        for t in 0..num_tokens {
-            let row_start = t * hidden;
-            let row = &src[row_start..row_start + hidden];
-            let ms = row.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
-            let rms = (ms + eps).sqrt();
-            for i in 0..hidden {
-                out[row_start + i] = row[i] * wgt[i] / rms;
-            }
+        let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
+        let state = self.state.clone();
+        eprintln!(
+            "rms_norm: self.dtype={:?} weight.dtype={:?}",
+            self.dtype, weight.dtype
+        );
+
+        match self.dtype {
+            DType::F32 => state.kernels.rms_norm_f32(
+                &state.ctx,
+                &state.alloc.lock().unwrap(),
+                &self.block,
+                &weight.block,
+                &output.block,
+                num_tokens as u32,
+                hidden as u32,
+                eps,
+            )?,
+            DType::F16 => state.kernels.rms_norm_f16(
+                &state.ctx,
+                &state.alloc.lock().unwrap(),
+                &self.block,
+                &weight.block,
+                &output.block,
+                num_tokens as u32,
+                hidden as u32,
+                eps,
+            )?,
+            _ => return Err(CoreError::Internal("rms_norm: unsupported dtype".into())),
         }
-        Self::from_slice(&out, &self.shape, &self.device)
+
+        Ok(output)
     }
 
     fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
-        // Read both tensors into CPU memory
-        let a = self.to_vec_f32()?;
-        let w_orig = other.to_vec_f32()?;
-
         let rank = self.shape.rank();
         let other_rank = other.shape.rank();
-
-        // Inner dimension
         let k = self.shape.dims()[rank - 1];
 
-        // `other` is always expected in [..., K, N] form — every call site in
-        // this codebase (Linear::forward, attention QK^T/softmax@V) already
-        // explicitly transposes its second operand into this form before
-        // calling broadcast_matmul. The previous version tried to guess
-        // orientation by comparing shape dims against k, which is genuinely
-        // ambiguous whenever K == N (e.g. attn_q/attn_o's square 2048x2048
-        // weight) and silently picked the wrong branch in that case.
         let n = if other_rank == 2 {
             if other.shape.dims()[0] != k {
                 return Err(CoreError::Internal(format!(
@@ -1421,7 +1412,6 @@ impl TensorOps for MetalTensor {
         } else {
             other.shape.dims()[other_rank - 1]
         };
-        let w_is_transposed = true;
 
         let m_per = self.shape.dims()[rank - 2];
         let batch_self: usize = self.shape.dims()[..rank - 2].iter().product();
@@ -1432,48 +1422,66 @@ impl TensorOps for MetalTensor {
         };
         let batch_out = batch_self.max(batch_other);
 
-        let mut out = vec![0.0f32; batch_out * m_per * n];
+        let mut out_dims = Vec::new();
+        if batch_out > 1 {
+            out_dims.extend(self.shape.dims()[..rank - 2].iter());
+            if out_dims.is_empty() {
+                out_dims.push(batch_out);
+            }
+        }
+        out_dims.push(m_per);
+        out_dims.push(n);
+        let output = Self::zeros(&Shape::new(&out_dims), self.dtype, &self.device)?;
+
+        let state = self.state.clone();
+        let dtype_size = self.dtype.size_in_bytes();
+        let stride_a = m_per * k * dtype_size;
+        let stride_b = k * n * dtype_size;
+        let stride_c = m_per * n * dtype_size;
 
         for batch_idx in 0..batch_out {
             let self_b = if batch_self == 1 { 0 } else { batch_idx };
             let other_b = if batch_other == 1 { 0 } else { batch_idx };
 
-            let a_offset = self_b * m_per * k;
-            let w_offset = other_b * k * n; // only used when w_is_transposed
-            let c_offset = batch_idx * m_per * n;
+            let mut block_a = (*self.block).clone();
+            block_a.offset_bytes += self.offset_bytes + self_b * stride_a;
 
-            for i in 0..m_per {
-                for j in 0..n {
-                    let mut sum = 0.0;
-                    for p in 0..k {
-                        let a_val = a[a_offset + i * k + p];
-                        let w_val = if w_is_transposed {
-                            // w_orig is [..., K, N] → element (p, j) is at w_offset + p * n + j
-                            w_orig[w_offset + p * n + j]
-                        } else {
-                            // w_orig is [N, K] → element (p, j) is at other_b * (n*k) + j * k + p
-                            w_orig[other_b * n * k + j * k + p]
-                        };
-                        sum += a_val * w_val;
-                    }
-                    out[c_offset + i * n + j] = sum;
+            let mut block_b = (*other.block).clone();
+            block_b.offset_bytes += other.offset_bytes + other_b * stride_b;
+
+            let mut block_c = (*output.block).clone();
+            block_c.offset_bytes += batch_idx * stride_c;
+
+            match self.dtype {
+                DType::F32 => state.kernels.matmul_f32(
+                    &state.ctx,
+                    &state.alloc.lock().unwrap(),
+                    &block_a,
+                    &block_b,
+                    &block_c,
+                    m_per as u32,
+                    n as u32,
+                    k as u32,
+                )?,
+                DType::F16 => state.kernels.matmul_f16(
+                    &state.ctx,
+                    &state.alloc.lock().unwrap(),
+                    &block_a,
+                    &block_b,
+                    &block_c,
+                    m_per as u32,
+                    n as u32,
+                    k as u32,
+                )?,
+                _ => {
+                    return Err(CoreError::Internal(
+                        "broadcast_matmul: unsupported dtype".into(),
+                    ))
                 }
             }
         }
 
-        // Determine output shape
-        let mut final_shape = Vec::new();
-        if batch_out > 1 {
-            final_shape.extend(self.shape.dims()[..rank - 2].iter());
-            if final_shape.is_empty() {
-                final_shape.push(batch_out);
-            }
-        }
-        final_shape.push(m_per);
-        final_shape.push(n);
-        let shape = Shape::new(&final_shape);
-
-        Self::from_slice(&out, &shape, &self.device)
+        Ok(output)
     }
 
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
@@ -2127,5 +2135,86 @@ mod tests {
         let t = make_tensor(&[1.0; 24], &[2, 3, 4]);
         assert_eq!(t.rank(), 3);
         assert_eq!(t.numel(), 24);
+    }
+}
+
+#[cfg(feature = "metal")]
+#[cfg(test)]
+mod metal_matmul_tests {
+    use super::*;
+    use crate::core::device::Device;
+    use crate::core::dtype::DType;
+    use crate::core::shape::Shape;
+
+    fn ensure_metal_device() -> Device {
+        if crate::metal::state::global_metal_state().is_none() {
+            let _ = crate::metal::state::init_global_metal_state(1024 * 1024 * 100);
+        }
+        Device::Metal(0)
+    }
+
+    fn make_metal_tensor(data: &[f32], shape: &[usize]) -> MetalTensor {
+        let device = ensure_metal_device();
+        MetalTensor::from_slice(data, &Shape::new(shape), &device)
+            .expect("Failed to create MetalTensor from slice")
+    }
+
+    // Both operands go through from_slice -> from_bytes_direct, i.e. both
+    // get their own dedicated MTLBuffer (owned_buffer = Some(..)), same as
+    // every real GGUF-loaded weight does. This is deliberately the case
+    // that silently read garbage before BlockHandle::metal_buffer() existed
+    // -- kernel unit tests that only use pool-allocated blocks can't catch
+    // that class of bug at all, so this needs to construct real tensors.
+    //
+    // Square (K==N) on purpose: this is the exact case the orientation
+    // comment on broadcast_matmul calls out as ambiguous under the old
+    // guess-the-orientation logic. Wrong orientation and correct-buffer-
+    // wrong-math both land on a *different* wrong answer than a buffer
+    // bug would, so this test also discriminates between those failure
+    // modes if it ever fails again.
+    #[test]
+    fn test_metal_matmul_square_weight_orientation() {
+        let a = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]); // [M=2,K=2]
+        let w = make_metal_tensor(&[5.0, 6.0, 7.0, 8.0], &[2, 2]); // [K=2,N=2]
+
+        let out = a.matmul(&w).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[2, 2]));
+        // out[i,j] = sum_p a[i,p] * w[p,j], w read as [K,N] (not transposed)
+        assert_eq!(out.to_vec_f32().unwrap(), vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    // [batch, seq, hidden] x [hidden, out] is the actual shape every
+    // Linear::forward call in the model uses. Reuses the same numbers as
+    // the test above (split across the batch dim instead of one 2x2) so
+    // the expected values are already hand-verified -- this test is really
+    // checking that per-batch offsets (self_b * m_per * k, weight held
+    // fixed since batch_other==1) land in the right place, not the matmul
+    // arithmetic itself.
+    #[test]
+    fn test_metal_broadcast_matmul_batched_over_shared_weight() {
+        let a = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 1, 2]); // [batch=2, seq=1, K=2]
+        let w = make_metal_tensor(&[5.0, 6.0, 7.0, 8.0], &[2, 2]); // [K=2,N=2], broadcast over batch
+
+        let out = a.broadcast_matmul(&w).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[2, 1, 2]));
+        assert_eq!(out.to_vec_f32().unwrap(), vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    // narrow() leaves the underlying block untouched and only bumps the
+    // tensor-level offset_bytes -- confirms that offset actually gets
+    // folded into the kernel dispatch (a_base = block.offset_bytes +
+    // self.offset_bytes) instead of silently reading from the start of
+    // the block, which would happen if a kernel wrapper only looked at
+    // BlockHandle.offset_bytes the way the pasted-in production code
+    // sometimes does.
+    #[test]
+    fn test_metal_matmul_after_narrow() {
+        let full = make_metal_tensor(&[9.0, 9.0, 1.0, 2.0, 3.0, 4.0], &[3, 2]); // rows: junk, junk, real
+        let a = full.narrow(0, 1, 2).unwrap(); // drop the first junk row -> [[9,9]->gone] rows 1,2 = [1,2],[3,4]
+        let w = make_metal_tensor(&[5.0, 6.0, 7.0, 8.0], &[2, 2]);
+
+        let out = a.matmul(&w).unwrap();
+        assert_eq!(out.shape(), &Shape::new(&[2, 2]));
+        assert_eq!(out.to_vec_f32().unwrap(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 }

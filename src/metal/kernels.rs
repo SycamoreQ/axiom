@@ -14,7 +14,9 @@ use std::ptr::NonNull;
 const RMS_NORM_MSL: &str = include_str!("kernels/rms_norm_f16.metal");
 const RMS_NORM_F32_MSL: &str = include_str!("kernels/rms_norm_f32.metal");
 const ROPE_MSL: &str = include_str!("kernels/rope_f16.metal");
+const ROPE_F32_MSL: &str = include_str!("kernels/rope_f32.metal");
 const SWIGLU_MSL: &str = include_str!("kernels/swiglu_f16.metal");
+const SWIGLU_F32_MSL: &str = include_str!("kernels/swiglu_f32.metal");
 const MATMUL_MSL: &str = include_str!("kernels/matmul_f16.metal");
 const MATMUL_F32_MSL: &str = include_str!("kernels/matmul_f32.metal");
 const ATTN_QK_MSL: &str = include_str!("kernels/attention_qk_f16.metal");
@@ -24,7 +26,9 @@ pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rms_norm_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rope_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub rope_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub swiglu_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub swiglu_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub matmul_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub matmul_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_qk_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -37,7 +41,9 @@ impl std::fmt::Debug for MetalKernels {
             .field("rms_norm_pipeline", &"MTLComputePipelineState")
             .field("rm_norm_f32_pipeline", &"MTLComputePipelineState")
             .field("rope_pipeline", &"MTLComputePipelineState")
+            .field("rope_f32_pipeline", &"MTLComputePipelineState")
             .field("swiglu_pipeline", &"MTLComputePipelineState")
+            .field("swiglu_f32_pipeline", &"MTLComputePipelineState")
             .field("matmul_pipeline", &"MTLComputePipelineState")
             .field("matmul_f32_pipeline", &"MTLComputePipelineState")
             .field("attention_qk_pipeline", &"MTLComputePipelineState")
@@ -59,7 +65,6 @@ impl MetalKernels {
                         MetalError::LibraryCompilation(e.localizedDescription().to_string())
                     })?;
 
-                // Use from_str instead of ns_string! for dynamic variables
                 let func_name_ns = NSString::from_str(func_name);
                 let function = library
                     .newFunctionWithName(&func_name_ns)
@@ -74,7 +79,9 @@ impl MetalKernels {
             rms_norm_pipeline: build_pipeline(RMS_NORM_MSL, "rms_norm_f16")?,
             rms_norm_f32_pipeline: build_pipeline(RMS_NORM_F32_MSL, "rms_norm_f32")?,
             rope_pipeline: build_pipeline(ROPE_MSL, "rope_f16")?,
+            rope_f32_pipeline: build_pipeline(ROPE_F32_MSL, "rope_f32")?,
             swiglu_pipeline: build_pipeline(SWIGLU_MSL, "swiglu_f16")?,
+            swiglu_f32_pipeline: build_pipeline(SWIGLU_F32_MSL, "swiglu_f32")?,
             matmul_pipeline: build_pipeline(MATMUL_MSL, "matmul_f16")?,
             matmul_f32_pipeline: build_pipeline(MATMUL_F32_MSL, "matmul_f32")?,
             attention_qk_pipeline: build_pipeline(ATTN_QK_MSL, "attention_qk_f16")?,
@@ -101,9 +108,21 @@ impl MetalKernels {
         encoder.setComputePipelineState(&self.rms_norm_pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), input.offset_bytes, 0);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), weight.offset_bytes, 1);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), output.offset_bytes, 2);
+            encoder.setBuffer_offset_atIndex(
+                Some(input.metal_buffer(allocator)),
+                input.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(weight.metal_buffer(allocator)),
+                weight.offset_bytes,
+                1,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(output.metal_buffer(allocator)),
+                output.offset_bytes,
+                2,
+            );
 
             encoder.setBytes_length_atIndex(
                 NonNull::new_unchecked(&hidden as *const u32 as *mut c_void),
@@ -134,7 +153,7 @@ impl MetalKernels {
 
         encoder.endEncoding();
         cmd_buf.commit();
-        ////cmd_buf.waitUntilCompleted();
+        cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -158,9 +177,21 @@ impl MetalKernels {
         encoder.setComputePipelineState(&self.rms_norm_f32_pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), input.offset_bytes, 0);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), weight.offset_bytes, 1);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), output.offset_bytes, 2);
+            encoder.setBuffer_offset_atIndex(
+                Some(input.metal_buffer(allocator)),
+                input.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(weight.metal_buffer(allocator)),
+                weight.offset_bytes,
+                1,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(output.metal_buffer(allocator)),
+                output.offset_bytes,
+                2,
+            );
 
             encoder.setBytes_length_atIndex(
                 NonNull::new_unchecked(&hidden as *const u32 as *mut c_void),
@@ -191,11 +222,11 @@ impl MetalKernels {
 
         encoder.endEncoding();
         cmd_buf.commit();
-
-        ////cmd_buf.waitUntilCompleted();
+        cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
+
     pub fn rope_f16(
         &self,
         ctx: &MetalContext,
@@ -214,7 +245,7 @@ impl MetalKernels {
         encoder.setComputePipelineState(&self.rope_pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), x.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 0);
 
             encoder.setBytes_length_atIndex(
                 NonNull::new_unchecked(&seq_len as *const u32 as *mut c_void),
@@ -255,7 +286,71 @@ impl MetalKernels {
 
         encoder.endEncoding();
         cmd_buf.commit();
-        ////cmd_buf.waitUntilCompleted();
+        cmd_buf.waitUntilCompleted();
+
+        Ok(())
+    }
+
+    pub fn rope_f32(
+        &self,
+        ctx: &MetalContext,
+        allocator: &MetalAllocator,
+        x: &BlockHandle,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        theta: f32,
+    ) -> Result<()> {
+        let cmd_buf = ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
+
+        encoder.setComputePipelineState(&self.rope_f32_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 0);
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&seq_len as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_heads as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&head_dim as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&theta as *const f32 as *mut c_void),
+                std::mem::size_of::<f32>(),
+                4,
+            );
+        }
+
+        let grid = MTLSize {
+            width: seq_len as usize,
+            height: n_heads as usize,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -277,9 +372,17 @@ impl MetalKernels {
         encoder.setComputePipelineState(&self.swiglu_pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), gate.offset_bytes, 0);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), up.offset_bytes, 1);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), output.offset_bytes, 2);
+            encoder.setBuffer_offset_atIndex(
+                Some(gate.metal_buffer(allocator)),
+                gate.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(Some(up.metal_buffer(allocator)), up.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(
+                Some(output.metal_buffer(allocator)),
+                output.offset_bytes,
+                2,
+            );
 
             encoder.setBytes_length_atIndex(
                 NonNull::new_unchecked(&num_elements as *const u32 as *mut c_void),
@@ -305,7 +408,65 @@ impl MetalKernels {
 
         encoder.endEncoding();
         cmd_buf.commit();
-        ////cmd_buf.waitUntilCompleted();
+        cmd_buf.waitUntilCompleted();
+
+        Ok(())
+    }
+
+    pub fn swiglu_f32(
+        &self,
+        ctx: &MetalContext,
+        allocator: &MetalAllocator,
+        gate: &BlockHandle,
+        up: &BlockHandle,
+        output: &BlockHandle,
+        num_elements: u32,
+    ) -> Result<()> {
+        let cmd_buf = ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
+
+        encoder.setComputePipelineState(&self.swiglu_f32_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(gate.metal_buffer(allocator)),
+                gate.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(Some(up.metal_buffer(allocator)), up.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(
+                Some(output.metal_buffer(allocator)),
+                output.offset_bytes,
+                2,
+            );
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&num_elements as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let grid = MTLSize {
+            width: num_elements as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -329,9 +490,9 @@ impl MetalKernels {
         encoder.setComputePipelineState(&self.matmul_pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), a.offset_bytes, 0);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), b.offset_bytes, 1);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), c.offset_bytes, 2);
+            encoder.setBuffer_offset_atIndex(Some(a.metal_buffer(allocator)), a.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(b.metal_buffer(allocator)), b.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(c.metal_buffer(allocator)), c.offset_bytes, 2);
 
             encoder.setBytes_length_atIndex(
                 NonNull::new_unchecked(&m as *const u32 as *mut c_void),
@@ -368,7 +529,7 @@ impl MetalKernels {
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
             encoder.endEncoding();
             cmd_buf.commit();
-            //cmd_buf.waitUntilCompleted();
+            cmd_buf.waitUntilCompleted();
             Ok(())
         }
     }
@@ -392,12 +553,10 @@ impl MetalKernels {
         encoder.setComputePipelineState(&self.matmul_f32_pipeline);
 
         unsafe {
-            // Bind the tensor buffers
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), a.offset_bytes, 0);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), b.offset_bytes, 1);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), c.offset_bytes, 2);
+            encoder.setBuffer_offset_atIndex(Some(a.metal_buffer(allocator)), a.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(b.metal_buffer(allocator)), b.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(c.metal_buffer(allocator)), c.offset_bytes, 2);
 
-            // Bind the matrix dimensions
             encoder.setBytes_length_atIndex(
                 NonNull::new_unchecked(&m as *const u32 as *mut c_void),
                 std::mem::size_of::<u32>(),
@@ -437,7 +596,7 @@ impl MetalKernels {
 
         encoder.endEncoding();
         cmd_buf.commit();
-        //cmd_buf.waitUntilCompleted();
+        cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -463,9 +622,17 @@ impl MetalKernels {
         encoder.setComputePipelineState(&self.attention_qk_pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), q.offset_bytes, 0);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), k_cache.offset_bytes, 1);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), scores.offset_bytes, 2);
+            encoder.setBuffer_offset_atIndex(Some(q.metal_buffer(allocator)), q.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(
+                Some(k_cache.metal_buffer(allocator)),
+                k_cache.offset_bytes,
+                1,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(scores.metal_buffer(allocator)),
+                scores.offset_bytes,
+                2,
+            );
 
             encoder.setBytes_length_atIndex(
                 NonNull::new_unchecked(&n_heads as *const u32 as *mut c_void),
@@ -503,7 +670,7 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
             encoder.endEncoding();
             cmd_buf.commit();
-            //cmd_buf.waitUntilCompleted();
+            cmd_buf.waitUntilCompleted();
             Ok(())
         }
     }
@@ -529,9 +696,21 @@ impl MetalKernels {
         encoder.setComputePipelineState(&self.attention_pv_pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), scores.offset_bytes, 0);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), v_cache.offset_bytes, 1);
-            encoder.setBuffer_offset_atIndex(Some(allocator.buffer()), out.offset_bytes, 2);
+            encoder.setBuffer_offset_atIndex(
+                Some(scores.metal_buffer(allocator)),
+                scores.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(v_cache.metal_buffer(allocator)),
+                v_cache.offset_bytes,
+                1,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(out.metal_buffer(allocator)),
+                out.offset_bytes,
+                2,
+            );
 
             encoder.setBytes_length_atIndex(
                 NonNull::new_unchecked(&n_heads as *const u32 as *mut c_void),
@@ -570,7 +749,7 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
             encoder.endEncoding();
             cmd_buf.commit();
-            //cmd_buf.waitUntilCompleted();
+            cmd_buf.waitUntilCompleted();
             Ok(())
         }
     }
@@ -615,7 +794,6 @@ mod tests {
                     let freq = 1.0f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
                     let angle = pos as f32 * freq;
                     let (sin_a, cos_a) = angle.sin_cos();
-                    // BUGFIX: Interleaved pairing (2i, 2i+1)
                     let x0 = row[2 * i];
                     let x1 = row[2 * i + 1];
                     row[2 * i] = x0 * cos_a - x1 * sin_a;
@@ -757,6 +935,64 @@ mod tests {
         let expected = rms_norm_ref(&input_f32, &weight_f32, eps);
         for i in 0..hidden {
             assert!((output_f32[i] - expected[i]).abs() < 1e-2);
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_f32_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+        let hidden = 8usize;
+        let eps = 1e-5f32;
+
+        let input_f32 = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let weight_f32 = vec![1.0f32; hidden];
+
+        let block_size = hidden * std::mem::size_of::<f32>();
+        let in_block = alloc.alloc(block_size, 16).unwrap();
+        let wt_block = alloc.alloc(block_size, 16).unwrap();
+        let out_block = alloc.alloc(block_size, 16).unwrap();
+
+        unsafe {
+            let in_ptr = in_block.ptr as *mut f32;
+            let wt_ptr = wt_block.ptr as *mut f32;
+            for i in 0..hidden {
+                in_ptr.add(i).write(input_f32[i]);
+                wt_ptr.add(i).write(weight_f32[i]);
+            }
+        }
+
+        kernels
+            .rms_norm_f32(
+                &ctx,
+                &alloc,
+                &in_block,
+                &wt_block,
+                &out_block,
+                1,
+                hidden as u32,
+                eps,
+            )
+            .unwrap();
+
+        let mut output_f32 = vec![0.0f32; hidden];
+        unsafe {
+            let out_ptr = out_block.ptr as *const f32;
+            for i in 0..hidden {
+                output_f32[i] = out_ptr.add(i).read();
+            }
+        }
+
+        let expected = rms_norm_ref(&input_f32, &weight_f32, eps);
+        for i in 0..hidden {
+            assert!(
+                (output_f32[i] - expected[i]).abs() < 1e-2,
+                "index {}: got {}, want {} -- if this fails but \
+                 test_rms_norm_single_token (f16) passes, the bug is in the \
+                 F32 kernel/pipeline specifically",
+                i,
+                output_f32[i],
+                expected[i]
+            );
         }
     }
 
@@ -1274,8 +1510,8 @@ mod tests {
         let seq_len = 2usize;
         let n_heads = 1usize;
         let mut input = vec![0.0f32; seq_len * n_heads * head_dim];
-        input[head_dim] = 0.4288; // position 1, channel 0 (pre-RoPE Q)
-        input[head_dim + 1] = -0.2099; // position 1, channel 1 (pre-RoPE Q)
+        input[head_dim] = 0.4288;
+        input[head_dim + 1] = -0.2099;
 
         let out = rope_ref(&input, seq_len, n_heads, head_dim, 500000.0);
 
