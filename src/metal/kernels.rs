@@ -236,6 +236,7 @@ impl MetalKernels {
         n_heads: u32,
         head_dim: u32,
         theta: f32,
+        offset: u32,
     ) -> Result<()> {
         let cmd_buf = ctx.command_buffer()?;
         let encoder = cmd_buf
@@ -266,6 +267,11 @@ impl MetalKernels {
                 NonNull::new_unchecked(&theta as *const f32 as *mut c_void),
                 std::mem::size_of::<f32>(),
                 4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&offset as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
             );
         }
 
@@ -300,6 +306,7 @@ impl MetalKernels {
         n_heads: u32,
         head_dim: u32,
         theta: f32,
+        offset: u32,
     ) -> Result<()> {
         let cmd_buf = ctx.command_buffer()?;
         let encoder = cmd_buf
@@ -330,6 +337,11 @@ impl MetalKernels {
                 NonNull::new_unchecked(&theta as *const f32 as *mut c_void),
                 std::mem::size_of::<f32>(),
                 4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&offset as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
             );
         }
 
@@ -1127,6 +1139,7 @@ mod tests {
                 n_heads as u32,
                 head_dim as u32,
                 10000.0,
+                0, // offset — these tests exercise prefill (offset=0)
             )
             .unwrap();
 
@@ -1168,6 +1181,7 @@ mod tests {
                 n_heads as u32,
                 head_dim as u32,
                 10000.0,
+                0, // offset — these tests exercise prefill (offset=0)
             )
             .unwrap();
 
@@ -1208,6 +1222,7 @@ mod tests {
                 n_heads as u32,
                 head_dim as u32,
                 10000.0,
+                0, // offset — these tests exercise prefill (offset=0)
             )
             .unwrap();
 
@@ -1556,6 +1571,7 @@ mod tests {
                 n_heads as u32,
                 head_dim as u32,
                 500000.0,
+                0, // offset — these tests exercise prefill (offset=0)
             )
             .unwrap();
 

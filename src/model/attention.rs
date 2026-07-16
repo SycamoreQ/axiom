@@ -100,9 +100,6 @@ impl<B: Backend> Attention<B> {
         let batch = x.shape().dim(0)?;
         let seq_len = x.shape().dim(1)?;
         let q_pre_reshape = self.q_proj.forward(x)?;
-        let w = self.q_proj.weight().to_vec_f32()?;
-        let x_row0 = x.to_vec_f32()?;
-        let hidden = x.shape().dims()[x.shape().rank() - 1];
 
         let q = q_pre_reshape.reshape(&Shape::new(&[
             batch,
@@ -123,10 +120,8 @@ impl<B: Backend> Attention<B> {
             self.head_dim,
         ]))?;
 
-        //let q = self.rope.forward(&q, offset)?;
-        //let k = self.rope.forward(&k, offset)?;
-        let q = Self::apply_cpu_rope(&q, offset, self.rope_theta, self.head_dim)?;
-        let k = Self::apply_cpu_rope(&k, offset, self.rope_theta, self.head_dim)?;
+        let q = q.rope(offset, self.rope_theta, self.head_dim)?;
+        let k = k.rope(offset, self.rope_theta, self.head_dim)?;
 
         let (mut k, mut v) = match kv_cache {
             Some((past_k, past_v)) => (
@@ -306,6 +301,49 @@ mod tests {
             (out[head_dim + 1] - 0.2474).abs() < 1e-3,
             "channel 1 @ pos 1: got {}, want 0.2474",
             out[head_dim + 1]
+        );
+    }
+
+    #[test]
+    fn test_rope_trait_method_matches_llama_cpp_ground_truth() {
+        // Same as test_apply_cpu_rope_matches_llama_cpp_ground_truth, but
+        // exercising the actual `.rope()` trait method used in
+        // Attention::forward now, not the underlying free function directly
+        // — confirms the Metal migration's wiring, not just the math.
+        let head_dim = 64usize;
+        let mut data = vec![0.0f32; 2 * head_dim];
+        data[head_dim] = 0.4288;
+        data[head_dim + 1] = -0.2099;
+        data[head_dim + 2] = 1.1587;
+
+        let x = CandleTensor::from_slice(&data, &Shape::new(&[1, 2, 1, head_dim]), &cpu()).unwrap();
+        let out = x.rope(0, 500000.0, head_dim).unwrap();
+        let out = out.to_vec_f32().unwrap();
+
+        assert!((out[head_dim] - 0.4083).abs() < 1e-3);
+        assert!((out[head_dim + 1] - 0.2474).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_rope_offset_shifts_position() {
+        // A nonzero `offset` (as used during incremental decode with a
+        // growing KV cache) must produce a different rotation than offset=0
+        // — this is the exact bug that was silently present in the unused
+        // Metal rope kernel before the offset parameter was added to it.
+        let head_dim = 8usize;
+        let mut data = vec![0.0f32; head_dim];
+        data[0] = 1.0;
+        data[1] = 0.5;
+
+        let x = CandleTensor::from_slice(&data, &Shape::new(&[1, 1, 1, head_dim]), &cpu()).unwrap();
+        let out_offset_0 = x.rope(0, 10000.0, head_dim).unwrap().to_vec_f32().unwrap();
+        let out_offset_5 = x.rope(5, 10000.0, head_dim).unwrap().to_vec_f32().unwrap();
+
+        assert!(
+            (out_offset_0[0] - out_offset_5[0]).abs() > 1e-4,
+            "offset=0 and offset=5 should rotate differently, got {} vs {}",
+            out_offset_0[0],
+            out_offset_5[0]
         );
     }
 }

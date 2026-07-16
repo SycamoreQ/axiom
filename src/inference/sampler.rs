@@ -14,6 +14,13 @@ pub struct SamplerConfig {
     pub max_new_tokens: usize,
     pub seed: Option<u64>,
     pub vocab_size: Option<usize>,
+    // Hard-ban any token that would recreate an n-gram already present in
+    // the generated history (e.g. 3 = no repeated trigrams). Unlike
+    // repetition_penalty (a soft multiplicative discount that a strong
+    // enough raw logit can eventually overcome), this is an absolute -inf
+    // ban — it stops decay-then-relapse loops that repetition_penalty alone
+    // can't fully prevent. None/0 disables it.
+    pub no_repeat_ngram_size: Option<usize>,
 }
 
 pub struct Sampler {
@@ -31,6 +38,7 @@ impl Default for SamplerConfig {
             max_new_tokens: 256,
             seed: None,
             vocab_size: None,
+            no_repeat_ngram_size: None,
         }
     }
 }
@@ -62,6 +70,17 @@ impl Sampler {
                 previous_tokens,
                 self.config.repetition_penalty,
             );
+        }
+
+        //No-repeat n-gram hard ban — placed before the greedy shortcut so it
+        //protects both the greedy and stochastic paths. This is an absolute
+        //-inf ban, not a soft discount, so it can't be "won back" the way a
+        //multiplicative repetition_penalty eventually can be by a strong
+        //enough raw logit.
+        if let Some(n) = self.config.no_repeat_ngram_size {
+            if n >= 2 {
+                Self::apply_no_repeat_ngram(&mut logits_vec, previous_tokens, n);
+            }
         }
 
         //Check for Greedy Shortcut
@@ -134,6 +153,41 @@ impl Sampler {
                     } else {
                         logits[idx] *= penalty;
                     }
+                }
+            }
+        }
+    }
+
+    // Bans any token that would recreate an n-gram already seen in `previous`.
+    // E.g. n=3: if the last 2 tokens are [A, B] and [A, B, C] has already
+    // occurred earlier in `previous`, C is banned this step (logit set to
+    // -inf) — it would recreate that exact trigram. Standard technique from
+    // Holtzman et al.'s "neural text degeneration" work; same mechanism
+    // HF transformers' NoRepeatNGramLogitsProcessor and llama.cpp use.
+    fn apply_no_repeat_ngram(logits: &mut [f32], previous: &[u32], ngram_size: usize) {
+        let prefix_len = ngram_size - 1;
+        if previous.len() < ngram_size {
+            return; // not enough history yet to have completed one n-gram
+        }
+
+        // Map every (n-1)-token prefix seen so far to the set of tokens
+        // that immediately followed it.
+        let mut following: std::collections::HashMap<&[u32], HashSet<u32>> =
+            std::collections::HashMap::new();
+        for window in previous.windows(ngram_size) {
+            let prefix = &window[..prefix_len];
+            let next = window[prefix_len];
+            following.entry(prefix).or_default().insert(next);
+        }
+
+        // If the CURRENT tail matches a prefix we've seen before, ban
+        // whatever token(s) completed it last time.
+        let current_prefix = &previous[previous.len() - prefix_len..];
+        if let Some(banned) = following.get(current_prefix) {
+            for &token in banned {
+                let idx = token as usize;
+                if idx < logits.len() {
+                    logits[idx] = f32::NEG_INFINITY;
                 }
             }
         }
@@ -348,6 +402,54 @@ mod tests {
         let mut logits = vec![0.0, 4.0, 0.0];
         Sampler::apply_repetition_penalty(&mut logits, &[1u32, 1u32], 2.0);
         assert!((logits[1] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_no_repeat_ngram_bans_repeated_completion() {
+        // history: [A, B, C, A, B] — [A, B] has previously been followed by
+        // C, so with n=3 (bigram prefix), C should be banned now that the
+        // tail is [A, B] again.
+        let mut logits = vec![0.0, 0.0, 0.0, 0.0]; // tokens 0=A,1=B,2=C,3=D
+        Sampler::apply_no_repeat_ngram(&mut logits, &[0, 1, 2, 0, 1], 3);
+        assert!(
+            logits[2].is_infinite() && logits[2] < 0.0,
+            "C should be banned"
+        );
+        assert!(logits[0].is_finite());
+        assert!(logits[1].is_finite());
+        assert!(logits[3].is_finite());
+    }
+
+    #[test]
+    fn test_no_repeat_ngram_insufficient_history_no_op() {
+        // fewer than `ngram_size` tokens seen yet — nothing to ban
+        let mut logits = vec![0.0, 0.0, 0.0];
+        let original = logits.clone();
+        Sampler::apply_no_repeat_ngram(&mut logits, &[0, 1], 3);
+        assert_eq!(logits, original);
+    }
+
+    #[test]
+    fn test_no_repeat_ngram_novel_prefix_no_op() {
+        // current tail [B, C] has never occurred as a prefix before —
+        // nothing should be banned
+        let mut logits = vec![0.0, 0.0, 0.0, 0.0];
+        let original = logits.clone();
+        Sampler::apply_no_repeat_ngram(&mut logits, &[0, 1, 2], 3);
+        assert_eq!(logits, original);
+    }
+
+    #[test]
+    fn test_no_repeat_ngram_breaks_degenerate_loop() {
+        // simulates the exact failure mode from the bug report: the same
+        // token repeating over and over. With n=3, after [X, X] has been
+        // followed by X once, the very next [X, X] tail must ban X.
+        let mut logits = vec![10.0, 0.0]; // token 0 = X, dominant logit
+        Sampler::apply_no_repeat_ngram(&mut logits, &[0, 0, 0], 3);
+        assert!(
+            logits[0].is_infinite() && logits[0] < 0.0,
+            "repeated token should be banned despite dominant raw logit"
+        );
     }
 
     #[test]

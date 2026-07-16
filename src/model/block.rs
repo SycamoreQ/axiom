@@ -62,34 +62,6 @@ impl<B: Backend> Block<B> {
         kv_cache: Option<(&B::Tensor, &B::Tensor)>,
         offset: usize,
     ) -> Result<(B::Tensor, B::Tensor, B::Tensor)> {
-        let is_layer_0 = self.layer_idx == 0;
-        let is_mid_layer = self.layer_idx == 11;
-        let is_last_layer = self.layer_idx == 15;
-        let is_first_token = offset == 0;
-        let should_dump = (is_layer_0 || is_mid_layer || is_last_layer) && is_first_token;
-        let layer_idx = self.layer_idx;
-
-        let dump = |label: &str, t: &B::Tensor| -> Result<()> {
-            if !should_dump {
-                return Ok(());
-            }
-            let label = format!("Layer {layer_idx} {label}");
-
-            let hidden_size = *t.shape().dims().last().unwrap();
-            let mut v = t.to_vec_f32()?;
-
-            v.truncate(hidden_size);
-
-            let n = v.len() as f32;
-            let mean = v.iter().sum::<f32>() / n;
-            let var = v.iter().map(|val| (val - mean).powi(2)).sum::<f32>() / n;
-            let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
-            let nan_count = v.iter().filter(|val| val.is_nan()).count();
-            let std = var.sqrt();
-            Ok(())
-        };
-
         let h = self.attn_norm.forward(x)?;
 
         let (attn_out, new_k, new_v) = self.attn.forward(&h, mask, kv_cache, offset)?;

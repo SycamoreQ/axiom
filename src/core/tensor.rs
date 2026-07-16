@@ -180,6 +180,12 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
 
     // model ops — backends can fuse these
     fn rms_norm(&self, weight: &Self, eps: f32) -> crate::core::error::Result<Self>;
+    // Applies rotary position embeddings in place semantics (returns a new
+    // tensor, does not mutate self). `self` shape: [batch, seq_len, n_heads,
+    // head_dim]. `offset` is the absolute starting position of this
+    // sequence's first token (0 for prefill, session.offset for decode
+    // steps with a growing KV cache) — angle = (offset + token) * freq.
+    fn rope(&self, offset: usize, theta: f64, head_dim: usize) -> crate::core::error::Result<Self>;
     fn broadcast_add(&self, other: &Self) -> Result<Self>;
     fn broadcast_matmul(&self, other: &Self) -> Result<Self>;
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self>;
@@ -524,6 +530,31 @@ impl TensorOps for CandleTensor {
         })
     }
 
+    fn rope(&self, offset: usize, theta: f64, head_dim: usize) -> Result<Self> {
+        // Same interleaved-pairs convention as the validated apply_cpu_rope
+        // (kept as a CPU fallback here — Metal has its own real kernel).
+        let seq_len = self.shape().dim(1)?;
+        let n_heads = self.shape().dim(2)?;
+        let data = self.to_vec_f32()?;
+        let mut out = vec![0.0f32; data.len()];
+        for token in 0..seq_len {
+            for head in 0..n_heads {
+                let idx = (token * n_heads + head) * head_dim;
+                for i in 0..head_dim / 2 {
+                    let freq = 1.0f64 / theta.powf((2 * i) as f64 / head_dim as f64);
+                    let angle = (offset + token) as f64 * freq;
+                    let (sin_a, cos_a) = angle.sin_cos();
+                    let (sin_a, cos_a) = (sin_a as f32, cos_a as f32);
+                    let x0 = data[idx + 2 * i];
+                    let x1 = data[idx + 2 * i + 1];
+                    out[idx + 2 * i] = x0 * cos_a - x1 * sin_a;
+                    out[idx + 2 * i + 1] = x0 * sin_a + x1 * cos_a;
+                }
+            }
+        }
+        Self::from_slice(&out, &self.shape(), &self.device())
+    }
+
     fn broadcast_add(&self, other: &Self) -> Result<Self> {
         let inner = self.inner.broadcast_add(&other.inner)?;
         let new_shape = Shape::new(&inner.dims());
@@ -810,6 +841,10 @@ impl TensorOps for CudarcTensor {
         todo!("Phase 4")
     }
     fn rms_norm(&self, _: &Self, _: f32) -> Result<Self> {
+        todo!("Phase 4")
+    }
+
+    fn rope(&self, _offset: usize, _theta: f64, _head_dim: usize) -> Result<Self> {
         todo!("Phase 4")
     }
 
@@ -1390,16 +1425,84 @@ impl TensorOps for MetalTensor {
         Ok(output)
     }
 
+    fn rope(&self, offset: usize, theta: f64, head_dim: usize) -> Result<Self> {
+        // Shape: [batch, seq_len, n_heads, head_dim]. Like apply_cpu_rope
+        // before it, the underlying kernel doesn't take a batch dimension —
+        // this matches the existing (batch=1 always, in this codebase)
+        // usage; extending to batch>1 would need updating the kernel too.
+        let seq_len = self.shape.dims()[1];
+        let n_heads = self.shape.dims()[2];
+
+        let self_ = self.contiguous()?;
+        let output = Self::zeros(&self_.shape, self_.dtype, &self_.device)?;
+
+        // The rope kernel mutates its buffer in place. Copy input into the
+        // output buffer first (fast unified-memory copy, no CPU round-trip),
+        // then run the kernel on that copy — keeps this op's contract
+        // consistent with every other op here (returns a new tensor, never
+        // mutates the caller's).
+        let nbytes = self_.shape.numel() * self_.dtype.size_in_bytes();
+        unsafe {
+            let src = (self_.block.as_ref().ptr as *const u8).add(self_.offset_bytes);
+            let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes);
+            std::ptr::copy_nonoverlapping(src, dst, nbytes);
+        }
+
+        let state = self_.state.clone();
+        match self_.dtype {
+            DType::F32 => state.kernels.rope_f32(
+                &state.ctx,
+                &state.alloc.lock().unwrap(),
+                &output.block,
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                theta as f32,
+                offset as u32,
+            )?,
+            DType::F16 => state.kernels.rope_f16(
+                &state.ctx,
+                &state.alloc.lock().unwrap(),
+                &output.block,
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                theta as f32,
+                offset as u32,
+            )?,
+            _ => return Err(CoreError::Internal("rope: unsupported dtype".into())),
+        }
+
+        Ok(output)
+    }
+
     fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
-        let rank = self.shape.rank();
+        // The GPU kernel below reads directly off raw block/offset_bytes with
+        // hardcoded contiguous stride math — it has no awareness of this
+        // tensor's actual `strides` field. Any non-contiguous view (e.g.
+        // Linear::forward's `weight.transpose(0, 1)`, which swaps shape+strides
+        // as a lazy view and never calls .contiguous()) would otherwise be
+        // silently misread as if it were plain row-major data. Materialize
+        // both operands first so the kernel always sees real contiguous
+        // buffers regardless of how the caller produced them.
+        //
+        // NOTE: this exact fix has been lost twice already in commit
+        // resets/rebases and reintroduced the "degenerate repeated-token"
+        // bug it fixes — if you're refactoring this function, keep this
+        // guard, and consider committing+pushing this file on its own.
+        let self_owned = self.contiguous()?;
+        let other_owned = other.contiguous()?;
+        let (self_, other) = (&self_owned, &other_owned);
+
+        let rank = self_.shape.rank();
         let other_rank = other.shape.rank();
-        let k = self.shape.dims()[rank - 1];
+        let k = self_.shape.dims()[rank - 1];
 
         let n = if other_rank == 2 {
             if other.shape.dims()[0] != k {
                 return Err(CoreError::Internal(format!(
                     "matmul shape mismatch: self.shape={:?} (k={}), other.shape={:?}",
-                    self.shape.dims(),
+                    self_.shape.dims(),
                     k,
                     other.shape.dims()
                 )));
@@ -1409,8 +1512,8 @@ impl TensorOps for MetalTensor {
             other.shape.dims()[other_rank - 1]
         };
 
-        let m_per = self.shape.dims()[rank - 2];
-        let batch_self: usize = self.shape.dims()[..rank - 2].iter().product();
+        let m_per = self_.shape.dims()[rank - 2];
+        let batch_self: usize = self_.shape.dims()[..rank - 2].iter().product();
         let batch_other: usize = if other_rank > 2 {
             other.shape.dims()[..other_rank - 2].iter().product()
         } else {
@@ -1420,17 +1523,17 @@ impl TensorOps for MetalTensor {
 
         let mut out_dims = Vec::new();
         if batch_out > 1 {
-            out_dims.extend(self.shape.dims()[..rank - 2].iter());
+            out_dims.extend(self_.shape.dims()[..rank - 2].iter());
             if out_dims.is_empty() {
                 out_dims.push(batch_out);
             }
         }
         out_dims.push(m_per);
         out_dims.push(n);
-        let output = Self::zeros(&Shape::new(&out_dims), self.dtype, &self.device)?;
+        let output = Self::zeros(&Shape::new(&out_dims), self_.dtype, &self_.device)?;
 
-        let state = self.state.clone();
-        let dtype_size = self.dtype.size_in_bytes();
+        let state = self_.state.clone();
+        let dtype_size = self_.dtype.size_in_bytes();
         let stride_a = m_per * k * dtype_size;
         let stride_b = k * n * dtype_size;
         let stride_c = m_per * n * dtype_size;
@@ -1439,8 +1542,8 @@ impl TensorOps for MetalTensor {
             let self_b = if batch_self == 1 { 0 } else { batch_idx };
             let other_b = if batch_other == 1 { 0 } else { batch_idx };
 
-            let mut block_a = (*self.block).clone();
-            block_a.offset_bytes += self.offset_bytes + self_b * stride_a;
+            let mut block_a = (*self_.block).clone();
+            block_a.offset_bytes += self_.offset_bytes + self_b * stride_a;
 
             let mut block_b = (*other.block).clone();
             block_b.offset_bytes += other.offset_bytes + other_b * stride_b;
@@ -1448,7 +1551,7 @@ impl TensorOps for MetalTensor {
             let mut block_c = (*output.block).clone();
             block_c.offset_bytes += batch_idx * stride_c;
 
-            match self.dtype {
+            match self_.dtype {
                 DType::F32 => state.kernels.matmul_f32(
                     &state.ctx,
                     &state.alloc.lock().unwrap(),
@@ -1481,28 +1584,43 @@ impl TensorOps for MetalTensor {
     }
 
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
+        // `self` is often a huge table (e.g. token_embd: ~1GB for a 128k-vocab
+        // model) but this only ever gathers a handful of rows (num tokens).
+        // The naive version calls self.to_vec_f32() — downloading the ENTIRE
+        // table — on every single call (every token, every step). Copy
+        // directly within unified memory instead, byte-range by byte-range,
+        // same approach `cat` already uses. Dtype-agnostic (byte copy)
+        // rather than assuming F32, so this stays correct for F16 too.
+        let self_ = self.contiguous()?;
         let idx = indexes.to_vec_u32()?;
-        let src = self.to_vec_f32()?;
-        let dims = self.shape.dims();
+        let dims = self_.shape.dims();
         let slice_size: usize = dims[dim + 1..].iter().product();
         let outer_size: usize = dims[..dim].iter().product();
-
-        let out_len = outer_size * idx.len() * slice_size;
-        let mut out = vec![0.0f32; out_len];
-
-        for o in 0..outer_size {
-            for (out_i, &idx_val) in idx.iter().enumerate() {
-                let src_offset = (o * dims[dim] + idx_val as usize) * slice_size;
-                let dst_offset = (o * idx.len() + out_i) * slice_size;
-                out[dst_offset..dst_offset + slice_size]
-                    .copy_from_slice(&src[src_offset..src_offset + slice_size]);
-            }
-        }
+        let dtype_size = self_.dtype.size_in_bytes();
+        let slice_bytes = slice_size * dtype_size;
 
         let mut out_dims = dims.to_vec();
         out_dims[dim] = idx.len();
+        let output = Self::zeros(&Shape::new(&out_dims), self_.dtype, &self_.device)?;
 
-        Self::from_slice(&out, &Shape::new(&out_dims), &self.device)
+        unsafe {
+            let src_base = (self_.block.as_ref().ptr as *const u8).add(self_.offset_bytes);
+            let dst_base = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes);
+
+            for o in 0..outer_size {
+                for (out_i, &idx_val) in idx.iter().enumerate() {
+                    let src_offset = (o * dims[dim] + idx_val as usize) * slice_bytes;
+                    let dst_offset = (o * idx.len() + out_i) * slice_bytes;
+                    std::ptr::copy_nonoverlapping(
+                        src_base.add(src_offset),
+                        dst_base.add(dst_offset),
+                        slice_bytes,
+                    );
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     fn cos(&self) -> Result<Self> {

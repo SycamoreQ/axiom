@@ -7,6 +7,7 @@ kernel void rope_f32(
     constant uint& n_heads  [[buffer(2)]],
     constant uint& head_dim [[buffer(3)]],
     constant float& theta   [[buffer(4)]],
+    constant uint& offset   [[buffer(5)]],
     uint2 tid [[thread_position_in_grid]]
 ) {
     uint token = tid.x;
@@ -18,7 +19,7 @@ kernel void rope_f32(
 
     for (uint i = 0; i < head_dim / 2; i++) {
         float freq = 1.0f / pow(theta, float(2 * i) / float(head_dim));
-        float angle = float(token) * freq;
+        float angle = float(offset + token) * freq;
         float cos_a = cos(angle);
         float sin_a = sin(angle);
         float x0 = row[2 * i];

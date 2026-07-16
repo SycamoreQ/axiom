@@ -46,10 +46,6 @@ fn main() {
     // tokenizer
     let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("failed to load tokenizer");
     println!("Tokenizer: ok (vocab {})", tokenizer.vocab().size());
-    let ids_a = tokenizer.encode("A", EncodeOptions::default());
-    let ids_space_a = tokenizer.encode(" A", EncodeOptions::default());
-    eprintln!("'A' -> {:?}", ids_a);
-    eprintln!("' A' -> {:?}", ids_space_a);
     // model + engine — backend selected at compile time
     #[cfg(feature = "metal")]
     let engine = {
@@ -84,6 +80,7 @@ fn main() {
             max_new_tokens,
             repetition_penalty: 1.0,
             vocab_size: Some(vocab_size),
+            no_repeat_ngram_size: Some(3),
         };
 
         Engine::<MetalBackend>::new(model, tokenizer, sampler_config, 1, device)
@@ -101,13 +98,14 @@ fn main() {
 
         let vocab_size = model.config().vocab_size;
         let sampler_config = SamplerConfig {
-            temperature: 0.7,
+            temperature: 0.0,
             top_p: Some(0.9),
             top_k: Some(50),
             seed: Some(42),
             max_new_tokens,
             repetition_penalty: 1.3,
             vocab_size: Some(vocab_size),
+            no_repeat_ngram_size: Some(3),
         };
 
         Engine::<CandleBackend>::new(model, tokenizer, sampler_config, 1, device)
@@ -146,11 +144,6 @@ fn main() {
         for (sid, token) in &results {
             if *sid == session_id {
                 let t = *token as u32;
-                eprintln!(
-                    "DEBUG token={} text={:?}",
-                    token,
-                    engine.tokenizer().decode(&[*token as usize])
-                );
                 if t == 128255 || t == 128001 || t == 128009 || t == 2 {
                     stop_reason = Some("Stop token generated");
                     break;

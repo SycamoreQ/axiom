@@ -125,11 +125,6 @@ impl<B: Backend> LlamaModel<B> {
             println!("NaN detected in Post Final Norm!");
         } else {
             let preview_len = 10.min(normed.len());
-            println!(
-                "Model [Final] - Post Final Norm (first {}): {:?}",
-                preview_len,
-                &normed[..preview_len]
-            );
         }
 
         let w_lm_head = self.lm_head.weight().to_vec_f32()?;
