@@ -101,12 +101,12 @@ fn main() {
 
         let vocab_size = model.config().vocab_size;
         let sampler_config = SamplerConfig {
-            temperature: 0.0,
+            temperature: 0.7,
             top_p: Some(0.9),
             top_k: Some(50),
             seed: Some(42),
             max_new_tokens,
-            repetition_penalty: 1.4,
+            repetition_penalty: 1.3,
             vocab_size: Some(vocab_size),
         };
 

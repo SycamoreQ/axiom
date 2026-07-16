@@ -243,15 +243,6 @@ pub fn load_bytes_as_tensor<B: Backend>(
         dtype => {
             // For quantized types, dequantize
             let floats = crate::weights::quantize::dequantize(data, dtype, info.numel() as usize);
-            if info.name == "token_embd.weight" {
-                let row_start = 128000 * 2048;
-                eprintln!(
-                    "CPU-SIDE dequant token_embd row128000: first3={:?} last3={:?} (total len={})",
-                    &floats[row_start..row_start + 3],
-                    &floats[row_start + 2045..row_start + 2048],
-                    floats.len()
-                );
-            }
             B::Tensor::from_slice(&floats, &shape, device)
                 .map_err(|e| LoaderError::Backend(e.to_string()))
         }
@@ -282,21 +273,10 @@ pub fn load_from_gguf<B: Backend>(
     let mut token_embd_tensor: Option<B::Tensor> = None;
 
     for (name, info) in &gguf.tensors {
-        if LlamaTensor::parse(name).is_none() {
-            eprintln!("SKIPPED TENSOR: {}", name);
-        }
         let kind = match LlamaTensor::parse(name) {
             Some(k) => k,
             None => continue,
         };
-
-        if name == "token_embd.weight"
-            || name == "output.weight"
-            || name.contains("attn_v.weight")
-            || name.contains("ffn_down.weight")
-        {
-            eprintln!("TENSOR DTYPE: {:<30} {:?}", name, info.dtype);
-        }
 
         let data = gguf
             .get_tensor_data(name)
@@ -307,9 +287,6 @@ pub fn load_from_gguf<B: Backend>(
             has_output_weight = true;
         }
         if matches!(kind, LlamaTensor::TokenEmbd) {
-            // Shape is correct at the source now (see gguf.rs) — no
-            // orientation heuristic needed here either.
-            eprintln!("token_embd normalized shape: {:?}", tensor.shape().dims());
             token_embd_tensor = Some(tensor.clone());
         }
 
@@ -325,8 +302,6 @@ pub fn load_from_gguf<B: Backend>(
                 .map_err(|e| LoaderError::Backend(e.to_string()))?;
         }
     }
-
-    eprintln!("has_output_weight={}", has_output_weight);
 
     Ok(model)
 }

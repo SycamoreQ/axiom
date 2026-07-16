@@ -83,40 +83,9 @@ impl<B: Backend> LlamaModel<B> {
         let mut x = x.unsqueeze(0)?;
         let device = x.device().clone();
         let mask = self.causal_mask(seq_len, &device)?;
-
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
         let should_dump = offset == 0;
-
-        // Statistical inspection helper matching your Block setup
-        let dump = |label: &str, t: &B::Tensor| -> Result<()> {
-            if !should_dump {
-                return Ok(());
-            }
-            let mut v = t.to_vec_f32()?;
-            v.truncate(hidden_size); // Check first token space safely
-            eprintln!(
-                "{label} VALUES: first3={:?} last3={:?}",
-                &v[0..3],
-                &v[v.len() - 3..]
-            );
-
-            let n = v.len() as f32;
-            let mean = v.iter().sum::<f32>() / n;
-            let var = v.iter().map(|val| (val - mean).powi(2)).sum::<f32>() / n;
-            let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
-            let nan_count = v.iter().filter(|val| val.is_nan()).count();
-            let std = var.sqrt();
-
-            eprintln!(
-                "{label}: mean={mean:.4} std={std:.4} min={min:.4} max={max:.4} nan={nan_count}"
-            );
-            Ok(())
-        };
-
-        // 1. Log Token Embedding State
-        dump("Model [0] - Token Embeddings", &x)?;
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
             let cache = kv_cache
@@ -127,10 +96,8 @@ impl<B: Backend> LlamaModel<B> {
             } else {
                 None
             };
-
             let (block_out, new_k, new_v) = block.forward(&x, mask_ref, cache, offset)?;
             x = block_out;
-
             if let Some(ref mut cache) = kv_cache {
                 if i < cache.len() {
                     cache[i] = (new_k, new_v);
@@ -140,12 +107,10 @@ impl<B: Backend> LlamaModel<B> {
             }
         }
 
-        // ---- CPU fallback region for final norm + LM head ----
         let x_pre_norm = x.to_vec_f32()?;
         let w_norm = self.norm.weight().to_vec_f32()?;
         let eps = self.norm.eps();
 
-        // CPU RMS norm computation
         let mut normed = vec![0.0f32; x_pre_norm.len()];
         for i in 0..x_pre_norm.len() {
             let row_start = (i / hidden_size) * hidden_size;
@@ -155,11 +120,18 @@ impl<B: Backend> LlamaModel<B> {
             normed[i] = x_pre_norm[i] * w_norm[i % hidden_size] / rms;
         }
 
-        // Create temporary view layer to safely print the RMSNorm via our helper
         let normed_tensor = B::Tensor::from_slice(&normed, &x.shape(), &device)?;
-        dump("Model [Final] - Post Final Norm", &normed_tensor)?;
+        if normed.iter().any(|&x| x.is_nan()) {
+            println!("NaN detected in Post Final Norm!");
+        } else {
+            let preview_len = 10.min(normed.len());
+            println!(
+                "Model [Final] - Post Final Norm (first {}): {:?}",
+                preview_len,
+                &normed[..preview_len]
+            );
+        }
 
-        // Compute LM Head Logits
         let w_lm_head = self.lm_head.weight().to_vec_f32()?;
         let mut logits_cpu = vec![0.0f32; seq_len * vocab_size];
         for pos in 0..seq_len {
@@ -197,18 +169,6 @@ impl<B: Backend> LlamaModel<B> {
                 // reverses ne[] on parse), so no orientation heuristic is
                 // needed or safe here anymore — trust the shape as-is.
                 self.embedding = Embedding::new(tensor);
-                let raw = self.embedding.weight().to_vec_f32()?;
-                eprintln!(
-                    "token_embd raw buffer len = {} (expected {})",
-                    raw.len(),
-                    128256usize * 2048
-                );
-                let row_start = 128000 * 2048;
-                eprintln!(
-                    "row 128000 direct read: first3={:?} last3={:?}",
-                    &raw[row_start..row_start + 3],
-                    &raw[row_start + 2045..row_start + 2048]
-                );
             }
             LlamaTensor::OutputNorm => {
                 let eps = self.norm.eps();

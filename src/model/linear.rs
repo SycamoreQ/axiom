@@ -15,14 +15,6 @@ impl<B: Backend> Linear<B> {
 
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
         let wt = self.weight.transpose(0, 1).unwrap();
-        if std::env::var("AXIOM_DEBUG_LINEAR").is_ok() {
-            eprintln!(
-                "Linear::forward weight.shape={:?} -> transposed={:?} x.shape={:?}",
-                self.weight.shape().dims(),
-                wt.shape().dims(),
-                x.shape().dims()
-            );
-        }
         let out = x.broadcast_matmul(&wt)?;
         match &self.bias {
             Some(bias) => out.broadcast_add(bias),

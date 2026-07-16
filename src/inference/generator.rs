@@ -55,6 +55,17 @@ impl<B: Backend> Generator<B> {
         let flattened_logits = last_token_logits.squeeze(0)?.squeeze(0)?;
         let logits_vec: Vec<f32> = flattened_logits.to_vec_f32()?;
 
+        if session.offset == 0 || true {
+            // First, bring the tensor data back to the CPU
+            let logits_cpu = flattened_logits.to_vec_f32()?;
+
+            // Now you can iterate over the standard Rust vector
+            let mut indexed: Vec<(usize, f32)> = logits_cpu.iter().copied().enumerate().collect();
+
+            indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+            eprintln!("TOP5 LOGITS: {:?}", &indexed[..5]);
+        }
+
         let next_token = self.sampler.sample(&logits_vec, &session.all_tokens());
 
         session.push_token(next_token);

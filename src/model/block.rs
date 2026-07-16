@@ -87,49 +87,23 @@ impl<B: Backend> Block<B> {
             let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
             let nan_count = v.iter().filter(|val| val.is_nan()).count();
             let std = var.sqrt();
-
-            eprintln!(
-                "{label}: mean={mean:.4} std={std:.4} min={min:.4} max={max:.4} nan={nan_count}"
-            );
-            eprintln!(
-                "{label} ROW0 first3={:?} last3={:?}",
-                &v[0..3],
-                &v[v.len() - 3..]
-            );
             Ok(())
         };
-        dump("[1] - Raw Input", x)?;
 
         let h = self.attn_norm.forward(x)?;
-        dump("[2] - After Attn Norm", &h)?;
 
         let (attn_out, new_k, new_v) = self.attn.forward(&h, mask, kv_cache, offset)?;
 
-        // 3. Post-attention projection output
-        dump("[3] - Attn Out", &attn_out)?;
-
         let x = x.add(&attn_out)?;
 
-        // 4. State metrics after adding attention residual context
-        dump("[4] - After Attn Residual", &x)?;
-
         let h = self.ffn_norm.forward(&x)?;
-
-        // 5. State metrics post-FFN input norm normalization step
-        dump("[5] - After FFN Norm", &h)?;
 
         let ffn_out = match &mut self.ffn {
             FeedForwardLayer::Dense(ff) => ff.forward(&h)?,
             FeedForwardLayer::Moe(moe) => moe.forward(&h, offset)?.hidden_states,
         };
 
-        // 6. Dense SwiGLU FFN layer evaluation context
-        dump("[6] - FFN Out", &ffn_out)?;
-
         let x = x.add(&ffn_out)?;
-
-        // 7. Complete single layer block evaluation with both residual paths merged
-        dump("[7] - After FFN Residual", &x)?;
 
         Ok((x, new_k, new_v))
     }

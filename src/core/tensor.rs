@@ -1362,10 +1362,6 @@ impl TensorOps for MetalTensor {
 
         let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
         let state = self.state.clone();
-        eprintln!(
-            "rms_norm: self.dtype={:?} weight.dtype={:?}",
-            self.dtype, weight.dtype
-        );
 
         match self.dtype {
             DType::F32 => state.kernels.rms_norm_f32(
@@ -1505,14 +1501,6 @@ impl TensorOps for MetalTensor {
 
         let mut out_dims = dims.to_vec();
         out_dims[dim] = idx.len();
-        let nonzero = out.iter().filter(|&&x| x != 0.0).count();
-        eprintln!(
-            "index_select: idx={:?} out_shape={:?} nonzero={}/{}",
-            &idx[..idx.len().min(4)],
-            out_dims,
-            nonzero,
-            out.len()
-        );
 
         Self::from_slice(&out, &Shape::new(&out_dims), &self.device)
     }
