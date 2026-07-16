@@ -21,6 +21,8 @@ const MATMUL_MSL: &str = include_str!("kernels/matmul_f16.metal");
 const MATMUL_F32_MSL: &str = include_str!("kernels/matmul_f32.metal");
 const ATTN_QK_MSL: &str = include_str!("kernels/attention_qk_f16.metal");
 const ATTN_PV_MSL: &str = include_str!("kernels/attention_pv_f16.metal");
+const SOFTMAX_F32_MSL: &str = include_str!("kernels/softmax_f32.metal");
+const SOFTMAX_F16_MSL: &str = include_str!("kernels/softmax_f16.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -33,6 +35,8 @@ pub struct MetalKernels {
     pub matmul_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_qk_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_pv_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub softmax_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub softmax_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -48,6 +52,8 @@ impl std::fmt::Debug for MetalKernels {
             .field("matmul_f32_pipeline", &"MTLComputePipelineState")
             .field("attention_qk_pipeline", &"MTLComputePipelineState")
             .field("attention_pv_pipeline", &"MTLComputePipelineState")
+            .field("softmax_f32_pipeline", &"MTLComputePipelineState")
+            .field("softmax_f16_pipeline", &"MTLComputePipelineState")
             .finish()
     }
 }
@@ -86,6 +92,8 @@ impl MetalKernels {
             matmul_f32_pipeline: build_pipeline(MATMUL_F32_MSL, "matmul_f32")?,
             attention_qk_pipeline: build_pipeline(ATTN_QK_MSL, "attention_qk_f16")?,
             attention_pv_pipeline: build_pipeline(ATTN_PV_MSL, "attention_pv_float")?,
+            softmax_f32_pipeline: build_pipeline(SOFTMAX_F32_MSL, "softmax_f32")?,
+            softmax_f16_pipeline: build_pipeline(SOFTMAX_F16_MSL, "softmax_f16")?,
         })
     }
 
@@ -138,6 +146,118 @@ impl MetalKernels {
 
         let grid = MTLSize {
             width: num_tokens as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        Ok(())
+    }
+
+    pub fn softmax_f32(
+        &self,
+        ctx: &MetalContext,
+        allocator: &MetalAllocator,
+        input: &BlockHandle,
+        output: &BlockHandle,
+        num_rows: u32,
+        row_size: u32,
+    ) -> Result<()> {
+        let cmd_buf = ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
+
+        encoder.setComputePipelineState(&self.softmax_f32_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(input.metal_buffer(allocator)),
+                input.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(output.metal_buffer(allocator)),
+                output.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&row_size as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+        }
+
+        let grid = MTLSize {
+            width: num_rows as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        Ok(())
+    }
+
+    pub fn softmax_f16(
+        &self,
+        ctx: &MetalContext,
+        allocator: &MetalAllocator,
+        input: &BlockHandle,
+        output: &BlockHandle,
+        num_rows: u32,
+        row_size: u32,
+    ) -> Result<()> {
+        let cmd_buf = ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
+
+        encoder.setComputePipelineState(&self.softmax_f16_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(input.metal_buffer(allocator)),
+                input.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(output.metal_buffer(allocator)),
+                output.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&row_size as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+        }
+
+        let grid = MTLSize {
+            width: num_rows as usize,
             height: 1,
             depth: 1,
         };

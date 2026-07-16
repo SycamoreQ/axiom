@@ -1342,23 +1342,51 @@ impl TensorOps for MetalTensor {
     }
 
     fn softmax(&self, dim: usize) -> Result<Self> {
-        let dims = self.shape.dims();
-        let row_size = dims[dim];
-        let n = self.shape.numel();
-        let num_rows = n / row_size;
-        let src = self.to_vec_f32()?;
-        let mut dst = vec![0.0f32; n];
-        for r in 0..num_rows {
-            let row = &src[r * row_size..(r + 1) * row_size];
-            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = row.iter().map(|&x| (x - max).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            for (i, &e) in exps.iter().enumerate() {
-                dst[r * row_size + i] = e / sum;
-            }
+        // Every actual call site in this codebase applies softmax along the
+        // last dimension (attention scores: dim=rank-1=3; MoE routing:
+        // dim=rank-1=1). The kernel below assumes `dim` is the last
+        // dimension of a contiguous row-major tensor — same assumption the
+        // previous CPU version made implicitly (row_size = dims[dim] only
+        // corresponds to a contiguous memory chunk when dim is the fastest-
+        // varying dimension). Made explicit and checked here rather than
+        // silently computing wrong results for a hypothetical future caller
+        // that passes something else.
+        let rank = self.shape.rank();
+        if dim != rank - 1 {
+            return Err(CoreError::Internal(format!(
+                "softmax: only the last dimension is supported (got dim={dim}, rank={rank})"
+            )));
         }
-        let out = Self::from_slice(&dst, &self.shape, &self.device)?;
-        out.to_dtype(self.dtype)
+
+        let self_ = self.contiguous()?;
+        let dims = self_.shape.dims();
+        let row_size = dims[dim];
+        let num_rows = self_.shape.numel() / row_size;
+
+        let output = Self::zeros(&self_.shape, self_.dtype, &self_.device)?;
+        let state = self_.state.clone();
+
+        match self_.dtype {
+            DType::F32 => state.kernels.softmax_f32(
+                &state.ctx,
+                &state.alloc.lock().unwrap(),
+                &self_.block,
+                &output.block,
+                num_rows as u32,
+                row_size as u32,
+            )?,
+            DType::F16 => state.kernels.softmax_f16(
+                &state.ctx,
+                &state.alloc.lock().unwrap(),
+                &self_.block,
+                &output.block,
+                num_rows as u32,
+                row_size as u32,
+            )?,
+            _ => return Err(CoreError::Internal("softmax: unsupported dtype".into())),
+        }
+
+        Ok(output)
     }
 
     fn sqrt(&self) -> Result<Self> {
@@ -2322,5 +2350,51 @@ mod metal_matmul_tests {
         let out = a.matmul(&w).unwrap();
         assert_eq!(out.shape(), &Shape::new(&[2, 2]));
         assert_eq!(out.to_vec_f32().unwrap(), vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn test_metal_softmax_basic() {
+        // well-known values: softmax([1,2,3]) ~= [0.0900, 0.2447, 0.6652]
+        let x = make_metal_tensor(&[1.0, 2.0, 3.0], &[1, 3]);
+        let out = x.softmax(1).unwrap().to_vec_f32().unwrap();
+
+        assert!((out[0] - 0.0900).abs() < 1e-3);
+        assert!((out[1] - 0.2447).abs() < 1e-3);
+        assert!((out[2] - 0.6652).abs() < 1e-3);
+        let sum: f32 = out.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "probabilities should sum to 1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn test_metal_softmax_multi_row_independent() {
+        // two rows should be softmaxed independently — same row values
+        // should give identical output regardless of which row they're in
+        let x = make_metal_tensor(&[1.0, 2.0, 3.0, 1.0, 2.0, 3.0], &[2, 3]);
+        let out = x.softmax(1).unwrap().to_vec_f32().unwrap();
+        assert_eq!(&out[0..3], &out[3..6]);
+    }
+
+    #[test]
+    fn test_metal_softmax_numerically_stable_with_large_inputs() {
+        // naive (non-max-subtracted) softmax would overflow exp() here;
+        // the numerically-stable version should stay finite
+        let x = make_metal_tensor(&[1000.0, 1001.0, 1002.0], &[1, 3]);
+        let out = x.softmax(1).unwrap().to_vec_f32().unwrap();
+        assert!(out.iter().all(|v| v.is_finite()), "got {out:?}");
+        // shape of the distribution should match softmax([0,1,2]) since
+        // softmax is shift-invariant
+        assert!((out[2] - 0.6652).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_metal_softmax_rejects_non_last_dim() {
+        let x = make_metal_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        assert!(
+            x.softmax(0).is_err(),
+            "softmax on a non-last dim should error, not silently compute wrong results"
+        );
     }
 }
