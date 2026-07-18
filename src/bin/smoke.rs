@@ -74,6 +74,8 @@ fn main() {
 
         let embd = model.embedding.weight().to_vec_f32().unwrap();
         println!("token_embd[0..10]: {:?}", &embd[..10]);
+        let n = embd.len();
+        println!("token_embd[last 10]: {:?}", &embd[n - 10..]);
 
         let vocab_size = model.config().vocab_size;
         let sampler_config = SamplerConfig {
@@ -148,6 +150,11 @@ fn main() {
         for (sid, token) in &results {
             if *sid == session_id {
                 let t = *token as u32;
+                eprintln!(
+                    "DEBUG token={} text={:?}",
+                    token,
+                    engine.tokenizer().decode(&[*token as usize])
+                );
                 if t == 128255 || t == 128001 || t == 128009 || t == 2 {
                     stop_reason = Some("Stop token generated");
                     break;

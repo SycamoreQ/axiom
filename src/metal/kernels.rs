@@ -25,6 +25,7 @@ const SOFTMAX_F16_MSL: &str = include_str!("kernels/softmax_f16.metal");
 const ADD_F32_MSL: &str = include_str!("kernels/add_f32.metal");
 const ATTN_QK_F32_MSL: &str = include_str!("kernels/attention_qk_f32.metal");
 const ATTN_PV_F32_MSL: &str = include_str!("kernels/attention_pv_f32.metal");
+const ADD_F16_MSL: &str = include_str!("kernels/add_f16.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -42,6 +43,7 @@ pub struct MetalKernels {
     pub add_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_qk_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_pv_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub add_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -102,6 +104,7 @@ impl MetalKernels {
             add_f32_pipeline: build_pipeline(ADD_F32_MSL, "add_f32")?,
             attention_qk_f32_pipeline: build_pipeline(ATTN_QK_F32_MSL, "attention_qk_f32")?,
             attention_pv_f32_pipeline: build_pipeline(ATTN_PV_F32_MSL, "attention_pv_f32")?,
+            add_f16_pipeline: build_pipeline(ADD_F16_MSL, "add_f16")?,
         })
     }
 
@@ -964,6 +967,44 @@ impl MetalKernels {
         };
         let grid = MTLSize {
             width: (n_heads * 32) as usize,
+            height: 1,
+            depth: 1,
+        };
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+        Ok(())
+    }
+    
+    pub fn add_f16(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        a: &BlockHandle,
+        b: &BlockHandle,
+        c: &BlockHandle,
+        num_elements: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.add_f16_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a.metal_buffer(allocator)), a.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(b.metal_buffer(allocator)), b.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(c.metal_buffer(allocator)), c.offset_bytes, 2);
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&num_elements as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let grid = MTLSize {
+            width: num_elements as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 64,
             height: 1,
             depth: 1,
         };

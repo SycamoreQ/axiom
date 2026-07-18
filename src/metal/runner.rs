@@ -377,14 +377,25 @@ impl<'a> MetalRunner<'a> {
         output: &MetalTensor,
         num_elements: u32,
     ) -> Result<()> {
-        self.state.kernels.swiglu_f16(
-            &self.encoder,
-            self.allocator,
-            gate.block(),
-            up.block(),
-            output.block(),
-            num_elements,
-        )?;
+        match gate.metal_dtype() {
+            DType::F32 => self.state.kernels.swiglu_f32(
+                &self.encoder,
+                self.allocator,
+                gate.block(),
+                up.block(),
+                output.block(),
+                num_elements,
+            )?,
+            DType::F16 => self.state.kernels.swiglu_f16(
+                &self.encoder,
+                self.allocator,
+                gate.block(),
+                up.block(),
+                output.block(),
+                num_elements,
+            )?,
+            _ => return Err(MetalError::Internal("swiglu: unsupported dtype".into()).into()),
+        }
         Ok(())
     }
 
@@ -392,6 +403,14 @@ impl<'a> MetalRunner<'a> {
         let num_elements = output.metal_shape().numel() as u32;
         match a.metal_dtype() {
             DType::F32 => self.state.kernels.add_f32(
+                &self.encoder,
+                self.allocator,
+                a.block(),
+                b.block(),
+                output.block(),
+                num_elements,
+            )?,
+            DType::F16 => self.state.kernels.add_f16(
                 &self.encoder,
                 self.allocator,
                 a.block(),

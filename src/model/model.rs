@@ -200,7 +200,6 @@ impl<B: Backend> LlamaModel<B> {
         let mut x = x_emb.unsqueeze(0)?; // [1, seq_len, hidden]
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
-            // ---- RMS norm ----
             let norm_out = B::Tensor::zeros_like(&x)?;
             runner.rms_norm(
                 x.as_metal()
@@ -216,7 +215,6 @@ impl<B: Backend> LlamaModel<B> {
                 eps,
             )?;
 
-            // ---- Q, K, V projections — cached, pre-transposed weights ----
             let norm_2d = norm_out.reshape(&Shape::new(&[seq_len, hidden]))?;
 
             let q_weight = block.attn.metal_q_weight.as_ref().ok_or_else(|| {
@@ -337,9 +335,18 @@ impl<B: Backend> LlamaModel<B> {
             };
 
             let q_last = q_rope.narrow(1, seq_len - 1, 1)?.squeeze(1)?.squeeze(0)?;
-            let scores = B::Tensor::zeros(&Shape::new(&[n_heads, seq_len]), x.dtype(), x.device())?;
+            let cache_len = k_for_attn
+                .as_ref()
+                .map(|k| k.shape().dims()[1])
+                .unwrap_or(seq_len) as u32;
+            let scores = B::Tensor::zeros(
+                &Shape::new(&[n_heads, cache_len as usize]),
+                x.dtype(),
+                x.device(),
+            )?;
 
             if let (Some(k_ref), Some(v_ref)) = (k_for_attn, v_for_attn) {
+                let current_pos = (offset + seq_len - 1) as u32;
                 runner.attention_qk(
                     q_last
                         .as_metal()
@@ -353,24 +360,14 @@ impl<B: Backend> LlamaModel<B> {
                     n_heads as u32,
                     n_kv_heads as u32,
                     head_dim as u32,
-                    seq_len as u32,
-                    offset as u32,
-                )?;
-
-                let probs = B::Tensor::zeros_like(&scores)?;
-                runner.softmax(
-                    scores
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
-                    probs
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("probs not Metal".into()))?,
+                    cache_len,
+                    current_pos,
                 )?;
 
                 let attn_out =
                     B::Tensor::zeros(&Shape::new(&[n_heads, head_dim]), x.dtype(), x.device())?;
                 runner.attention_pv(
-                    probs
+                    scores
                         .as_metal()
                         .ok_or_else(|| CoreError::Internal("probs not Metal".into()))?,
                     v_ref
@@ -381,9 +378,9 @@ impl<B: Backend> LlamaModel<B> {
                         .ok_or_else(|| CoreError::Internal("attn_out not Metal".into()))?,
                     n_heads as u32,
                     n_kv_heads as u32,
-                    seq_len as u32,
+                    cache_len,
                     head_dim as u32,
-                    offset as u32,
+                    current_pos,
                 )?;
 
                 let attn_reshaped = attn_out.reshape(&Shape::new(&[1, 1, hidden]))?;
@@ -579,7 +576,17 @@ impl<B: Backend> LlamaModel<B> {
         )?;
 
         let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
-
+        let logits_vec = logits.to_vec_f32()?;
+        let nan_count = logits_vec.iter().filter(|v| v.is_nan()).count();
+        let inf_count = logits_vec.iter().filter(|v| v.is_infinite()).count();
+        if nan_count > 0 || inf_count > 0 {
+            println!(
+                "logits: {} NaN, {} Inf (of {})",
+                nan_count,
+                inf_count,
+                logits_vec.len()
+            );
+        }
         runner.finish()?;
         Ok(logits)
     }
