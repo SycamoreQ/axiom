@@ -60,5 +60,8 @@ pub mod kernels;
 #[cfg(feature = "metal")]
 pub mod state;
 
+#[cfg(feature = "metal")]
+pub mod runner;
+
 pub use kernels::MetalKernels;
 pub use state::MetalState;

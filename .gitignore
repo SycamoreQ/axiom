@@ -331,3 +331,4 @@ TSWLatexianTemp*
 *.gguf
 testdata/*.gguf
 .DS_Store
+Cargo.lock

@@ -62,6 +62,12 @@ impl<B: Backend> FeedForward<B> {
     pub fn gate_proj(&self) -> &Linear<B> {
         &self.gate_proj
     }
+    pub fn up_proj(&self) -> &Linear<B> {
+        &self.up_proj
+    }
+    pub fn down_proj(&self) -> &Linear<B> {
+        &self.down_proj
+    }
 }
 
 #[cfg(test)]

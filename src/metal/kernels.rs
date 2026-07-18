@@ -1,12 +1,11 @@
 use crate::metal::allocator::{BlockHandle, MetalAllocator};
-use crate::metal::context::MetalContext;
 use crate::metal::error::{MetalError, Result};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{ns_string, NSString};
+use objc2_metal::MTLCommandEncoder;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLDevice, MTLLibrary, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize,
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -99,7 +98,7 @@ impl MetalKernels {
 
     pub fn rms_norm_f16(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         input: &BlockHandle,
         weight: &BlockHandle,
@@ -108,11 +107,6 @@ impl MetalKernels {
         hidden: u32,
         eps: f32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.rms_norm_pipeline);
 
         unsafe {
@@ -159,27 +153,18 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     pub fn softmax_f32(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         input: &BlockHandle,
         output: &BlockHandle,
         num_rows: u32,
         row_size: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.softmax_f32_pipeline);
 
         unsafe {
@@ -215,27 +200,18 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     pub fn softmax_f16(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         input: &BlockHandle,
         output: &BlockHandle,
         num_rows: u32,
         row_size: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.softmax_f16_pipeline);
 
         unsafe {
@@ -271,16 +247,12 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     pub fn rms_norm_f32(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         input: &BlockHandle,
         weight: &BlockHandle,
@@ -289,11 +261,6 @@ impl MetalKernels {
         hidden: u32,
         eps: f32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.rms_norm_f32_pipeline);
 
         unsafe {
@@ -340,16 +307,12 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     pub fn rope_f16(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         x: &BlockHandle,
         seq_len: u32,
@@ -358,11 +321,6 @@ impl MetalKernels {
         theta: f32,
         offset: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.rope_pipeline);
 
         unsafe {
@@ -410,16 +368,12 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     pub fn rope_f32(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         x: &BlockHandle,
         seq_len: u32,
@@ -428,11 +382,6 @@ impl MetalKernels {
         theta: f32,
         offset: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.rope_f32_pipeline);
 
         unsafe {
@@ -480,27 +429,18 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     pub fn swiglu_f16(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         gate: &BlockHandle,
         up: &BlockHandle,
         output: &BlockHandle,
         num_elements: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.swiglu_pipeline);
 
         unsafe {
@@ -538,27 +478,18 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     pub fn swiglu_f32(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         gate: &BlockHandle,
         up: &BlockHandle,
         output: &BlockHandle,
         num_elements: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.swiglu_f32_pipeline);
 
         unsafe {
@@ -596,16 +527,12 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     pub fn matmul_f16(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         a: &BlockHandle,
         b: &BlockHandle,
@@ -614,11 +541,6 @@ impl MetalKernels {
         n: u32,
         k: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.matmul_pipeline);
 
         unsafe {
@@ -659,16 +581,15 @@ impl MetalKernels {
 
         unsafe {
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
-            encoder.endEncoding();
-            cmd_buf.commit();
-            cmd_buf.waitUntilCompleted();
-            Ok(())
+            // No endEncoding, commit, or wait here
         }
+
+        Ok(())
     }
 
     pub fn matmul_f32(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         a: &BlockHandle,
         b: &BlockHandle,
@@ -677,11 +598,6 @@ impl MetalKernels {
         n: u32,
         k: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.matmul_f32_pipeline);
 
         unsafe {
@@ -726,17 +642,13 @@ impl MetalKernels {
             );
         }
 
-        encoder.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn attention_qk_f16(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         q: &BlockHandle,
         k_cache: &BlockHandle,
@@ -746,11 +658,6 @@ impl MetalKernels {
         seq_len: u32,
         current_pos: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.attention_qk_pipeline);
 
         unsafe {
@@ -800,17 +707,15 @@ impl MetalKernels {
         };
         unsafe {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-            encoder.endEncoding();
-            cmd_buf.commit();
-            cmd_buf.waitUntilCompleted();
-            Ok(())
         }
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn attention_pv_f16(
         &self,
-        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         allocator: &MetalAllocator,
         scores: &BlockHandle,
         v_cache: &BlockHandle,
@@ -820,11 +725,6 @@ impl MetalKernels {
         head_dim: u32,
         current_pos: u32,
     ) -> Result<()> {
-        let cmd_buf = ctx.command_buffer()?;
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
-
         encoder.setComputePipelineState(&self.attention_pv_pipeline);
 
         unsafe {
@@ -879,19 +779,19 @@ impl MetalKernels {
 
         unsafe {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-            encoder.endEncoding();
-            cmd_buf.commit();
-            cmd_buf.waitUntilCompleted();
-            Ok(())
         }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metal::context::MetalContext;
     use crate::metal::device::MetalDevice;
     use half::f16;
+    use objc2_metal::MTLCommandBuffer;
 
     fn setup() -> (MetalContext, MetalAllocator, MetalKernels) {
         let device = MetalDevice::system_default().unwrap();
@@ -1043,9 +943,14 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .rms_norm_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &in_block,
                 &wt_block,
@@ -1055,6 +960,10 @@ mod tests {
                 eps,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         let mut output_f32 = vec![0.0f32; hidden];
         unsafe {
@@ -1093,9 +1002,14 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .rms_norm_f32(
-                &ctx,
+                &encoder,
                 &alloc,
                 &in_block,
                 &wt_block,
@@ -1105,6 +1019,10 @@ mod tests {
                 eps,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         let mut output_f32 = vec![0.0f32; hidden];
         unsafe {
@@ -1118,9 +1036,7 @@ mod tests {
         for i in 0..hidden {
             assert!(
                 (output_f32[i] - expected[i]).abs() < 1e-2,
-                "index {}: got {}, want {} -- if this fails but \
-                 test_rms_norm_single_token (f16) passes, the bug is in the \
-                 F32 kernel/pipeline specifically",
+                "index {}: got {}, want {}",
                 i,
                 output_f32[i],
                 expected[i]
@@ -1158,9 +1074,14 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .rms_norm_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &in_block,
                 &wt_block,
@@ -1170,6 +1091,10 @@ mod tests {
                 eps,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         unsafe {
             let out_ptr = out_block.ptr as *const f16;
@@ -1207,9 +1132,14 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .rms_norm_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &in_block,
                 &wt_block,
@@ -1219,6 +1149,10 @@ mod tests {
                 eps,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         let expected = rms_norm_ref(&input_f32, &weight_f32, eps);
         unsafe {
@@ -1250,18 +1184,27 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .rope_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &x_block,
                 seq_len as u32,
                 n_heads as u32,
                 head_dim as u32,
                 10000.0,
-                0, // offset — these tests exercise prefill (offset=0)
+                0,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         unsafe {
             let ptr = x_block.ptr as *const f16;
@@ -1292,18 +1235,27 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .rope_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &x_block,
                 seq_len as u32,
                 n_heads as u32,
                 head_dim as u32,
                 10000.0,
-                0, // offset — these tests exercise prefill (offset=0)
+                0,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         let expected = rope_ref(&input_f32, seq_len, n_heads, head_dim, 10000.0);
         unsafe {
@@ -1333,18 +1285,27 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .rope_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &x_block,
                 seq_len as u32,
                 n_heads as u32,
                 head_dim as u32,
                 10000.0,
-                0, // offset — these tests exercise prefill (offset=0)
+                0,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         unsafe {
             let ptr = x_block.ptr as *const f16;
@@ -1355,6 +1316,10 @@ mod tests {
             assert_ne!(t0, t1);
         }
     }
+
+    // --------------------------------------------------------------
+    // SwiGLU Test
+    // --------------------------------------------------------------
 
     #[test]
     fn test_swiglu_f16_execution() {
@@ -1378,9 +1343,14 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .swiglu_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &gate_block,
                 &up_block,
@@ -1388,6 +1358,10 @@ mod tests {
                 num_elements as u32,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         let mut output_f32 = vec![0.0f32; num_elements];
         unsafe {
@@ -1399,16 +1373,13 @@ mod tests {
 
         let expected = swiglu_ref(&gate_f32, &up_f32);
         for i in 0..num_elements {
-            let mut all_ok = true;
-            for i in 0..num_elements {
-                let diff = (output_f32[i] - expected[i]).abs();
-                if diff >= 1e-2 {
-                    all_ok = false;
-                }
-            }
-            assert!(all_ok, "swiglu values out of tolerance");
+            assert!((output_f32[i] - expected[i]).abs() < 1e-2);
         }
     }
+
+    // --------------------------------------------------------------
+    // MatMul Tests
+    // --------------------------------------------------------------
 
     #[test]
     fn test_matmul_f32_execution() {
@@ -1450,11 +1421,20 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .matmul_f16(
-                &ctx, &alloc, &a_block, &b_block, &c_block, m as u32, n as u32, k as u32,
+                &encoder, &alloc, &a_block, &b_block, &c_block, m as u32, n as u32, k as u32,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         let expected_c = matmul_ref(&a_f16, &b_f16, m, n, k);
 
@@ -1506,11 +1486,20 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .matmul_f16(
-                &ctx, &alloc, &a_block, &b_block, &c_block, m as u32, n as u32, k as u32,
+                &encoder, &alloc, &a_block, &b_block, &c_block, m as u32, n as u32, k as u32,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         let expected_c = matmul_ref(&a_f16, &b_f16, m, n, k);
 
@@ -1522,6 +1511,10 @@ mod tests {
             }
         }
     }
+
+    // --------------------------------------------------------------
+    // Attention Tests
+    // --------------------------------------------------------------
 
     #[test]
     fn test_attention_qk_execution() {
@@ -1554,9 +1547,14 @@ mod tests {
             );
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .attention_qk_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &q_block,
                 &k_block,
@@ -1567,6 +1565,10 @@ mod tests {
                 current_pos as u32,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         let expected_score = attention_qk_ref(&q_f16, &k_f16, head_dim, n_heads, seq_len);
 
@@ -1614,9 +1616,14 @@ mod tests {
             );
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .attention_pv_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &scores_block,
                 &v_block,
@@ -1628,6 +1635,10 @@ mod tests {
             )
             .unwrap();
 
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
         let expected_out = attention_pv_ref(&scores_f16, &v_f16, head_dim, n_heads, seq_len);
 
         unsafe {
@@ -1638,6 +1649,10 @@ mod tests {
             }
         }
     }
+
+    // --------------------------------------------------------------
+    // Reference / Ground Truth Tests (unchanged – no Metal calls)
+    // --------------------------------------------------------------
 
     #[test]
     fn test_rope_ref_matches_llama_cpp_ground_truth() {
@@ -1652,12 +1667,12 @@ mod tests {
 
         assert!(
             (out[head_dim] - 0.4083).abs() < 1e-3,
-            "channel 0 @ pos 1: got {}, want 0.4083 (llama.cpp ground truth)",
+            "channel 0 @ pos 1: got {}, want 0.4083",
             out[head_dim]
         );
         assert!(
             (out[head_dim + 1] - 0.2474).abs() < 1e-3,
-            "channel 1 @ pos 1: got {}, want 0.2474 (llama.cpp ground truth)",
+            "channel 1 @ pos 1: got {}, want 0.2474",
             out[head_dim + 1]
         );
     }
@@ -1682,18 +1697,27 @@ mod tests {
             }
         }
 
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("failed to create compute encoder");
+
         kernels
             .rope_f16(
-                &ctx,
+                &encoder,
                 &alloc,
                 &x_block,
                 seq_len as u32,
                 n_heads as u32,
                 head_dim as u32,
                 500000.0,
-                0, // offset — these tests exercise prefill (offset=0)
+                0,
             )
             .unwrap();
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         unsafe {
             let ptr = x_block.ptr as *const f16;

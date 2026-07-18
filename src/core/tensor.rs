@@ -10,6 +10,8 @@ use candle_core::{self, Tensor};
 use candle_nn;
 #[cfg(feature = "metal")]
 use objc2_metal::MTLCommandBuffer;
+#[cfg(feature = "metal")]
+use objc2_metal::MTLCommandEncoder;
 use std::sync::Arc;
 
 fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
@@ -117,6 +119,32 @@ impl MetalTensor {
             device,
         ))
     }
+
+    pub(crate) fn block(&self) -> &BlockHandle {
+        &self.block
+    }
+    pub(crate) fn metal_shape(&self) -> &Shape {
+        &self.shape
+    }
+    pub(crate) fn metal_dtype(&self) -> DType {
+        self.dtype
+    }
+    pub(crate) fn metal_strides(&self) -> &[usize] {
+        &self.strides
+    }
+    pub(crate) fn metal_offset(&self) -> usize {
+        self.offset_bytes
+    }
+    pub(crate) fn metal_device(&self) -> &Device {
+        &self.device
+    }
+    pub(crate) fn metal_state(&self) -> Arc<MetalState> {
+        self.state.clone()
+    }
+
+    pub(crate) fn as_metal(&self) -> Option<&MetalTensor> {
+        Some(self)
+    }
 }
 
 pub struct TopKOutput<T> {
@@ -206,6 +234,9 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn to_vec_f32(&self) -> Result<Vec<f32>>;
     fn exp(&self) -> Result<Self>;
     fn log(&self) -> Result<Self>;
+    fn as_metal(&self) -> Option<&MetalTensor> {
+        None
+    }
 }
 
 impl TensorOps for CandleTensor {
@@ -1366,9 +1397,14 @@ impl TensorOps for MetalTensor {
         let output = Self::zeros(&self_.shape, self_.dtype, &self_.device)?;
         let state = self_.state.clone();
 
+        let cmd_buf = state.ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| CoreError::Internal("failed to create compute encoder".into()))?;
+
         match self_.dtype {
             DType::F32 => state.kernels.softmax_f32(
-                &state.ctx,
+                &encoder,
                 &state.alloc.lock().unwrap(),
                 &self_.block,
                 &output.block,
@@ -1376,7 +1412,7 @@ impl TensorOps for MetalTensor {
                 row_size as u32,
             )?,
             DType::F16 => state.kernels.softmax_f16(
-                &state.ctx,
+                &encoder,
                 &state.alloc.lock().unwrap(),
                 &self_.block,
                 &output.block,
@@ -1385,6 +1421,9 @@ impl TensorOps for MetalTensor {
             )?,
             _ => return Err(CoreError::Internal("softmax: unsupported dtype".into())),
         }
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         Ok(output)
     }
@@ -1426,9 +1465,14 @@ impl TensorOps for MetalTensor {
         let output = Self::zeros(&self.shape, self.dtype, &self.device)?;
         let state = self.state.clone();
 
+        let cmd_buf = state.ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| CoreError::Internal("failed to create compute encoder".into()))?;
+
         match self.dtype {
             DType::F32 => state.kernels.rms_norm_f32(
-                &state.ctx,
+                &encoder,
                 &state.alloc.lock().unwrap(),
                 &self.block,
                 &weight.block,
@@ -1438,7 +1482,7 @@ impl TensorOps for MetalTensor {
                 eps,
             )?,
             DType::F16 => state.kernels.rms_norm_f16(
-                &state.ctx,
+                &encoder,
                 &state.alloc.lock().unwrap(),
                 &self.block,
                 &weight.block,
@@ -1449,6 +1493,9 @@ impl TensorOps for MetalTensor {
             )?,
             _ => return Err(CoreError::Internal("rms_norm: unsupported dtype".into())),
         }
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         Ok(output)
     }
@@ -1477,9 +1524,14 @@ impl TensorOps for MetalTensor {
         }
 
         let state = self_.state.clone();
+        let cmd_buf = state.ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| CoreError::Internal("failed to create compute encoder".into()))?;
+
         match self_.dtype {
             DType::F32 => state.kernels.rope_f32(
-                &state.ctx,
+                &encoder,
                 &state.alloc.lock().unwrap(),
                 &output.block,
                 seq_len as u32,
@@ -1489,7 +1541,7 @@ impl TensorOps for MetalTensor {
                 offset as u32,
             )?,
             DType::F16 => state.kernels.rope_f16(
-                &state.ctx,
+                &encoder,
                 &state.alloc.lock().unwrap(),
                 &output.block,
                 seq_len as u32,
@@ -1500,24 +1552,14 @@ impl TensorOps for MetalTensor {
             )?,
             _ => return Err(CoreError::Internal("rope: unsupported dtype".into())),
         }
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         Ok(output)
     }
 
     fn broadcast_matmul(&self, other: &Self) -> Result<Self> {
-        // The GPU kernel below reads directly off raw block/offset_bytes with
-        // hardcoded contiguous stride math — it has no awareness of this
-        // tensor's actual `strides` field. Any non-contiguous view (e.g.
-        // Linear::forward's `weight.transpose(0, 1)`, which swaps shape+strides
-        // as a lazy view and never calls .contiguous()) would otherwise be
-        // silently misread as if it were plain row-major data. Materialize
-        // both operands first so the kernel always sees real contiguous
-        // buffers regardless of how the caller produced them.
-        //
-        // NOTE: this exact fix has been lost twice already in commit
-        // resets/rebases and reintroduced the "degenerate repeated-token"
-        // bug it fixes — if you're refactoring this function, keep this
-        // guard, and consider committing+pushing this file on its own.
         let self_owned = self.contiguous()?;
         let other_owned = other.contiguous()?;
         let (self_, other) = (&self_owned, &other_owned);
@@ -1566,6 +1608,11 @@ impl TensorOps for MetalTensor {
         let stride_b = k * n * dtype_size;
         let stride_c = m_per * n * dtype_size;
 
+        let cmd_buf = state.ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| CoreError::Internal("failed to create compute encoder".into()))?;
+
         for batch_idx in 0..batch_out {
             let self_b = if batch_self == 1 { 0 } else { batch_idx };
             let other_b = if batch_other == 1 { 0 } else { batch_idx };
@@ -1581,7 +1628,7 @@ impl TensorOps for MetalTensor {
 
             match self_.dtype {
                 DType::F32 => state.kernels.matmul_f32(
-                    &state.ctx,
+                    &encoder,
                     &state.alloc.lock().unwrap(),
                     &block_a,
                     &block_b,
@@ -1591,7 +1638,7 @@ impl TensorOps for MetalTensor {
                     k as u32,
                 )?,
                 DType::F16 => state.kernels.matmul_f16(
-                    &state.ctx,
+                    &encoder,
                     &state.alloc.lock().unwrap(),
                     &block_a,
                     &block_b,
@@ -1607,6 +1654,10 @@ impl TensorOps for MetalTensor {
                 }
             }
         }
+
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
 
         Ok(output)
     }
@@ -2068,6 +2119,10 @@ impl TensorOps for MetalTensor {
             }
         }
         Ok(output)
+    }
+
+    fn as_metal(&self) -> Option<&MetalTensor> {
+        Some(self)
     }
 }
 

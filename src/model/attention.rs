@@ -10,9 +10,9 @@ use crate::model::rope::RotaryEmbedding;
 
 pub struct Attention<B: Backend> {
     pub q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    o_proj: Linear<B>,
+    pub k_proj: Linear<B>,
+    pub v_proj: Linear<B>,
+    pub o_proj: Linear<B>,
     rope: RotaryEmbedding<B>,
     num_heads: usize,
     num_kv_heads: usize,

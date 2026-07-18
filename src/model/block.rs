@@ -16,12 +16,36 @@ pub enum FeedForwardLayer<B: Backend> {
     Moe(MoeLayer<B>),
 }
 
+impl<B: Backend> FeedForwardLayer<B> {
+    pub fn gate_proj(&self) -> &Linear<B> {
+        match self {
+            FeedForwardLayer::Dense(ff) => ff.gate_proj(),
+            FeedForwardLayer::Moe(_) => panic!("gate_proj not supported for MoE layer"),
+        }
+    }
+
+    pub fn up_proj(&self) -> &Linear<B> {
+        match self {
+            FeedForwardLayer::Dense(ff) => ff.up_proj(),
+            FeedForwardLayer::Moe(_) => panic!("up_proj not supported for MoE layer"),
+        }
+    }
+
+    pub fn down_proj(&self) -> &Linear<B> {
+        match self {
+            FeedForwardLayer::Dense(ff) => ff.down_proj(),
+            FeedForwardLayer::Moe(_) => panic!("down_proj not supported for MoE layer"),
+        }
+    }
+}
+
 pub struct Block<B: Backend> {
-    attn_norm: RmsNorm<B>,
+    pub attn_norm: RmsNorm<B>,
     pub attn: Attention<B>,
-    ffn_norm: RmsNorm<B>,
-    ffn: FeedForwardLayer<B>,
+    pub ffn_norm: RmsNorm<B>,
+    pub ffn: FeedForwardLayer<B>,
     layer_idx: usize,
+    config: ModelConfig,
 }
 
 impl<B: Backend> Block<B> {
@@ -52,6 +76,7 @@ impl<B: Backend> Block<B> {
             ffn_norm,
             ffn,
             layer_idx,
+            config: config.clone(),
         })
     }
 
@@ -91,12 +116,50 @@ impl<B: Backend> Block<B> {
     pub fn set_attn_q(&mut self, w: B::Tensor) {
         self.attn.set_q_proj(Linear::new(w, None));
     }
-    pub fn set_attn_k(&mut self, w: B::Tensor) {
-        self.attn.set_k_proj(Linear::new(w, None));
+
+    pub fn set_attn_k(&mut self, w: B::Tensor) -> Result<()> {
+        let hidden = self.config.hidden_size;
+        let head_dim = hidden / self.config.num_attention_heads;
+        let kv_hidden = self.config.num_key_value_heads * head_dim;
+
+        let shape = w.shape().dims();
+        println!(
+            "set_attn_k: input weight shape: {:?}, hidden={}, kv_hidden={}",
+            shape, hidden, kv_hidden
+        );
+
+        if shape == [kv_hidden, hidden] {
+            let w = w.transpose(0, 1)?.contiguous()?;
+            println!("transposed weight shape: {:?}", w.shape().dims());
+            self.attn.set_k_proj(Linear::new(w, None));
+        } else {
+            self.attn.set_k_proj(Linear::new(w, None));
+        }
+        Ok(())
     }
-    pub fn set_attn_v(&mut self, w: B::Tensor) {
-        self.attn.set_v_proj(Linear::new(w, None));
+
+    // Same for set_attn_v
+
+    pub fn set_attn_v(&mut self, w: B::Tensor) -> Result<()> {
+        let hidden = self.config.hidden_size;
+        let head_dim = hidden / self.config.num_attention_heads;
+        let kv_hidden = self.config.num_key_value_heads * head_dim;
+
+        let shape = w.shape().dims();
+        println!(
+            "set_attn_v: input weight shape: {:?}, hidden={}, kv_hidden={}",
+            shape, hidden, kv_hidden
+        );
+        if shape == [kv_hidden, hidden] {
+            let w = w.transpose(0, 1)?.contiguous()?;
+            println!("transposed weight shape: {:?}", w.shape().dims());
+            self.attn.set_v_proj(Linear::new(w, None));
+        } else {
+            self.attn.set_v_proj(Linear::new(w, None));
+        }
+        Ok(())
     }
+
     pub fn set_attn_o(&mut self, w: B::Tensor) {
         self.attn.set_o_proj(Linear::new(w, None));
     }
@@ -121,6 +184,16 @@ impl<B: Backend> Block<B> {
     }
     pub fn ffn_norm_weight(&self) -> &B::Tensor {
         &self.ffn_norm.weight
+    }
+
+    pub fn gate_proj(&self) -> &Linear<B> {
+        self.ffn.gate_proj()
+    }
+    pub fn up_proj(&self) -> &Linear<B> {
+        self.ffn.up_proj()
+    }
+    pub fn down_proj(&self) -> &Linear<B> {
+        self.ffn.down_proj()
     }
 }
 

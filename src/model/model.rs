@@ -1,6 +1,8 @@
 use crate::core::backend::Backend;
+use crate::core::backend::MetalTensor;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
+use crate::core::error::CoreError;
 use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
@@ -78,6 +80,14 @@ impl<B: Backend> LlamaModel<B> {
         mut kv_cache: Option<&mut Vec<(B::Tensor, B::Tensor)>>,
         offset: usize,
     ) -> Result<B::Tensor> {
+        // Use the Metal fast path only for single‑token decode (seq_len == 1)
+        if self.embedding.weight().device().is_metal() && token_ids.len() == 1 {
+            #[cfg(feature = "metal")]
+            return self.forward_metal(token_ids, kv_cache, offset);
+            #[cfg(not(feature = "metal"))]
+            return Err(CoreError::Internal("Metal feature not enabled".into()));
+        }
+
         let seq_len = token_ids.len();
         let x = self.embedding.forward(token_ids)?;
         let mut x = x.unsqueeze(0)?;
@@ -85,7 +95,6 @@ impl<B: Backend> LlamaModel<B> {
         let mask = self.causal_mask(seq_len, &device)?;
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
-        let should_dump = offset == 0;
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
             let cache = kv_cache
@@ -148,6 +157,386 @@ impl<B: Backend> LlamaModel<B> {
         Ok(logits)
     }
 
+    #[cfg(feature = "metal")]
+    fn forward_metal(
+        &mut self,
+        token_ids: &[u32],
+        mut kv_cache: Option<&mut Vec<(B::Tensor, B::Tensor)>>,
+        offset: usize,
+    ) -> Result<B::Tensor> {
+        use crate::core::tensor::TensorOps;
+        use crate::metal::runner::MetalRunner;
+        use crate::metal::state::global_metal_state;
+
+        let seq_len = token_ids.len();
+
+        let hidden = self.config.hidden_size;
+        let n_heads = self.config.num_attention_heads;
+        let n_kv_heads = self.config.num_key_value_heads;
+        let head_dim = hidden / n_heads;
+        let theta = self.config.rope_theta as f32;
+        let eps = self.config.rms_norm_eps as f32;
+
+        let state = global_metal_state()
+            .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
+        let alloc = state
+            .alloc
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runner = MetalRunner::new(&state, &alloc)?;
+
+        let x_emb = self.embedding.forward(token_ids)?;
+        let mut x = x_emb.unsqueeze(0)?; // [1, seq_len, hidden]
+
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            // ---- RMS norm ----
+            let norm_out = B::Tensor::zeros_like(&x)?;
+            runner.rms_norm(
+                x.as_metal()
+                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                block
+                    .attn_norm
+                    .weight()
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("attn_norm not Metal".into()))?,
+                norm_out
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("norm_out not Metal".into()))?,
+                eps,
+            )?;
+
+            // ---- Q, K, V projections with transposed weights ----
+            let norm_2d = norm_out.reshape(&Shape::new(&[seq_len, hidden]))?;
+
+            let q_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
+            let q_weight = block.attn.q_proj.weight().transpose(0, 1)?.contiguous()?;
+            runner.broadcast_matmul(
+                norm_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("norm_2d not Metal".into()))?,
+                q_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("q_weight not Metal".into()))?,
+                q_2d.as_metal()
+                    .ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
+            )?;
+
+            let k_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
+            let k_weight = block.attn.k_proj.weight().transpose(0, 1)?.contiguous()?;
+            runner.broadcast_matmul(
+                norm_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("norm_2d not Metal".into()))?,
+                k_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("k_weight not Metal".into()))?,
+                k_2d.as_metal()
+                    .ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
+            )?;
+
+            let v_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
+            let v_weight = block.attn.v_proj.weight().transpose(0, 1)?.contiguous()?;
+            runner.broadcast_matmul(
+                norm_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("norm_2d not Metal".into()))?,
+                v_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("v_weight not Metal".into()))?,
+                v_2d.as_metal()
+                    .ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
+            )?;
+
+            // Reshape to [1, seq_len, n_heads, head_dim]
+            let q = q_2d.reshape(&Shape::new(&[1, seq_len, n_heads, head_dim]))?;
+            let k = k_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
+            let v = v_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
+
+            // ---- RoPE on copies ----
+            let q_data = q.to_vec_f32()?;
+            let mut q_rope = B::Tensor::from_slice(&q_data, q.shape(), q.device())?;
+            runner.rope(
+                q_rope
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("q_rope not Metal".into()))?,
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                theta,
+                offset as u32,
+            )?;
+
+            let k_data = k.to_vec_f32()?;
+            let mut k_rope = B::Tensor::from_slice(&k_data, k.shape(), k.device())?;
+            runner.rope(
+                k_rope
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("k_rope not Metal".into()))?,
+                seq_len as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                theta,
+                offset as u32,
+            )?;
+
+            // ---- Update KV cache ----
+            if let Some(ref mut cache) = kv_cache {
+                if i < cache.len() {
+                    let (k_cache, v_cache) = &mut cache[i];
+                    let new_k = B::Tensor::cat(&[k_cache, &k_rope], 1)?;
+                    let new_v = B::Tensor::cat(&[v_cache, &v], 1)?;
+                    *k_cache = new_k;
+                    *v_cache = new_v;
+                } else {
+                    cache.push((k_rope.clone(), v.clone()));
+                }
+            }
+
+            // ---- Determine K and V for attention ----
+            // For the first token (cache currently has 1 token), we use that single token as both query and key/value.
+            // For subsequent tokens, we use the full cache.
+            let (k_for_attn, v_for_attn) = if let Some(ref mut cache) = kv_cache {
+                if i < cache.len() {
+                    let (k_ref, v_ref) = &cache[i];
+                    (Some(k_ref), Some(v_ref))
+                } else {
+                    // This shouldn't happen because we just pushed the first token above,
+                    // but as a fallback, use current K/V.
+                    (Some(&k_rope), Some(&v))
+                }
+            } else {
+                // No cache: use current K/V (only for first token)
+                (Some(&k_rope), Some(&v))
+            };
+
+            // ---- Attention QK (only last token) ----
+            let q_last = q_rope.narrow(1, seq_len - 1, 1)?.squeeze(1)?.squeeze(0)?;
+            let scores = B::Tensor::zeros(&Shape::new(&[n_heads, seq_len]), x.dtype(), x.device())?;
+
+            if let (Some(k_ref), Some(v_ref)) = (k_for_attn, v_for_attn) {
+                runner.attention_qk(
+                    q_last
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("q_last not Metal".into()))?,
+                    k_ref
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("k_ref not Metal".into()))?,
+                    scores
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
+                    n_heads as u32,
+                    head_dim as u32,
+                    seq_len as u32,
+                    offset as u32,
+                )?;
+
+                // ---- Softmax ----
+                let probs = B::Tensor::zeros_like(&scores)?;
+                runner.softmax(
+                    scores
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
+                    probs
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("probs not Metal".into()))?,
+                )?;
+
+                // ---- Attention PV ----
+                let attn_out =
+                    B::Tensor::zeros(&Shape::new(&[n_heads, head_dim]), x.dtype(), x.device())?;
+                runner.attention_pv(
+                    probs
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("probs not Metal".into()))?,
+                    v_ref
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("v_ref not Metal".into()))?,
+                    attn_out
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("attn_out not Metal".into()))?,
+                    n_heads as u32,
+                    seq_len as u32,
+                    head_dim as u32,
+                    offset as u32,
+                )?;
+
+                let attn_reshaped = attn_out.reshape(&Shape::new(&[1, 1, hidden]))?;
+
+                // ---- Output projection (with transposed weight) ----
+                let attn_proj =
+                    B::Tensor::zeros(&Shape::new(&[1, 1, hidden]), x.dtype(), x.device())?;
+                let o_weight = block.attn.o_proj.weight().transpose(0, 1)?.contiguous()?;
+                runner.broadcast_matmul(
+                    attn_reshaped
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("attn_reshaped not Metal".into()))?,
+                    o_weight
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("o_weight not Metal".into()))?,
+                    attn_proj
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
+                )?;
+
+                // ---- Residual add ----
+                let x_data = x.to_vec_f32()?;
+                let proj_data = attn_proj.to_vec_f32()?;
+                let mut summed = Vec::with_capacity(x_data.len());
+                for (a, b) in x_data.iter().zip(proj_data.iter()) {
+                    summed.push(a + b);
+                }
+                x = B::Tensor::from_slice(&summed, x.shape(), x.device())?;
+            } else {
+                return Err(CoreError::Internal("No K/V available for attention".into()));
+            }
+            // ---- FFN ----
+            let ffn_norm_out = B::Tensor::zeros_like(&x)?;
+            runner.rms_norm(
+                x.as_metal()
+                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                block
+                    .ffn_norm
+                    .weight()
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("ffn_norm not Metal".into()))?,
+                ffn_norm_out
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("ffn_norm_out not Metal".into()))?,
+                eps,
+            )?;
+
+            let ffn_2d = ffn_norm_out.reshape(&Shape::new(&[seq_len, hidden]))?;
+
+            // Gate, Up, Down with transposed weights
+            let gate_2d = B::Tensor::zeros(
+                &Shape::new(&[seq_len, self.config.intermediate_size]),
+                x.dtype(),
+                x.device(),
+            )?;
+            let gate_weight = block
+                .ffn
+                .gate_proj()
+                .weight()
+                .transpose(0, 1)?
+                .contiguous()?;
+            runner.broadcast_matmul(
+                ffn_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("ffn_2d not Metal".into()))?,
+                gate_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("gate_weight not Metal".into()))?,
+                gate_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
+            )?;
+
+            let up_2d = B::Tensor::zeros(
+                &Shape::new(&[seq_len, self.config.intermediate_size]),
+                x.dtype(),
+                x.device(),
+            )?;
+            let up_weight = block.ffn.up_proj().weight().transpose(0, 1)?.contiguous()?;
+            runner.broadcast_matmul(
+                ffn_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("ffn_2d not Metal".into()))?,
+                up_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("up_weight not Metal".into()))?,
+                up_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
+            )?;
+
+            let swiglu_out = B::Tensor::zeros(
+                &Shape::new(&[seq_len, self.config.intermediate_size]),
+                x.dtype(),
+                x.device(),
+            )?;
+            runner.swiglu(
+                gate_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
+                up_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
+                swiglu_out
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("swiglu_out not Metal".into()))?,
+                (seq_len * self.config.intermediate_size) as u32,
+            )?;
+
+            let down_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
+            let down_weight = block
+                .ffn
+                .down_proj()
+                .weight()
+                .transpose(0, 1)?
+                .contiguous()?;
+            runner.broadcast_matmul(
+                swiglu_out
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("swiglu_out not Metal".into()))?,
+                down_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("down_weight not Metal".into()))?,
+                down_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
+            )?;
+
+            // Residual add
+            let x_data2 = x.to_vec_f32()?;
+            let down_data = down_2d.to_vec_f32()?;
+            let mut summed2 = Vec::with_capacity(x_data2.len());
+            for (a, b) in x_data2.iter().zip(down_data.iter()) {
+                summed2.push(a + b);
+            }
+            x = B::Tensor::from_slice(&summed2, x.shape(), x.device())?;
+        }
+
+        // ---- Final RMS norm and LM head with transposed weight ----
+        let final_norm = B::Tensor::zeros_like(&x)?;
+        runner.rms_norm(
+            x.as_metal()
+                .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+            self.norm
+                .weight()
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("norm weight not Metal".into()))?,
+            final_norm
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("final_norm not Metal".into()))?,
+            eps,
+        )?;
+
+        let final_2d = final_norm.reshape(&Shape::new(&[seq_len, hidden]))?;
+        let logits_2d = B::Tensor::zeros(
+            &Shape::new(&[seq_len, self.config.vocab_size]),
+            x.dtype(),
+            x.device(),
+        )?;
+        let lm_weight = self.lm_head.weight().transpose(0, 1)?.contiguous()?;
+        runner.broadcast_matmul(
+            final_2d
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("final_2d not Metal".into()))?,
+            lm_weight
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("lm_weight not Metal".into()))?,
+            logits_2d
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
+        )?;
+
+        println!("logits_2d shape: {:?}", logits_2d.shape());
+        let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
+
+        runner.finish()?;
+        Ok(logits)
+    }
+
     pub fn set_tensor(
         &mut self,
         kind: &crate::weights::loader::LlamaTensor,
@@ -182,8 +571,8 @@ impl<B: Backend> LlamaModel<B> {
                 match layer {
                     BlockLayer::AttnNorm => block.set_attn_norm(tensor),
                     BlockLayer::AttnQ => block.set_attn_q(tensor),
-                    BlockLayer::AttnK => block.set_attn_k(tensor),
-                    BlockLayer::AttnV => block.set_attn_v(tensor),
+                    BlockLayer::AttnK => block.set_attn_k(tensor)?,
+                    BlockLayer::AttnV => block.set_attn_v(tensor)?,
                     BlockLayer::AttnOutput => block.set_attn_o(tensor),
                     BlockLayer::FfnNorm => block.set_ffn_norm(tensor),
                     BlockLayer::FfnGate => block.set_ffn_gate(tensor),
@@ -216,7 +605,7 @@ mod tests {
             hidden_size: 64,
             num_hidden_layers: 2,
             num_attention_heads: 4,
-            num_key_value_heads: 2,
+            num_key_value_heads: 4,
             intermediate_size: 128,
             vocab_size: 256,
             max_position_embeddings: 128,
@@ -394,7 +783,8 @@ mod metal_tests {
         let device = ensure_metal_device();
         let config = make_config();
         let mut model = LlamaModel::<MetalBackend>::new(&config, &device).unwrap();
-        let logits = model.forward(&[42u32], None, 0).unwrap();
+        let mut cache = Vec::new();
+        let logits = model.forward(&[42u32], Some(&mut cache), 0).unwrap();
         assert_eq!(logits.shape().dim(0).unwrap(), 1);
         assert_eq!(logits.shape().dim(1).unwrap(), 1);
     }
@@ -404,7 +794,8 @@ mod metal_tests {
         let device = ensure_metal_device();
         let config = make_config();
         let mut model = LlamaModel::<MetalBackend>::new(&config, &device).unwrap();
-        let logits = model.forward(&[1u32, 2, 3], None, 0).unwrap();
+        let mut cache = Vec::new();
+        let logits = model.forward(&[42u32], Some(&mut cache), 0).unwrap();
         let values = logits.to_vec_f32().unwrap();
         assert!(!values.iter().any(|x| x.is_nan()));
         assert!(!values.iter().any(|x| x.is_infinite()));
