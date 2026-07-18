@@ -7,6 +7,7 @@ use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 use crate::model::block::Block;
+use crate::model::block::FeedForwardLayer;
 use crate::model::config::ModelConfig;
 use crate::model::embedding::Embedding;
 use crate::model::linear::Linear;
@@ -18,6 +19,7 @@ pub struct LlamaModel<B: Backend> {
     norm: RmsNorm<B>,
     lm_head: Linear<B>,
     config: ModelConfig,
+    metal_lm_head_weight: Option<B::Tensor>,
 }
 
 impl<B: Backend> LlamaModel<B> {
@@ -52,7 +54,16 @@ impl<B: Backend> LlamaModel<B> {
             norm,
             lm_head,
             config: config.clone(),
+            metal_lm_head_weight: Option::None,
         })
+    }
+
+    pub fn prepare_metal(&mut self) -> Result<()> {
+        for block in self.blocks.iter_mut() {
+            block.prepare_metal()?;
+        }
+        self.metal_lm_head_weight = Some(self.lm_head.weight().transpose(0, 1)?.contiguous()?);
+        Ok(())
     }
 
     pub fn config(&self) -> &ModelConfig {
@@ -183,7 +194,7 @@ impl<B: Backend> LlamaModel<B> {
             .alloc
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let runner = MetalRunner::new(&state, &alloc)?;
+        let mut runner = MetalRunner::new(&state, &alloc)?;
 
         let x_emb = self.embedding.forward(token_ids)?;
         let mut x = x_emb.unsqueeze(0)?; // [1, seq_len, hidden]
@@ -205,11 +216,26 @@ impl<B: Backend> LlamaModel<B> {
                 eps,
             )?;
 
-            // ---- Q, K, V projections with transposed weights ----
+            // ---- Q, K, V projections — cached, pre-transposed weights ----
             let norm_2d = norm_out.reshape(&Shape::new(&[seq_len, hidden]))?;
 
+            let q_weight = block.attn.metal_q_weight.as_ref().ok_or_else(|| {
+                CoreError::Internal(
+                    "metal weights not prepared — call model.prepare_metal()".into(),
+                )
+            })?;
+            let k_weight = block.attn.metal_k_weight.as_ref().ok_or_else(|| {
+                CoreError::Internal(
+                    "metal weights not prepared — call model.prepare_metal()".into(),
+                )
+            })?;
+            let v_weight = block.attn.metal_v_weight.as_ref().ok_or_else(|| {
+                CoreError::Internal(
+                    "metal weights not prepared — call model.prepare_metal()".into(),
+                )
+            })?;
+
             let q_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
-            let q_weight = block.attn.q_proj.weight().transpose(0, 1)?.contiguous()?;
             runner.broadcast_matmul(
                 norm_2d
                     .as_metal()
@@ -221,8 +247,11 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
             )?;
 
-            let k_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
-            let k_weight = block.attn.k_proj.weight().transpose(0, 1)?.contiguous()?;
+            let k_2d = B::Tensor::zeros(
+                &Shape::new(&[seq_len, n_kv_heads * head_dim]),
+                x.dtype(),
+                x.device(),
+            )?;
             runner.broadcast_matmul(
                 norm_2d
                     .as_metal()
@@ -234,8 +263,11 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
             )?;
 
-            let v_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
-            let v_weight = block.attn.v_proj.weight().transpose(0, 1)?.contiguous()?;
+            let v_2d = B::Tensor::zeros(
+                &Shape::new(&[seq_len, n_kv_heads * head_dim]),
+                x.dtype(),
+                x.device(),
+            )?;
             runner.broadcast_matmul(
                 norm_2d
                     .as_metal()
@@ -247,12 +279,12 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
             )?;
 
-            // Reshape to [1, seq_len, n_heads, head_dim]
             let q = q_2d.reshape(&Shape::new(&[1, seq_len, n_heads, head_dim]))?;
             let k = k_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
             let v = v_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
 
-            // ---- RoPE on copies ----
+            runner.flush()?;
+
             let q_data = q.to_vec_f32()?;
             let mut q_rope = B::Tensor::from_slice(&q_data, q.shape(), q.device())?;
             runner.rope(
@@ -279,7 +311,8 @@ impl<B: Backend> LlamaModel<B> {
                 offset as u32,
             )?;
 
-            // ---- Update KV cache ----
+            runner.flush()?;
+
             if let Some(ref mut cache) = kv_cache {
                 if i < cache.len() {
                     let (k_cache, v_cache) = &mut cache[i];
@@ -292,24 +325,17 @@ impl<B: Backend> LlamaModel<B> {
                 }
             }
 
-            // ---- Determine K and V for attention ----
-            // For the first token (cache currently has 1 token), we use that single token as both query and key/value.
-            // For subsequent tokens, we use the full cache.
             let (k_for_attn, v_for_attn) = if let Some(ref mut cache) = kv_cache {
                 if i < cache.len() {
                     let (k_ref, v_ref) = &cache[i];
                     (Some(k_ref), Some(v_ref))
                 } else {
-                    // This shouldn't happen because we just pushed the first token above,
-                    // but as a fallback, use current K/V.
                     (Some(&k_rope), Some(&v))
                 }
             } else {
-                // No cache: use current K/V (only for first token)
                 (Some(&k_rope), Some(&v))
             };
 
-            // ---- Attention QK (only last token) ----
             let q_last = q_rope.narrow(1, seq_len - 1, 1)?.squeeze(1)?.squeeze(0)?;
             let scores = B::Tensor::zeros(&Shape::new(&[n_heads, seq_len]), x.dtype(), x.device())?;
 
@@ -325,12 +351,12 @@ impl<B: Backend> LlamaModel<B> {
                         .as_metal()
                         .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
                     n_heads as u32,
+                    n_kv_heads as u32,
                     head_dim as u32,
                     seq_len as u32,
                     offset as u32,
                 )?;
 
-                // ---- Softmax ----
                 let probs = B::Tensor::zeros_like(&scores)?;
                 runner.softmax(
                     scores
@@ -341,7 +367,6 @@ impl<B: Backend> LlamaModel<B> {
                         .ok_or_else(|| CoreError::Internal("probs not Metal".into()))?,
                 )?;
 
-                // ---- Attention PV ----
                 let attn_out =
                     B::Tensor::zeros(&Shape::new(&[n_heads, head_dim]), x.dtype(), x.device())?;
                 runner.attention_pv(
@@ -355,6 +380,7 @@ impl<B: Backend> LlamaModel<B> {
                         .as_metal()
                         .ok_or_else(|| CoreError::Internal("attn_out not Metal".into()))?,
                     n_heads as u32,
+                    n_kv_heads as u32,
                     seq_len as u32,
                     head_dim as u32,
                     offset as u32,
@@ -362,10 +388,13 @@ impl<B: Backend> LlamaModel<B> {
 
                 let attn_reshaped = attn_out.reshape(&Shape::new(&[1, 1, hidden]))?;
 
-                // ---- Output projection (with transposed weight) ----
+                let o_weight = block.attn.metal_o_weight.as_ref().ok_or_else(|| {
+                    CoreError::Internal(
+                        "metal weights not prepared — call model.prepare_metal()".into(),
+                    )
+                })?;
                 let attn_proj =
                     B::Tensor::zeros(&Shape::new(&[1, 1, hidden]), x.dtype(), x.device())?;
-                let o_weight = block.attn.o_proj.weight().transpose(0, 1)?.contiguous()?;
                 runner.broadcast_matmul(
                     attn_reshaped
                         .as_metal()
@@ -378,18 +407,22 @@ impl<B: Backend> LlamaModel<B> {
                         .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
                 )?;
 
-                // ---- Residual add ----
-                let x_data = x.to_vec_f32()?;
-                let proj_data = attn_proj.to_vec_f32()?;
-                let mut summed = Vec::with_capacity(x_data.len());
-                for (a, b) in x_data.iter().zip(proj_data.iter()) {
-                    summed.push(a + b);
-                }
-                x = B::Tensor::from_slice(&summed, x.shape(), x.device())?;
+                let x_new = B::Tensor::zeros_like(&x)?;
+                runner.add(
+                    x.as_metal()
+                        .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                    attn_proj
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
+                    x_new
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("x_new not Metal".into()))?,
+                )?;
+                x = x_new;
             } else {
                 return Err(CoreError::Internal("No K/V available for attention".into()));
             }
-            // ---- FFN ----
+
             let ffn_norm_out = B::Tensor::zeros_like(&x)?;
             runner.rms_norm(
                 x.as_metal()
@@ -407,18 +440,35 @@ impl<B: Backend> LlamaModel<B> {
 
             let ffn_2d = ffn_norm_out.reshape(&Shape::new(&[seq_len, hidden]))?;
 
-            // Gate, Up, Down with transposed weights
+            let ff = match &block.ffn {
+                FeedForwardLayer::Dense(ff) => ff,
+                FeedForwardLayer::Moe(_) => {
+                    return Err(CoreError::Internal(
+                        "MoE not supported on the Metal fast path yet".into(),
+                    ))
+                }
+            };
+            let gate_weight = ff.metal_gate_weight.as_ref().ok_or_else(|| {
+                CoreError::Internal(
+                    "metal weights not prepared — call model.prepare_metal()".into(),
+                )
+            })?;
+            let up_weight = ff.metal_up_weight.as_ref().ok_or_else(|| {
+                CoreError::Internal(
+                    "metal weights not prepared — call model.prepare_metal()".into(),
+                )
+            })?;
+            let down_weight = ff.metal_down_weight.as_ref().ok_or_else(|| {
+                CoreError::Internal(
+                    "metal weights not prepared — call model.prepare_metal()".into(),
+                )
+            })?;
+
             let gate_2d = B::Tensor::zeros(
                 &Shape::new(&[seq_len, self.config.intermediate_size]),
                 x.dtype(),
                 x.device(),
             )?;
-            let gate_weight = block
-                .ffn
-                .gate_proj()
-                .weight()
-                .transpose(0, 1)?
-                .contiguous()?;
             runner.broadcast_matmul(
                 ffn_2d
                     .as_metal()
@@ -436,7 +486,6 @@ impl<B: Backend> LlamaModel<B> {
                 x.dtype(),
                 x.device(),
             )?;
-            let up_weight = block.ffn.up_proj().weight().transpose(0, 1)?.contiguous()?;
             runner.broadcast_matmul(
                 ffn_2d
                     .as_metal()
@@ -468,12 +517,6 @@ impl<B: Backend> LlamaModel<B> {
             )?;
 
             let down_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
-            let down_weight = block
-                .ffn
-                .down_proj()
-                .weight()
-                .transpose(0, 1)?
-                .contiguous()?;
             runner.broadcast_matmul(
                 swiglu_out
                     .as_metal()
@@ -486,17 +529,20 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
             )?;
 
-            // Residual add
-            let x_data2 = x.to_vec_f32()?;
-            let down_data = down_2d.to_vec_f32()?;
-            let mut summed2 = Vec::with_capacity(x_data2.len());
-            for (a, b) in x_data2.iter().zip(down_data.iter()) {
-                summed2.push(a + b);
-            }
-            x = B::Tensor::from_slice(&summed2, x.shape(), x.device())?;
+            let x_new2 = B::Tensor::zeros_like(&x)?;
+            runner.add(
+                x.as_metal()
+                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                down_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
+                x_new2
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("x_new2 not Metal".into()))?,
+            )?;
+            x = x_new2;
         }
 
-        // ---- Final RMS norm and LM head with transposed weight ----
         let final_norm = B::Tensor::zeros_like(&x)?;
         runner.rms_norm(
             x.as_metal()
@@ -517,7 +563,9 @@ impl<B: Backend> LlamaModel<B> {
             x.dtype(),
             x.device(),
         )?;
-        let lm_weight = self.lm_head.weight().transpose(0, 1)?.contiguous()?;
+        let lm_weight = self.metal_lm_head_weight.as_ref().ok_or_else(|| {
+            CoreError::Internal("metal weights not prepared — call model.prepare_metal()".into())
+        })?;
         runner.broadcast_matmul(
             final_2d
                 .as_metal()
@@ -530,7 +578,6 @@ impl<B: Backend> LlamaModel<B> {
                 .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
         )?;
 
-        println!("logits_2d shape: {:?}", logits_2d.shape());
         let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
 
         runner.finish()?;

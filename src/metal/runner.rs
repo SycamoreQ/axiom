@@ -30,6 +30,20 @@ impl<'a> MetalRunner<'a> {
         })
     }
 
+    pub fn flush(&mut self) -> Result<()> {
+        self.encoder.endEncoding();
+        self.cmd_buf.commit();
+        self.cmd_buf.waitUntilCompleted();
+
+        let cmd_buf = self.state.ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| MetalError::Internal("failed to create compute encoder".into()))?;
+        self.cmd_buf = cmd_buf;
+        self.encoder = encoder;
+        Ok(())
+    }
+
     pub fn rms_norm(
         &self,
         input: &MetalTensor,
@@ -282,21 +296,37 @@ impl<'a> MetalRunner<'a> {
         k_cache: &MetalTensor,
         scores: &MetalTensor,
         n_heads: u32,
+        n_kv_heads: u32,
         head_dim: u32,
         seq_len: u32,
         current_pos: u32,
     ) -> Result<()> {
-        self.state.kernels.attention_qk_f16(
-            &self.encoder,
-            self.allocator,
-            q.block(),
-            k_cache.block(),
-            scores.block(),
-            n_heads,
-            head_dim,
-            seq_len,
-            current_pos,
-        )?;
+        match q.metal_dtype() {
+            DType::F32 => self.state.kernels.attention_qk_f32(
+                &self.encoder,
+                self.allocator,
+                q.block(),
+                k_cache.block(),
+                scores.block(),
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                current_pos,
+            )?,
+            DType::F16 => self.state.kernels.attention_qk_f16(
+                &self.encoder,
+                self.allocator,
+                q.block(),
+                k_cache.block(),
+                scores.block(),
+                n_heads,
+                head_dim,
+                seq_len,
+                current_pos,
+            )?,
+            _ => return Err(MetalError::Internal("attention_qk: unsupported dtype".into()).into()),
+        }
         Ok(())
     }
 
@@ -306,21 +336,37 @@ impl<'a> MetalRunner<'a> {
         v_cache: &MetalTensor,
         out: &MetalTensor,
         n_heads: u32,
+        n_kv_heads: u32,
         seq_len: u32,
         head_dim: u32,
         current_pos: u32,
     ) -> Result<()> {
-        self.state.kernels.attention_pv_f16(
-            &self.encoder,
-            self.allocator,
-            scores.block(),
-            v_cache.block(),
-            out.block(),
-            n_heads,
-            seq_len,
-            head_dim,
-            current_pos,
-        )?;
+        match scores.metal_dtype() {
+            DType::F32 => self.state.kernels.attention_pv_f32(
+                &self.encoder,
+                self.allocator,
+                scores.block(),
+                v_cache.block(),
+                out.block(),
+                n_heads,
+                n_kv_heads,
+                seq_len,
+                head_dim,
+                current_pos,
+            )?,
+            DType::F16 => self.state.kernels.attention_pv_f16(
+                &self.encoder,
+                self.allocator,
+                scores.block(),
+                v_cache.block(),
+                out.block(),
+                n_heads,
+                seq_len,
+                head_dim,
+                current_pos,
+            )?,
+            _ => return Err(MetalError::Internal("attention_pv: unsupported dtype".into()).into()),
+        }
         Ok(())
     }
 
@@ -339,6 +385,22 @@ impl<'a> MetalRunner<'a> {
             output.block(),
             num_elements,
         )?;
+        Ok(())
+    }
+
+    pub fn add(&self, a: &MetalTensor, b: &MetalTensor, output: &MetalTensor) -> Result<()> {
+        let num_elements = output.metal_shape().numel() as u32;
+        match a.metal_dtype() {
+            DType::F32 => self.state.kernels.add_f32(
+                &self.encoder,
+                self.allocator,
+                a.block(),
+                b.block(),
+                output.block(),
+                num_elements,
+            )?,
+            _ => return Err(MetalError::Internal("add: unsupported dtype".into()).into()),
+        }
         Ok(())
     }
 

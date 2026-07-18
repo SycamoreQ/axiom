@@ -37,6 +37,13 @@ impl<B: Backend> FeedForwardLayer<B> {
             FeedForwardLayer::Moe(_) => panic!("down_proj not supported for MoE layer"),
         }
     }
+
+    pub fn prepare_metal_weights(&mut self) -> Result<()> {
+        match self {
+            FeedForwardLayer::Dense(ff) => ff.prepare_metal_weights(),
+            FeedForwardLayer::Moe(_) => Ok(()), // not on the Metal fast path yet
+        }
+    }
 }
 
 pub struct Block<B: Backend> {
@@ -118,45 +125,12 @@ impl<B: Backend> Block<B> {
     }
 
     pub fn set_attn_k(&mut self, w: B::Tensor) -> Result<()> {
-        let hidden = self.config.hidden_size;
-        let head_dim = hidden / self.config.num_attention_heads;
-        let kv_hidden = self.config.num_key_value_heads * head_dim;
-
-        let shape = w.shape().dims();
-        println!(
-            "set_attn_k: input weight shape: {:?}, hidden={}, kv_hidden={}",
-            shape, hidden, kv_hidden
-        );
-
-        if shape == [kv_hidden, hidden] {
-            let w = w.transpose(0, 1)?.contiguous()?;
-            println!("transposed weight shape: {:?}", w.shape().dims());
-            self.attn.set_k_proj(Linear::new(w, None));
-        } else {
-            self.attn.set_k_proj(Linear::new(w, None));
-        }
+        self.attn.set_k_proj(Linear::new(w, None));
         Ok(())
     }
 
-    // Same for set_attn_v
-
     pub fn set_attn_v(&mut self, w: B::Tensor) -> Result<()> {
-        let hidden = self.config.hidden_size;
-        let head_dim = hidden / self.config.num_attention_heads;
-        let kv_hidden = self.config.num_key_value_heads * head_dim;
-
-        let shape = w.shape().dims();
-        println!(
-            "set_attn_v: input weight shape: {:?}, hidden={}, kv_hidden={}",
-            shape, hidden, kv_hidden
-        );
-        if shape == [kv_hidden, hidden] {
-            let w = w.transpose(0, 1)?.contiguous()?;
-            println!("transposed weight shape: {:?}", w.shape().dims());
-            self.attn.set_v_proj(Linear::new(w, None));
-        } else {
-            self.attn.set_v_proj(Linear::new(w, None));
-        }
+        self.attn.set_v_proj(Linear::new(w, None));
         Ok(())
     }
 
@@ -194,6 +168,11 @@ impl<B: Backend> Block<B> {
     }
     pub fn down_proj(&self) -> &Linear<B> {
         self.ffn.down_proj()
+    }
+
+    pub fn prepare_metal(&mut self) -> Result<()> {
+        self.attn.prepare_metal_weights()?;
+        self.ffn.prepare_metal_weights()
     }
 }
 

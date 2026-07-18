@@ -19,6 +19,10 @@ pub struct Attention<B: Backend> {
     rope_theta: f64,
     head_dim: usize,
     scale: f32, // 1/sqrt(head_dim) — precomputed
+    pub metal_q_weight: Option<B::Tensor>,
+    pub metal_k_weight: Option<B::Tensor>,
+    pub metal_v_weight: Option<B::Tensor>,
+    pub metal_o_weight: Option<B::Tensor>,
 }
 
 impl<B: Backend> Attention<B> {
@@ -58,7 +62,19 @@ impl<B: Backend> Attention<B> {
             head_dim,
             rope_theta,
             scale,
+            metal_q_weight: Option::None,
+            metal_k_weight: Option::None,
+            metal_v_weight: Option::None,
+            metal_o_weight: Option::None,
         })
+    }
+
+    pub fn prepare_metal_weights(&mut self) -> Result<()> {
+        self.metal_q_weight = Some(self.q_proj.weight().transpose(0, 1)?.contiguous()?);
+        self.metal_k_weight = Some(self.k_proj.weight().transpose(0, 1)?.contiguous()?);
+        self.metal_v_weight = Some(self.v_proj.weight().transpose(0, 1)?.contiguous()?);
+        self.metal_o_weight = Some(self.o_proj.weight().transpose(0, 1)?.contiguous()?);
+        Ok(())
     }
 
     pub fn apply_cpu_rope(

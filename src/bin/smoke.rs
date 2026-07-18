@@ -64,9 +64,13 @@ fn main() {
         print!("Loading model... ");
         std::io::stdout().flush().unwrap();
 
-        let model = load_from_gguf::<MetalBackend>(Path::new(&gguf_path), &device)
+        let mut model = load_from_gguf::<MetalBackend>(Path::new(&gguf_path), &device)
             .expect("failed to load model");
-        println!("ok");
+        model
+            .prepare_metal()
+            .expect("failed to prepare metal weights");
+
+        println!("Ok");
 
         let embd = model.embedding.weight().to_vec_f32().unwrap();
         println!("token_embd[0..10]: {:?}", &embd[..10]);

@@ -13,6 +13,9 @@ pub struct FeedForward<B: Backend> {
     pub gate_proj: Linear<B>, // [intermediate_size, hidden_size]
     pub up_proj: Linear<B>,   // [intermediate_size, hidden_size]
     pub down_proj: Linear<B>, // [hidden_size, intermediate_size]
+    pub metal_gate_weight: Option<B::Tensor>,
+    pub metal_up_weight: Option<B::Tensor>,
+    pub metal_down_weight: Option<B::Tensor>,
 }
 
 impl<B: Backend> FeedForward<B> {
@@ -30,7 +33,17 @@ impl<B: Backend> FeedForward<B> {
             gate_proj,
             up_proj,
             down_proj,
+            metal_gate_weight: Option::None,
+            metal_up_weight: Option::None,
+            metal_down_weight: Option::None,
         })
+    }
+
+    pub fn prepare_metal_weights(&mut self) -> Result<()> {
+        self.metal_gate_weight = Some(self.gate_proj.weight().transpose(0, 1)?.contiguous()?);
+        self.metal_up_weight = Some(self.up_proj.weight().transpose(0, 1)?.contiguous()?);
+        self.metal_down_weight = Some(self.down_proj.weight().transpose(0, 1)?.contiguous()?);
+        Ok(())
     }
 
     pub fn forward(&self, x: &B::Tensor) -> Result<B::Tensor> {
