@@ -178,7 +178,6 @@ impl<B: Backend> LlamaModel<B> {
         use crate::core::tensor::TensorOps;
         use crate::metal::runner::MetalRunner;
         use crate::metal::state::global_metal_state;
-        eprintln!("FORWARD_METAL BUILD MARKER v7 — swiglu+cache_len fixes active");
 
         let seq_len = token_ids.len();
 
@@ -314,6 +313,8 @@ impl<B: Backend> LlamaModel<B> {
                 offset as u32,
             )?;
 
+            runner.flush()?;
+
             if let Some(ref mut cache) = kv_cache {
                 if i < cache.len() {
                     let (k_cache, v_cache) = &mut cache[i];
@@ -337,91 +338,104 @@ impl<B: Backend> LlamaModel<B> {
                 (Some(&k_rope), Some(&v))
             };
 
-            let q_last = q_rope.narrow(1, seq_len - 1, 1)?.squeeze(1)?.squeeze(0)?;
             let cache_len = k_for_attn
                 .as_ref()
                 .map(|k| k.shape().dims()[1])
                 .unwrap_or(seq_len) as u32;
-            let scores = B::Tensor::zeros(
-                &Shape::new(&[n_heads, cache_len as usize]),
-                x.dtype(),
-                x.device(),
+            let mut attn_rows: Vec<f32> = Vec::with_capacity(seq_len * hidden);
+
+            for p in 0..seq_len {
+                let q_p = q_rope.narrow(1, p, 1)?.squeeze(1)?.squeeze(0)?;
+                let current_pos = (offset + p) as u32;
+                let scores = B::Tensor::zeros(
+                    &Shape::new(&[n_heads, cache_len as usize]),
+                    x.dtype(),
+                    x.device(),
+                )?;
+
+                if let (Some(k_ref), Some(v_ref)) = (k_for_attn, v_for_attn) {
+                    runner.attention_qk(
+                        q_p.as_metal()
+                            .ok_or_else(|| CoreError::Internal("q_p not Metal".into()))?,
+                        k_ref
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("k_ref not Metal".into()))?,
+                        scores
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        cache_len,
+                        current_pos,
+                    )?;
+
+                    let attn_out_p =
+                        B::Tensor::zeros(&Shape::new(&[n_heads, head_dim]), x.dtype(), x.device())?;
+                    runner.attention_pv(
+                        scores
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
+                        v_ref
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("v_ref not Metal".into()))?,
+                        attn_out_p
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("attn_out_p not Metal".into()))?,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        cache_len,
+                        head_dim as u32,
+                        current_pos,
+                    )?;
+
+                    attn_rows.extend(
+                        runner.read_f32(
+                            attn_out_p.as_metal().ok_or_else(|| {
+                                CoreError::Internal("attn_out_p not Metal".into())
+                            })?,
+                        )?,
+                    );
+                } else {
+                    return Err(CoreError::Internal("No K/V available for attention".into()));
+                }
+            }
+
+            let attn_reshaped =
+                B::Tensor::from_slice(&attn_rows, &Shape::new(&[1, seq_len, hidden]), x.device())?;
+
+            let o_weight = block.attn.metal_o_weight.as_ref().ok_or_else(|| {
+                CoreError::Internal(
+                    "metal weights not prepared — call model.prepare_metal()".into(),
+                )
+            })?;
+
+            let attn_proj = B::Tensor::zeros(&Shape::new(&[1, 1, hidden]), x.dtype(), x.device())?;
+
+            runner.broadcast_matmul(
+                attn_reshaped
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("attn_reshaped not Metal".into()))?,
+                o_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("o_weight not Metal".into()))?,
+                attn_proj
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
             )?;
 
-            if let (Some(k_ref), Some(v_ref)) = (k_for_attn, v_for_attn) {
-                let current_pos = (offset + seq_len - 1) as u32;
-                runner.attention_qk(
-                    q_last
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("q_last not Metal".into()))?,
-                    k_ref
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("k_ref not Metal".into()))?,
-                    scores
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
-                    n_heads as u32,
-                    n_kv_heads as u32,
-                    head_dim as u32,
-                    cache_len,
-                    current_pos,
-                )?;
-
-                let attn_out =
-                    B::Tensor::zeros(&Shape::new(&[n_heads, head_dim]), x.dtype(), x.device())?;
-                runner.attention_pv(
-                    scores
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("probs not Metal".into()))?,
-                    v_ref
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("v_ref not Metal".into()))?,
-                    attn_out
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("attn_out not Metal".into()))?,
-                    n_heads as u32,
-                    n_kv_heads as u32,
-                    cache_len,
-                    head_dim as u32,
-                    current_pos,
-                )?;
-
-                let attn_reshaped = attn_out.reshape(&Shape::new(&[1, 1, hidden]))?;
-
-                let o_weight = block.attn.metal_o_weight.as_ref().ok_or_else(|| {
-                    CoreError::Internal(
-                        "metal weights not prepared — call model.prepare_metal()".into(),
-                    )
-                })?;
-                let attn_proj =
-                    B::Tensor::zeros(&Shape::new(&[1, 1, hidden]), x.dtype(), x.device())?;
-                runner.broadcast_matmul(
-                    attn_reshaped
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("attn_reshaped not Metal".into()))?,
-                    o_weight
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("o_weight not Metal".into()))?,
-                    attn_proj
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
-                )?;
-
-                let x_new = B::Tensor::zeros_like(&x)?;
-                runner.add(
-                    x.as_metal()
-                        .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
-                    attn_proj
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
-                    x_new
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("x_new not Metal".into()))?,
-                )?;
-                x = x_new;
-            } else {
-                return Err(CoreError::Internal("No K/V available for attention".into()));
-            }
+            let x_new = B::Tensor::zeros_like(&x)?;
+            runner.add(
+                x.as_metal()
+                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                attn_proj
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
+                x_new
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("x_new not Metal".into()))?,
+            )?;
+            x = x_new;
 
             let ffn_norm_out = B::Tensor::zeros_like(&x)?;
             runner.rms_norm(
@@ -448,6 +462,7 @@ impl<B: Backend> LlamaModel<B> {
                     ))
                 }
             };
+
             let gate_weight = ff.metal_gate_weight.as_ref().ok_or_else(|| {
                 CoreError::Internal(
                     "metal weights not prepared — call model.prepare_metal()".into(),
@@ -577,7 +592,9 @@ impl<B: Backend> LlamaModel<B> {
                 .as_metal()
                 .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
         )?;
+
         runner.finish()?;
+
         let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
         let logits_vec = logits.to_vec_f32()?;
         let nan_count = logits_vec.iter().filter(|v| v.is_nan()).count();
@@ -590,6 +607,7 @@ impl<B: Backend> LlamaModel<B> {
                 logits_vec.len()
             );
         }
+
         Ok(logits)
     }
 

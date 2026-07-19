@@ -14,9 +14,6 @@ kernel void swiglu_f32(
     float gate_val = gate[tid];
     float up_val = up[tid];
 
-    // Compute silu(up)
-    float silu_val = up_val * (1.0f / (1.0f + exp(-up_val)));
-
-    // Fuse: gate * silu(up)
-    output[tid] = gate_val * silu_val;
+    float silu_val = gate_val * (1.0f / (1.0f + exp(-gate_val)));
+    output[tid] = silu_val * up_val;
 }

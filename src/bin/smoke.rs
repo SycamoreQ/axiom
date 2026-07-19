@@ -83,24 +83,6 @@ fn main() {
             .to_vec_f32()
             .unwrap();
 
-        for &tok in &[52107u32, 9741, 1490, 3174, 2790] {
-            let tok = tok as usize;
-            let raw_row: Vec<f32> = raw[tok * hidden..(tok + 1) * hidden].to_vec();
-            let prepared_col: Vec<f32> = (0..hidden)
-                .map(|i| prepared[i * vocab_size + tok])
-                .collect();
-            let max_diff = raw_row
-                .iter()
-                .zip(&prepared_col)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            println!(
-                "token {tok}: max_diff={max_diff}, raw[0..4]={:?}, prepared[0..4]={:?}",
-                &raw_row[..4],
-                &prepared_col[..4]
-            );
-        }
-
         println!("Ok");
 
         let embd = model.embedding.weight().to_vec_f32().unwrap();
@@ -181,11 +163,6 @@ fn main() {
         for (sid, token) in &results {
             if *sid == session_id {
                 let t = *token as u32;
-                eprintln!(
-                    "DEBUG token={} text={:?}",
-                    token,
-                    engine.tokenizer().decode(&[*token as usize])
-                );
                 if t == 128255 || t == 128001 || t == 128009 || t == 2 {
                     stop_reason = Some("Stop token generated");
                     break;

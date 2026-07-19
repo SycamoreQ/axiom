@@ -13,9 +13,6 @@ kernel void swiglu_f16(
     float gate_val = float(gate[tid]);
     float up_val = float(up[tid]);
 
-    // compute silu(up_val) — you fill this in
-    float silu_val = up_val * (1.0f / (1.0f + exp(-up_val)));
-
-    // fuse: gate * silu(up)
-    output[tid] = half(gate_val * silu_val);
+    float silu_val = gate_val * (1.0f / (1.0f + exp(-gate_val)));
+    output[tid] = silu_val * up_val;
 }
