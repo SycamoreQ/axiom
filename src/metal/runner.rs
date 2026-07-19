@@ -1,6 +1,7 @@
 use crate::core::backend::MetalTensor;
 use crate::core::dtype::DType;
 use crate::core::error::{CoreError, Result};
+use crate::core::tensor::TensorOps;
 use crate::metal::allocator::MetalAllocator;
 use crate::metal::error::MetalError;
 use crate::metal::state::MetalState;
@@ -42,6 +43,11 @@ impl<'a> MetalRunner<'a> {
         self.cmd_buf = cmd_buf;
         self.encoder = encoder;
         Ok(())
+    }
+
+    pub fn read_f32(&mut self, tensor: &MetalTensor) -> Result<Vec<f32>> {
+        self.flush()?;
+        tensor.to_vec_f32()
     }
 
     pub fn rms_norm(

@@ -1998,11 +1998,6 @@ impl TensorOps for MetalTensor {
     }
 
     fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        if let Some(state) = crate::metal::state::global_metal_state() {
-            let cmd_buf = state.ctx.command_buffer()?;
-            cmd_buf.commit(); // 1. Flush all previous work to the GPU
-            cmd_buf.waitUntilCompleted(); // 2. Safely wait for it all to finish
-        }
         let n = self.shape.numel();
         let mut out = vec![0.0f32; n];
         let dims = self.shape.dims();

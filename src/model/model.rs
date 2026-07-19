@@ -282,9 +282,10 @@ impl<B: Backend> LlamaModel<B> {
             let k = k_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
             let v = v_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
 
-            runner.flush()?;
-
-            let q_data = q.to_vec_f32()?;
+            let q_data = runner.read_f32(
+                q.as_metal()
+                    .ok_or_else(|| CoreError::Internal("q not Metal".into()))?,
+            )?;
             let mut q_rope = B::Tensor::from_slice(&q_data, q.shape(), q.device())?;
             runner.rope(
                 q_rope
@@ -297,7 +298,10 @@ impl<B: Backend> LlamaModel<B> {
                 offset as u32,
             )?;
 
-            let k_data = k.to_vec_f32()?;
+            let k_data = runner.read_f32(
+                k.as_metal()
+                    .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
+            )?;
             let mut k_rope = B::Tensor::from_slice(&k_data, k.shape(), k.device())?;
             runner.rope(
                 k_rope
@@ -309,8 +313,6 @@ impl<B: Backend> LlamaModel<B> {
                 theta,
                 offset as u32,
             )?;
-
-            runner.flush()?;
 
             if let Some(ref mut cache) = kv_cache {
                 if i < cache.len() {

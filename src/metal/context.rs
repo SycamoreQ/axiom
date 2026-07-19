@@ -35,23 +35,6 @@ impl MetalContext {
             .commandBuffer()
             .ok_or(MetalError::NoCommandBuffer)
     }
-
-    pub fn synchronize(&self) -> Result<()> {
-        let buffer = self.command_buffer()?;
-
-        buffer.commit();
-        buffer.waitUntilCompleted();
-
-        unsafe {
-            if buffer.status() == MTLCommandBufferStatus::Error {
-                if let Some(err) = buffer.error() {
-                    return Err(MetalError::Internal(err.localizedDescription().to_string()));
-                }
-                return Err(MetalError::Internal("Unknown Metal error".to_string()));
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
