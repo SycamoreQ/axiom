@@ -17,9 +17,9 @@ pub struct LlamaModel<B: Backend> {
     pub embedding: Embedding<B>,
     pub blocks: Vec<Block<B>>,
     norm: RmsNorm<B>,
-    lm_head: Linear<B>,
+    pub lm_head: Linear<B>,
     config: ModelConfig,
-    metal_lm_head_weight: Option<B::Tensor>,
+    pub metal_lm_head_weight: Option<B::Tensor>,
 }
 
 impl<B: Backend> LlamaModel<B> {
@@ -178,6 +178,7 @@ impl<B: Backend> LlamaModel<B> {
         use crate::core::tensor::TensorOps;
         use crate::metal::runner::MetalRunner;
         use crate::metal::state::global_metal_state;
+        eprintln!("FORWARD_METAL BUILD MARKER v7 — swiglu+cache_len fixes active");
 
         let seq_len = token_ids.len();
 
@@ -574,7 +575,7 @@ impl<B: Backend> LlamaModel<B> {
                 .as_metal()
                 .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
         )?;
-
+        runner.finish()?;
         let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
         let logits_vec = logits.to_vec_f32()?;
         let nan_count = logits_vec.iter().filter(|v| v.is_nan()).count();
@@ -587,7 +588,6 @@ impl<B: Backend> LlamaModel<B> {
                 logits_vec.len()
             );
         }
-        runner.finish()?;
         Ok(logits)
     }
 

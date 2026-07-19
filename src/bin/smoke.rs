@@ -70,6 +70,37 @@ fn main() {
             .prepare_metal()
             .expect("failed to prepare metal weights");
 
+        let vocab_size = model.config().vocab_size;
+        let hidden = model.config().hidden_size;
+
+        // pre-transpose, canonical [vocab, hidden] — row for a token is contiguous
+        let raw = model.lm_head.weight().to_vec_f32().unwrap();
+        // post-transpose+contiguous, [hidden, vocab] — same token is now a strided column
+        let prepared = model
+            .metal_lm_head_weight
+            .as_ref()
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+
+        for &tok in &[52107u32, 9741, 1490, 3174, 2790] {
+            let tok = tok as usize;
+            let raw_row: Vec<f32> = raw[tok * hidden..(tok + 1) * hidden].to_vec();
+            let prepared_col: Vec<f32> = (0..hidden)
+                .map(|i| prepared[i * vocab_size + tok])
+                .collect();
+            let max_diff = raw_row
+                .iter()
+                .zip(&prepared_col)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "token {tok}: max_diff={max_diff}, raw[0..4]={:?}, prepared[0..4]={:?}",
+                &raw_row[..4],
+                &prepared_col[..4]
+            );
+        }
+
         println!("Ok");
 
         let embd = model.embedding.weight().to_vec_f32().unwrap();
