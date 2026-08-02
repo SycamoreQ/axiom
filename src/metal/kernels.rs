@@ -26,6 +26,8 @@ const ADD_F32_MSL: &str = include_str!("kernels/add_f32.metal");
 const ATTN_QK_F32_MSL: &str = include_str!("kernels/attention_qk_f32.metal");
 const ATTN_PV_F32_MSL: &str = include_str!("kernels/attention_pv_f32.metal");
 const ADD_F16_MSL: &str = include_str!("kernels/add_f16.metal");
+const CACHE_WRITE_F32_MSL: &str = include_str!("kernels/cache_write_f32.metal");
+const CACHE_WRITE_F16_MSL: &str = include_str!("kernels/cache_write_f16.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -44,6 +46,8 @@ pub struct MetalKernels {
     pub attention_qk_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_pv_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub add_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub cache_write_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub cache_write_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -105,6 +109,8 @@ impl MetalKernels {
             attention_qk_f32_pipeline: build_pipeline(ATTN_QK_F32_MSL, "attention_qk_f32")?,
             attention_pv_f32_pipeline: build_pipeline(ATTN_PV_F32_MSL, "attention_pv_f32")?,
             add_f16_pipeline: build_pipeline(ADD_F16_MSL, "add_f16")?,
+            cache_write_f32_pipeline: build_pipeline(CACHE_WRITE_F32_MSL, "cache_write_f32")?,
+            cache_write_f16_pipeline: build_pipeline(CACHE_WRITE_F16_MSL, "cache_write_f16")?,
         })
     }
 
@@ -975,7 +981,7 @@ impl MetalKernels {
         }
         Ok(())
     }
-    
+
     pub fn add_f16(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1005,6 +1011,126 @@ impl MetalKernels {
         };
         let threadgroup = MTLSize {
             width: 64,
+            height: 1,
+            depth: 1,
+        };
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+        Ok(())
+    }
+
+    pub fn cache_write_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        src: &BlockHandle,
+        cache: &BlockHandle,
+        write_pos: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        write_len: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.cache_write_f32_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(src.metal_buffer(allocator)),
+                src.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(cache.metal_buffer(allocator)),
+                cache.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&write_pos as *const u32 as *mut c_void),
+                4,
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_kv_heads as *const u32 as *mut c_void),
+                4,
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&head_dim as *const u32 as *mut c_void),
+                4,
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&write_len as *const u32 as *mut c_void),
+                4,
+                5,
+            );
+        }
+        let grid = MTLSize {
+            width: write_len as usize,
+            height: n_kv_heads as usize,
+            depth: head_dim as usize,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+        Ok(())
+    }
+
+    pub fn cache_write_f16(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        src: &BlockHandle,
+        cache: &BlockHandle,
+        write_pos: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        write_len: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.cache_write_f16_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(src.metal_buffer(allocator)),
+                src.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(cache.metal_buffer(allocator)),
+                cache.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&write_pos as *const u32 as *mut c_void),
+                4,
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_kv_heads as *const u32 as *mut c_void),
+                4,
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&head_dim as *const u32 as *mut c_void),
+                4,
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&write_len as *const u32 as *mut c_void),
+                4,
+                5,
+            );
+        }
+        let grid = MTLSize {
+            width: write_len as usize,
+            height: n_kv_heads as usize,
+            depth: head_dim as usize,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
             height: 1,
             depth: 1,
         };

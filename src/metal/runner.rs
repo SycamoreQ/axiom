@@ -429,6 +429,41 @@ impl<'a> MetalRunner<'a> {
         Ok(())
     }
 
+    pub fn cache_write(
+        &self,
+        src: &MetalTensor,
+        cache: &MetalTensor,
+        write_pos: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        write_len: u32,
+    ) -> Result<()> {
+        match src.metal_dtype() {
+            DType::F32 => self.state.kernels.cache_write_f32(
+                &self.encoder,
+                self.allocator,
+                src.block(),
+                cache.block(),
+                write_pos,
+                n_kv_heads,
+                head_dim,
+                write_len,
+            )?,
+            DType::F16 => self.state.kernels.cache_write_f16(
+                &self.encoder,
+                self.allocator,
+                src.block(),
+                cache.block(),
+                write_pos,
+                n_kv_heads,
+                head_dim,
+                write_len,
+            )?,
+            _ => return Err(MetalError::Internal("cache_write: unsupported dtype".into()).into()),
+        }
+        Ok(())
+    }
+
     pub fn finish(self) -> Result<()> {
         self.encoder.endEncoding();
         self.cmd_buf.commit();

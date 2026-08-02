@@ -77,12 +77,14 @@ where
         self.drafted_total += drafted_pairs.len();
         let next_tokens = session.next_input_tokens().to_vec();
         let tokens_to_verify: Vec<u32> = drafted_pairs.iter().map(|(t, _)| *t).collect();
+        let max_seq_len = session.prompt_tokens.len() + session.max_new_tokens;
+
 
         if drafted_pairs.is_empty() {
             // gamma == 0: just sample one token from target
-            let logits = self
-                .target
-                .forward(&tokens_to_verify, None, session.offset)?;
+            let logits =
+                self.target
+                    .forward(&tokens_to_verify, None, session.offset, max_seq_len)?;
             let seq_len = logits.shape().dim(1)?;
             let last = logits.narrow(1, seq_len - 1, 1)?.squeeze(0)?.squeeze(0)?;
             let logits_vec = last.to_vec_f32()?;
@@ -95,10 +97,10 @@ where
 
         let tokens_to_verify: Vec<u32> = drafted_pairs.iter().map(|(t, _)| *t).collect();
 
-        //batched target forward over all draft tokens
-        let target_logits_tensor = self
-            .target
-            .forward(&tokens_to_verify, None, session.offset)?;
+        // Batched draft verification:
+        let target_logits_tensor =
+            self.target
+                .forward(&tokens_to_verify, None, session.offset, max_seq_len)?;
 
         let gamma = drafted_pairs.len();
         let mut accepted_tokens: Vec<u32> = Vec::new();

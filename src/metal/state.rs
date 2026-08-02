@@ -9,7 +9,7 @@ use crate::metal::MetalKernels;
 #[derive(Debug)]
 pub struct MetalState {
     pub ctx: MetalContext,
-    pub alloc: Mutex<MetalAllocator>, // Mutex because alloc is &mut for alloc/free
+    pub alloc: MetalAllocator, // Mutex because alloc is &mut for alloc/free
     pub kernels: MetalKernels,
 }
 
@@ -34,7 +34,7 @@ impl MetalState {
         let kernels = MetalKernels::new(ctx.device.raw())?;
         Ok(Self {
             ctx,
-            alloc: Mutex::new(alloc),
+            alloc: alloc,
             kernels,
         })
     }
@@ -52,10 +52,9 @@ mod tests {
     }
 
     #[test]
-    fn test_allocator_mutex() {
+    fn test_allocator_direct() {
         let state = global_metal_state().unwrap();
-        let mut alloc = state.alloc.lock().unwrap();
-        let block = alloc.alloc(128, 16).unwrap();
+        let block = state.alloc.alloc(128, 16).unwrap();
         assert!(!block.ptr.is_null());
     }
 }

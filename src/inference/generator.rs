@@ -44,9 +44,13 @@ impl<B: Backend> Generator<B> {
 
     pub fn step(&mut self, session: &mut Session<B>) -> Result<u32, GeneratorError> {
         let session_tokens = session.next_input_tokens().to_vec();
-        let logits =
-            self.model
-                .forward(&session_tokens, Some(&mut session.kv_cache), session.offset)?;
+        let max_seq_len = session.prompt_tokens.len() + session.max_new_tokens;
+        let logits = self.model.forward(
+            &session_tokens,
+            Some(&mut session.kv_cache),
+            session.offset,
+            max_seq_len,
+        )?;
 
         session.offset += session_tokens.len();
 

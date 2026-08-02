@@ -145,6 +145,38 @@ impl MetalTensor {
     pub(crate) fn as_metal(&self) -> Option<&MetalTensor> {
         Some(self)
     }
+
+    pub(crate) fn zeros_pooled(
+        shape: Shape,
+        size_bytes: usize,
+        dtype: DType,
+        device: Device,
+        state: Arc<MetalState>,
+    ) -> Result<Self> {
+        let handle = state
+            .alloc
+            .alloc(size_bytes, 256)
+            .map_err(|e| CoreError::Metal(format!("Allocation failed: {e:?}")))?;
+        let offset_bytes = handle.offset_bytes;
+
+        unsafe {
+            std::ptr::write_bytes(handle.ptr, 0, size_bytes);
+        }
+        let strides = Self::compute_strides(shape.dims());
+        Ok(Self {
+            state,
+            block: Arc::new(handle),
+            shape,
+            strides,
+            offset_bytes,
+            dtype,
+            device,
+        })
+    }
+
+    pub fn free_pooled(&self, state: &MetalState) {
+        state.alloc.free((*self.block).clone());
+    }
 }
 
 pub struct TopKOutput<T> {
@@ -169,8 +201,10 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
         self.shape().numel()
     }
 
-    // creation
     fn zeros(shape: &Shape, dtype: DType, device: &Device) -> crate::core::error::Result<Self>;
+    fn zeros_pooled(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
+        Self::zeros(shape, dtype, device)
+    }
     fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self>;
     fn ones(shape: &Shape, dtype: DType, device: &Device) -> crate::core::error::Result<Self>;
     fn from_slice<E: Element>(data: &[E], shape: &Shape, device: &Device) -> Result<Self>;
@@ -977,6 +1011,23 @@ impl TensorOps for MetalTensor {
         Self::from_bytes_direct(state, &data, shape.clone(), dtype, device.clone())
     }
 
+    fn zeros_pooled(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
+        let state = global_metal_state()
+            .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
+        let size_bytes = shape.numel() * dtype.size_in_bytes();
+        let block = state.alloc.alloc(size_bytes, 16)?;
+        unsafe {
+            std::ptr::write_bytes(block.ptr, 0, size_bytes);
+        }
+        Ok(Self::new_contiguous(
+            state,
+            Arc::new(block),
+            shape.clone(),
+            dtype,
+            device.clone(),
+        ))
+    }
+
     fn ones(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
         let n = shape.numel();
         let state = global_metal_state()
@@ -1405,7 +1456,7 @@ impl TensorOps for MetalTensor {
         match self_.dtype {
             DType::F32 => state.kernels.softmax_f32(
                 &encoder,
-                &state.alloc.lock().unwrap(),
+                &state.alloc,
                 &self_.block,
                 &output.block,
                 num_rows as u32,
@@ -1413,7 +1464,7 @@ impl TensorOps for MetalTensor {
             )?,
             DType::F16 => state.kernels.softmax_f16(
                 &encoder,
-                &state.alloc.lock().unwrap(),
+                &state.alloc,
                 &self_.block,
                 &output.block,
                 num_rows as u32,
@@ -1473,7 +1524,7 @@ impl TensorOps for MetalTensor {
         match self.dtype {
             DType::F32 => state.kernels.rms_norm_f32(
                 &encoder,
-                &state.alloc.lock().unwrap(),
+                &state.alloc,
                 &self.block,
                 &weight.block,
                 &output.block,
@@ -1483,7 +1534,7 @@ impl TensorOps for MetalTensor {
             )?,
             DType::F16 => state.kernels.rms_norm_f16(
                 &encoder,
-                &state.alloc.lock().unwrap(),
+                &state.alloc,
                 &self.block,
                 &weight.block,
                 &output.block,
@@ -1532,7 +1583,7 @@ impl TensorOps for MetalTensor {
         match self_.dtype {
             DType::F32 => state.kernels.rope_f32(
                 &encoder,
-                &state.alloc.lock().unwrap(),
+                &state.alloc,
                 &output.block,
                 seq_len as u32,
                 n_heads as u32,
@@ -1542,7 +1593,7 @@ impl TensorOps for MetalTensor {
             )?,
             DType::F16 => state.kernels.rope_f16(
                 &encoder,
-                &state.alloc.lock().unwrap(),
+                &state.alloc,
                 &output.block,
                 seq_len as u32,
                 n_heads as u32,
@@ -1629,7 +1680,7 @@ impl TensorOps for MetalTensor {
             match self_.dtype {
                 DType::F32 => state.kernels.matmul_f32(
                     &encoder,
-                    &state.alloc.lock().unwrap(),
+                    &state.alloc,
                     &block_a,
                     &block_b,
                     &block_c,
@@ -1639,7 +1690,7 @@ impl TensorOps for MetalTensor {
                 )?,
                 DType::F16 => state.kernels.matmul_f16(
                     &encoder,
-                    &state.alloc.lock().unwrap(),
+                    &state.alloc,
                     &block_a,
                     &block_b,
                     &block_c,

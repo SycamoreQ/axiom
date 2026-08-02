@@ -90,11 +90,12 @@ impl<B: Backend> LlamaModel<B> {
         token_ids: &[u32],
         mut kv_cache: Option<&mut Vec<(B::Tensor, B::Tensor)>>,
         offset: usize,
+        max_seq_len: usize,
     ) -> Result<B::Tensor> {
         // Use the Metal fast path only for single‑token decode (seq_len == 1)
         if self.embedding.weight().device().is_metal() && token_ids.len() == 1 {
             #[cfg(feature = "metal")]
-            return self.forward_metal(token_ids, kv_cache, offset);
+            return self.forward_metal(token_ids, kv_cache, offset, max_seq_len);
             #[cfg(not(feature = "metal"))]
             return Err(CoreError::Internal("Metal feature not enabled".into()));
         }
@@ -174,7 +175,10 @@ impl<B: Backend> LlamaModel<B> {
         token_ids: &[u32],
         mut kv_cache: Option<&mut Vec<(B::Tensor, B::Tensor)>>,
         offset: usize,
+        max_seq_len: usize,
     ) -> Result<B::Tensor> {
+        use std::eprintln;
+
         use crate::core::tensor::TensorOps;
         use crate::metal::runner::MetalRunner;
         use crate::metal::state::global_metal_state;
@@ -190,17 +194,16 @@ impl<B: Backend> LlamaModel<B> {
 
         let state = global_metal_state()
             .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
-        let alloc = state
-            .alloc
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut runner = MetalRunner::new(&state, &alloc)?;
+        let alloc = &state.alloc;
+        //alloc.reset();
+        let mut runner = MetalRunner::new(&state, alloc)?;
 
         let x_emb = self.embedding.forward(token_ids)?;
         let mut x = x_emb.unsqueeze(0)?; // [1, seq_len, hidden]
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
-            let norm_out = B::Tensor::zeros_like(&x)?;
+            use std::eprintln;
+            let norm_out = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
             runner.rms_norm(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -281,15 +284,13 @@ impl<B: Backend> LlamaModel<B> {
             let k = k_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
             let v = v_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
 
-            let q_data = runner.read_f32(
+            // RoPE runs in place on the GPU tensors the matmuls just wrote --
+            // no CPU round-trip, no separate q_rope/k_rope upload. q_rope/k_rope
+            // are just aliases so the rest of the function (which references
+            // those names) doesn't need to change.
+            runner.rope(
                 q.as_metal()
                     .ok_or_else(|| CoreError::Internal("q not Metal".into()))?,
-            )?;
-            let mut q_rope = B::Tensor::from_slice(&q_data, q.shape(), q.device())?;
-            runner.rope(
-                q_rope
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("q_rope not Metal".into()))?,
                 seq_len as u32,
                 n_heads as u32,
                 head_dim as u32,
@@ -297,15 +298,9 @@ impl<B: Backend> LlamaModel<B> {
                 offset as u32,
             )?;
 
-            let k_data = runner.read_f32(
+            runner.rope(
                 k.as_metal()
                     .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
-            )?;
-            let mut k_rope = B::Tensor::from_slice(&k_data, k.shape(), k.device())?;
-            runner.rope(
-                k_rope
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("k_rope not Metal".into()))?,
                 seq_len as u32,
                 n_kv_heads as u32,
                 head_dim as u32,
@@ -313,36 +308,115 @@ impl<B: Backend> LlamaModel<B> {
                 offset as u32,
             )?;
 
-            runner.flush()?;
+            let q_rope = q;
+            let k_rope = k;
+
+            // flush() used to be required here so cat()'s CPU-side cache growth
+            // could read raw bytes off the K/V buffers. Now that the cache is
+            // preallocated and grown via cache_write (a GPU kernel that reads
+            // these same buffers directly, still within this encoder), nothing
+            // downstream needs the CPU to see this data -- Metal already
+            // sequences dependent GPU work correctly within one encoder.
+
+            // k_rope/v are [1, seq_len, n_kv_heads, head_dim] here (seq_len is
+            // always 1 for every call that reaches forward_metal, since the
+            // caller only routes single-token decode here). Flatten to
+            // [seq_len, n_kv_heads, head_dim] -- cache_write treats its src
+            // and cache buffers as flat [positions, n_kv_heads, head_dim]
+            // regardless of the Tensor's own declared shape.
+            let k_flat = k_rope.reshape(&Shape::new(&[seq_len, n_kv_heads, head_dim]))?;
+            let v_flat = v.reshape(&Shape::new(&[seq_len, n_kv_heads, head_dim]))?;
 
             if let Some(ref mut cache) = kv_cache {
-                if i < cache.len() {
-                    let (k_cache, v_cache) = &mut cache[i];
-                    let new_k = B::Tensor::cat(&[k_cache, &k_rope], 1)?;
-                    let new_v = B::Tensor::cat(&[v_cache, &v], 1)?;
-                    *k_cache = new_k;
-                    *v_cache = new_v;
-                } else {
-                    cache.push((k_rope.clone(), v.clone()));
+                if i >= cache.len() {
+                    // No cache for this layer at all yet (e.g. forward_metal
+                    // called directly with no prior prefill). Allocate the
+                    // full max_seq_len buffer up front.
+                    let cache_shape = Shape::new(&[max_seq_len, n_kv_heads, head_dim]);
+                    let k_persist = B::Tensor::zeros(&cache_shape, x.dtype(), x.device())?;
+                    let v_persist = B::Tensor::zeros(&cache_shape, x.dtype(), x.device())?;
+                    cache.push((k_persist, v_persist));
+                } else if cache[i].0.shape().dims()[0] != max_seq_len {
+                    // Cache exists but is still the tightly-sized
+                    // [1, filled_len, n_kv_heads, head_dim] tensor the
+                    // generic (non-Metal) prefill path builds via cat().
+                    // Migrate its contents into a max_seq_len buffer once,
+                    // so every later decode step can cache_write in place
+                    // instead of reallocating on every call.
+                    let filled_len = offset;
+                    let cache_shape = Shape::new(&[max_seq_len, n_kv_heads, head_dim]);
+                    let k_persist = B::Tensor::zeros(&cache_shape, x.dtype(), x.device())?;
+                    let v_persist = B::Tensor::zeros(&cache_shape, x.dtype(), x.device())?;
+                    if filled_len > 0 {
+                        let (old_k, old_v) = &cache[i];
+                        let old_k_flat =
+                            old_k.reshape(&Shape::new(&[filled_len, n_kv_heads, head_dim]))?;
+                        let old_v_flat =
+                            old_v.reshape(&Shape::new(&[filled_len, n_kv_heads, head_dim]))?;
+                        runner.cache_write(
+                            old_k_flat.as_metal().ok_or_else(|| {
+                                CoreError::Internal("old_k_flat not Metal".into())
+                            })?,
+                            k_persist
+                                .as_metal()
+                                .ok_or_else(|| CoreError::Internal("k_persist not Metal".into()))?,
+                            0u32,
+                            n_kv_heads as u32,
+                            head_dim as u32,
+                            filled_len as u32,
+                        )?;
+                        runner.cache_write(
+                            old_v_flat.as_metal().ok_or_else(|| {
+                                CoreError::Internal("old_v_flat not Metal".into())
+                            })?,
+                            v_persist
+                                .as_metal()
+                                .ok_or_else(|| CoreError::Internal("v_persist not Metal".into()))?,
+                            0u32,
+                            n_kv_heads as u32,
+                            head_dim as u32,
+                            filled_len as u32,
+                        )?;
+                    }
+                    cache[i] = (k_persist, v_persist);
                 }
+
+                let (k_cache, v_cache) = &cache[i];
+                runner.cache_write(
+                    k_flat
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("k_flat not Metal".into()))?,
+                    k_cache
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("k_cache not Metal".into()))?,
+                    offset as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    seq_len as u32,
+                )?;
+                runner.cache_write(
+                    v_flat
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("v_flat not Metal".into()))?,
+                    v_cache
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("v_cache not Metal".into()))?,
+                    offset as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    seq_len as u32,
+                )?;
             }
 
-            let (k_for_attn, v_for_attn) = if let Some(ref mut cache) = kv_cache {
-                if i < cache.len() {
-                    let (k_ref, v_ref) = &cache[i];
-                    (Some(k_ref), Some(v_ref))
-                } else {
-                    (Some(&k_rope), Some(&v))
-                }
-            } else {
-                (Some(&k_rope), Some(&v))
+            let (k_for_attn, v_for_attn): (&B::Tensor, &B::Tensor) = match &kv_cache {
+                Some(cache) => (&cache[i].0, &cache[i].1),
+                None => (&k_flat, &v_flat),
             };
-
-            let cache_len = k_for_attn
-                .as_ref()
-                .map(|k| k.shape().dims()[1])
-                .unwrap_or(seq_len) as u32;
-            let mut attn_rows: Vec<f32> = Vec::with_capacity(seq_len * hidden);
+            let cache_len = match &kv_cache {
+                Some(_) => (offset + seq_len) as u32,
+                None => seq_len as u32,
+            };
+            let mut attn_out_final: Option<B::Tensor> = None;
 
             for p in 0..seq_len {
                 let q_p = q_rope.narrow(1, p, 1)?.squeeze(1)?.squeeze(0)?;
@@ -353,56 +427,52 @@ impl<B: Backend> LlamaModel<B> {
                     x.device(),
                 )?;
 
-                if let (Some(k_ref), Some(v_ref)) = (k_for_attn, v_for_attn) {
-                    runner.attention_qk(
-                        q_p.as_metal()
-                            .ok_or_else(|| CoreError::Internal("q_p not Metal".into()))?,
-                        k_ref
-                            .as_metal()
-                            .ok_or_else(|| CoreError::Internal("k_ref not Metal".into()))?,
-                        scores
-                            .as_metal()
-                            .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
-                        n_heads as u32,
-                        n_kv_heads as u32,
-                        head_dim as u32,
-                        cache_len,
-                        current_pos,
-                    )?;
+                runner.attention_qk(
+                    q_p.as_metal()
+                        .ok_or_else(|| CoreError::Internal("q_p not Metal".into()))?,
+                    k_for_attn
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("k_for_attn not Metal".into()))?,
+                    scores
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    cache_len,
+                    current_pos,
+                )?;
 
-                    let attn_out_p =
-                        B::Tensor::zeros(&Shape::new(&[n_heads, head_dim]), x.dtype(), x.device())?;
-                    runner.attention_pv(
-                        scores
-                            .as_metal()
-                            .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
-                        v_ref
-                            .as_metal()
-                            .ok_or_else(|| CoreError::Internal("v_ref not Metal".into()))?,
-                        attn_out_p
-                            .as_metal()
-                            .ok_or_else(|| CoreError::Internal("attn_out_p not Metal".into()))?,
-                        n_heads as u32,
-                        n_kv_heads as u32,
-                        cache_len,
-                        head_dim as u32,
-                        current_pos,
-                    )?;
+                let attn_out_p =
+                    B::Tensor::zeros(&Shape::new(&[n_heads, head_dim]), x.dtype(), x.device())?;
+                runner.attention_pv(
+                    scores
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
+                    v_for_attn
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("v_for_attn not Metal".into()))?,
+                    attn_out_p
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("attn_out_p not Metal".into()))?,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    cache_len,
+                    head_dim as u32,
+                    current_pos,
+                )?;
 
-                    attn_rows.extend(
-                        runner.read_f32(
-                            attn_out_p.as_metal().ok_or_else(|| {
-                                CoreError::Internal("attn_out_p not Metal".into())
-                            })?,
-                        )?,
-                    );
-                } else {
-                    return Err(CoreError::Internal("No K/V available for attention".into()));
-                }
+                attn_out_final = Some(attn_out_p);
             }
 
-            let attn_reshaped =
-                B::Tensor::from_slice(&attn_rows, &Shape::new(&[1, seq_len, hidden]), x.device())?;
+            // seq_len is always 1 here (forward_metal only ever runs for
+            // single-token decode), so the loop above produced exactly one
+            // position's attention output -- reshape it directly instead of
+            // round-tripping through the CPU to assemble a multi-row buffer
+            // that never has more than one row.
+            let attn_reshaped = attn_out_final
+                .ok_or_else(|| CoreError::Internal("no attention output produced".into()))?
+                .reshape(&Shape::new(&[1, seq_len, hidden]))?;
 
             let o_weight = block.attn.metal_o_weight.as_ref().ok_or_else(|| {
                 CoreError::Internal(
@@ -424,7 +494,7 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
             )?;
 
-            let x_new = B::Tensor::zeros_like(&x)?;
+            let x_new = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
             runner.add(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -437,7 +507,7 @@ impl<B: Backend> LlamaModel<B> {
             )?;
             x = x_new;
 
-            let ffn_norm_out = B::Tensor::zeros_like(&x)?;
+            let ffn_norm_out = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
             runner.rms_norm(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -544,7 +614,7 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
             )?;
 
-            let x_new2 = B::Tensor::zeros_like(&x)?;
+            let x_new2 = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
             runner.add(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -558,7 +628,7 @@ impl<B: Backend> LlamaModel<B> {
             x = x_new2;
         }
 
-        let final_norm = B::Tensor::zeros_like(&x)?;
+        let final_norm = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
         runner.rms_norm(
             x.as_metal()
                 .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,

@@ -5,6 +5,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 use objc2_metal::MTLDevice;
 use objc2_metal::MTLResourceOptions;
+use std::cell::{Cell, RefCell};
 
 #[derive(Clone, Debug)]
 pub struct BlockHandle {
@@ -19,18 +20,6 @@ unsafe impl Send for BlockHandle {}
 unsafe impl Sync for BlockHandle {}
 
 impl BlockHandle {
-    /// The MTLBuffer this block's data actually lives in.
-    ///
-    /// Blocks from the pooled MetalAllocator (Self::zeros/ones, and anything
-    /// allocated via alloc.alloc directly) live inside allocator.buffer() at
-    /// offset_bytes. Blocks created by from_bytes_direct -- which is every
-    /// GGUF-loaded weight, since that's what Tensor::from_slice and the
-    /// loader route through -- get their own dedicated MTLBuffer instead,
-    /// stored here, with offset_bytes always 0 *relative to that buffer*,
-    /// not the pool. Kernel wrappers must bind the right one of these two,
-    /// not unconditionally the pool -- binding the pool for an owned-buffer
-    /// block reads whatever unrelated data sits at that pool offset instead
-    /// of this block's actual contents.
     pub fn metal_buffer<'a>(
         &'a self,
         allocator: &'a MetalAllocator,
@@ -49,8 +38,8 @@ pub struct FreeBlock {
 pub struct MetalAllocator {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     capacity: usize,
-    current_offset: usize,
-    free_list: Vec<FreeBlock>,
+    current_offset: Cell<usize>,
+    free_list: RefCell<Vec<FreeBlock>>,
 }
 
 impl std::fmt::Debug for MetalAllocator {
@@ -64,7 +53,7 @@ unsafe impl Sync for MetalAllocator {}
 
 impl MetalAllocator {
     pub fn new(ctx: &MetalContext, total_size_bytes: usize) -> Result<Self> {
-        let options = MTLResourceOptions::StorageModeShared; // Unified memory for Apple Silicon
+        let options = MTLResourceOptions::StorageModeShared;
         let buffer = ctx
             .device
             .raw()
@@ -79,13 +68,13 @@ impl MetalAllocator {
         Ok(Self {
             buffer,
             capacity: total_size_bytes,
-            current_offset: 0,
-            free_list: Vec::new(),
+            current_offset: Cell::new(0),
+            free_list: RefCell::new(Vec::new()),
         })
     }
 
-    pub fn alloc(&mut self, size: usize, alignment: usize) -> Result<BlockHandle> {
-        if let Some(pos) = self.free_list.iter().position(|b| {
+    pub fn alloc(&self, size: usize, alignment: usize) -> Result<BlockHandle> {
+        if let Some(pos) = self.free_list.borrow().iter().position(|b| {
             let remainder = b.offset_bytes % alignment;
             let padding = if remainder == 0 {
                 0
@@ -94,7 +83,7 @@ impl MetalAllocator {
             };
             b.size >= size + padding
         }) {
-            let block = self.free_list.remove(pos);
+            let block = self.free_list.borrow_mut().remove(pos);
             let remainder = block.offset_bytes % alignment;
             let padding = if remainder == 0 {
                 0
@@ -109,26 +98,27 @@ impl MetalAllocator {
                 offset_bytes: start_offset,
                 size_bytes: size,
                 ptr,
-                owned_buffer: None, // pool-backed, buffer owned by allocator
+                owned_buffer: None,
             });
         }
 
-        let remainder = self.current_offset % alignment;
+        let current = self.current_offset.get();
+        let remainder = current % alignment;
         let padding = if remainder == 0 {
             0
         } else {
             alignment - remainder
         };
-        let start_offset = self.current_offset + padding;
+        let start_offset = current + padding;
 
         if start_offset + size > self.capacity {
             return Err(MetalError::OutOfMemory {
                 requested: size,
-                available: self.capacity - self.current_offset,
+                available: self.capacity - current,
             });
         }
 
-        self.current_offset = start_offset + size;
+        self.current_offset.set(start_offset + size);
 
         let base_ptr = self.buffer.contents().as_ptr() as *mut u8;
         let block_ptr = unsafe { base_ptr.add(start_offset) };
@@ -142,37 +132,46 @@ impl MetalAllocator {
         })
     }
 
-    pub fn free(&mut self, handle: BlockHandle) {
-        self.free_list.push(FreeBlock {
+    pub fn free(&self, handle: BlockHandle) {
+        let mut free_list = self.free_list.borrow_mut();
+        free_list.push(FreeBlock {
             offset_bytes: handle.offset_bytes,
             size: handle.size_bytes,
         });
-        self.free_list.sort_by_key(|b| b.offset_bytes);
+        free_list.sort_by_key(|b| b.offset_bytes);
 
-        // merge contiguous blocks
         let mut merged: Vec<FreeBlock> = Vec::new();
-        for block in self.free_list.drain(..) {
+        for block in free_list.drain(..) {
             if let Some(last) = merged.last_mut() {
                 if last.offset_bytes + last.size == block.offset_bytes {
-                    // contiguous — extend the last block instead of pushing a new one
                     last.size += block.size;
                     continue;
                 }
             }
             merged.push(block);
         }
-        self.free_list = merged;
+        *free_list = merged;
 
-        // if the last free block touches the bump cursor, reclaim it
-        if let Some(last) = self.free_list.last() {
-            if last.offset_bytes + last.size == self.current_offset {
-                self.current_offset = last.offset_bytes;
-                self.free_list.pop();
+        if let Some(last) = free_list.last() {
+            if last.offset_bytes + last.size == self.current_offset.get() {
+                self.current_offset.set(last.offset_bytes);
+                free_list.pop();
             }
         }
     }
+
+    /// Reclaims the entire pool at once: bump cursor back to 0, free list
+    /// cleared. Safe whenever nothing alive still needs pool-backed memory --
+    /// e.g. at the start of a forward_metal call, since the KV cache (the only
+    /// thing that must survive across calls) lives in its own dedicated
+    /// MTLBuffer via zeros()/from_bytes_direct, never in this pool.
+    pub fn reset(&self) {
+        self.current_offset.set(0);
+        self.free_list.borrow_mut().clear();
+    }
+
     pub fn free_count(&self) -> usize {
-        self.free_list.len()
+        self.free_list.borrow().len()
     }
 
     pub fn buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
@@ -194,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_basic_alloc() {
-        let mut alloc = make_allocator(1024);
+        let alloc = make_allocator(1024);
         let h = alloc.alloc(64, 16).unwrap();
         assert_eq!(h.offset_bytes, 0);
         assert_eq!(h.size_bytes, 64);
@@ -203,36 +202,35 @@ mod tests {
 
     #[test]
     fn test_alignment_padding() {
-        let mut alloc = make_allocator(1024);
-        let _h1 = alloc.alloc(3, 1).unwrap(); // bump cursor to 3
-        let h2 = alloc.alloc(16, 16).unwrap(); // should pad to offset 16
+        let alloc = make_allocator(1024);
+        let _h1 = alloc.alloc(3, 1).unwrap();
+        let h2 = alloc.alloc(16, 16).unwrap();
         assert_eq!(h2.offset_bytes % 16, 0);
     }
 
     #[test]
     fn test_free_reuse() {
-        let mut alloc = make_allocator(1024);
+        let alloc = make_allocator(1024);
         let h1 = alloc.alloc(64, 16).unwrap();
         let offset = h1.offset_bytes;
         alloc.free(h1);
         let h2 = alloc.alloc(64, 16).unwrap();
-        assert_eq!(h2.offset_bytes, offset); // same block reused
+        assert_eq!(h2.offset_bytes, offset);
     }
 
     #[test]
     fn test_cursor_reclaim() {
-        let mut alloc = make_allocator(1024);
+        let alloc = make_allocator(1024);
         let h = alloc.alloc(64, 16).unwrap();
-        let cursor_before = alloc.current_offset;
+        let cursor_before = alloc.current_offset.get();
         alloc.free(h);
-        // cursor should walk back since the freed block was at the top
-        assert!(alloc.current_offset < cursor_before);
-        assert_eq!(alloc.free_list.len(), 0);
+        assert!(alloc.current_offset.get() < cursor_before);
+        assert_eq!(alloc.free_list.borrow().len(), 0);
     }
 
     #[test]
     fn test_exhaustion() {
-        let mut alloc = make_allocator(128);
+        let alloc = make_allocator(128);
         let _h = alloc.alloc(128, 1).unwrap();
         let err = alloc.alloc(1, 1).unwrap_err();
         assert!(matches!(err, MetalError::OutOfMemory { .. }));
@@ -240,13 +238,24 @@ mod tests {
 
     #[test]
     fn test_cpu_write_read() {
-        let mut alloc = make_allocator(1024);
+        let alloc = make_allocator(1024);
         let h = alloc.alloc(4, 4).unwrap();
-        // write via CPU pointer, read back — validates StorageModeShared is working
         unsafe {
             let p = h.ptr as *mut f32;
             p.write(42.0f32);
             assert_eq!(p.read(), 42.0f32);
         }
+    }
+
+    #[test]
+    fn test_reset_reclaims_whole_pool() {
+        let alloc = make_allocator(1024);
+        let _h1 = alloc.alloc(200, 16).unwrap();
+        let _h2 = alloc.alloc(200, 16).unwrap();
+        alloc.reset();
+        assert_eq!(alloc.current_offset.get(), 0);
+        assert_eq!(alloc.free_list.borrow().len(), 0);
+        let h3 = alloc.alloc(1000, 16).unwrap();
+        assert_eq!(h3.offset_bytes, 0);
     }
 }
