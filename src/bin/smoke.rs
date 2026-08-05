@@ -52,10 +52,8 @@ fn main() {
         print!("Initializing Metal... ");
         std::io::stdout().flush().unwrap();
 
-        // 8GB pool — covers Llama 3.2 1B comfortably at any quant
-        // increase to 20GB for Qwen3-30B-A3B
-        let pool_size = 8usize * 1024 * 1024 * 1024;
-        println!("Metal pool: {} GB", pool_size / 1024 / 1024 / 1024);
+        let pool_size = 512usize * 1024 * 1024;
+        println!("Metal pool: {} MB", pool_size / 1024 / 1024);
         axiom::metal::state::init_global_metal_state(pool_size)
             .expect("failed to initialize Metal state");
         println!("ok");
@@ -154,8 +152,6 @@ fn main() {
 
     let mut steps = 0;
     let start = std::time::Instant::now();
-
-    // 1. Declare it out here so it stays in scope for the entire function
     let mut stop_reason = None;
 
     loop {

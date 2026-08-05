@@ -12,6 +12,7 @@ use crate::model::config::ModelConfig;
 use crate::model::embedding::Embedding;
 use crate::model::linear::Linear;
 use crate::model::norm::RmsNorm;
+use std::time::Instant;
 
 pub struct LlamaModel<B: Backend> {
     pub embedding: Embedding<B>,
@@ -93,7 +94,7 @@ impl<B: Backend> LlamaModel<B> {
         max_seq_len: usize,
     ) -> Result<B::Tensor> {
         // Use the Metal fast path only for single‑token decode (seq_len == 1)
-        if self.embedding.weight().device().is_metal() && token_ids.len() == 1 {
+        if self.embedding.weight().device().is_metal() {
             #[cfg(feature = "metal")]
             return self.forward_metal(token_ids, kv_cache, offset, max_seq_len);
             #[cfg(not(feature = "metal"))]
@@ -195,7 +196,14 @@ impl<B: Backend> LlamaModel<B> {
         let state = global_metal_state()
             .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
         let alloc = &state.alloc;
-        //alloc.reset();
+        // Safe iff nothing pool-backed survives past this function returning.
+        // That's true here as long as the two things that DO outlive this
+        // call -- the KV cache persist buffers and the returned logits --
+        // keep going through zeros() (dedicated MTLBuffer) rather than
+        // uninit_pooled(). Every zeros_pooled() tensor below is created and
+        // fully consumed within this one call.
+        alloc.reset();
+        let _t_encode_start = Instant::now();
         let mut runner = MetalRunner::new(&state, alloc)?;
 
         let x_emb = self.embedding.forward(token_ids)?;
@@ -203,7 +211,7 @@ impl<B: Backend> LlamaModel<B> {
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
             use std::eprintln;
-            let norm_out = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
+            let norm_out = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
             runner.rms_norm(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -236,7 +244,8 @@ impl<B: Backend> LlamaModel<B> {
                 )
             })?;
 
-            let q_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
+            let q_2d =
+                B::Tensor::uninit_pooled(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
             runner.broadcast_matmul(
                 norm_2d
                     .as_metal()
@@ -248,7 +257,7 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
             )?;
 
-            let k_2d = B::Tensor::zeros(
+            let k_2d = B::Tensor::uninit_pooled(
                 &Shape::new(&[seq_len, n_kv_heads * head_dim]),
                 x.dtype(),
                 x.device(),
@@ -264,7 +273,7 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
             )?;
 
-            let v_2d = B::Tensor::zeros(
+            let v_2d = B::Tensor::uninit_pooled(
                 &Shape::new(&[seq_len, n_kv_heads * head_dim]),
                 x.dtype(),
                 x.device(),
@@ -418,10 +427,25 @@ impl<B: Backend> LlamaModel<B> {
             };
             let mut attn_out_final: Option<B::Tensor> = None;
 
+            // One shared output buffer for the whole batch of query positions --
+            // attention_pv writes directly into row p via narrow(0, p, 1) instead of
+            // each position getting its own tiny allocation that then has to be
+            // reassembled.
+            let attn_out_all = B::Tensor::uninit_pooled(
+                &Shape::new(&[seq_len, n_heads, head_dim]),
+                x.dtype(),
+                x.device(),
+            )?;
+
             for p in 0..seq_len {
-                let q_p = q_rope.narrow(1, p, 1)?.squeeze(1)?.squeeze(0)?;
+                // No .squeeze() here -- narrow() alone correctly accumulates the
+                // view's byte offset (row p's position within q_rope); squeeze/reshape
+                // would reset that offset back to 0 (see new_contiguous). The kernel
+                // only cares about the flat memory layout, not the tensor's declared
+                // rank, so the leftover size-1 dims are harmless.
+                let q_p = q_rope.narrow(1, p, 1)?;
                 let current_pos = (offset + p) as u32;
-                let scores = B::Tensor::zeros(
+                let scores = B::Tensor::uninit_pooled(
                     &Shape::new(&[n_heads, cache_len as usize]),
                     x.dtype(),
                     x.device(),
@@ -443,8 +467,9 @@ impl<B: Backend> LlamaModel<B> {
                     current_pos,
                 )?;
 
-                let attn_out_p =
-                    B::Tensor::zeros(&Shape::new(&[n_heads, head_dim]), x.dtype(), x.device())?;
+                // Same deal: narrow (no squeeze) so attention_pv writes into row p of
+                // the shared buffer instead of a fresh allocation.
+                let attn_out_p = attn_out_all.narrow(0, p, 1)?;
                 runner.attention_pv(
                     scores
                         .as_metal()
@@ -461,18 +486,9 @@ impl<B: Backend> LlamaModel<B> {
                     head_dim as u32,
                     current_pos,
                 )?;
-
-                attn_out_final = Some(attn_out_p);
             }
 
-            // seq_len is always 1 here (forward_metal only ever runs for
-            // single-token decode), so the loop above produced exactly one
-            // position's attention output -- reshape it directly instead of
-            // round-tripping through the CPU to assemble a multi-row buffer
-            // that never has more than one row.
-            let attn_reshaped = attn_out_final
-                .ok_or_else(|| CoreError::Internal("no attention output produced".into()))?
-                .reshape(&Shape::new(&[1, seq_len, hidden]))?;
+            let attn_reshaped = attn_out_all.reshape(&Shape::new(&[1, seq_len, hidden]))?;
 
             let o_weight = block.attn.metal_o_weight.as_ref().ok_or_else(|| {
                 CoreError::Internal(
@@ -480,7 +496,15 @@ impl<B: Backend> LlamaModel<B> {
                 )
             })?;
 
-            let attn_proj = B::Tensor::zeros(&Shape::new(&[1, 1, hidden]), x.dtype(), x.device())?;
+            // Was [1, 1, hidden] -- fine by coincidence when seq_len was always 1, but
+            // broadcast_matmul's output here is [1, seq_len, hidden]; undersized by a
+            // factor of seq_len for prefill, which would have under-run the buffer and
+            // corrupted whatever pool memory sits right after it.
+            let attn_proj = B::Tensor::uninit_pooled(
+                &Shape::new(&[1, seq_len, hidden]),
+                x.dtype(),
+                x.device(),
+            )?;
 
             runner.broadcast_matmul(
                 attn_reshaped
@@ -494,7 +518,7 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
             )?;
 
-            let x_new = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
+            let x_new = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
             runner.add(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -507,7 +531,7 @@ impl<B: Backend> LlamaModel<B> {
             )?;
             x = x_new;
 
-            let ffn_norm_out = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
+            let ffn_norm_out = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
             runner.rms_norm(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -549,7 +573,7 @@ impl<B: Backend> LlamaModel<B> {
                 )
             })?;
 
-            let gate_2d = B::Tensor::zeros(
+            let gate_2d = B::Tensor::uninit_pooled(
                 &Shape::new(&[seq_len, self.config.intermediate_size]),
                 x.dtype(),
                 x.device(),
@@ -566,7 +590,7 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
             )?;
 
-            let up_2d = B::Tensor::zeros(
+            let up_2d = B::Tensor::uninit_pooled(
                 &Shape::new(&[seq_len, self.config.intermediate_size]),
                 x.dtype(),
                 x.device(),
@@ -583,7 +607,7 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
             )?;
 
-            let swiglu_out = B::Tensor::zeros(
+            let swiglu_out = B::Tensor::uninit_pooled(
                 &Shape::new(&[seq_len, self.config.intermediate_size]),
                 x.dtype(),
                 x.device(),
@@ -601,7 +625,8 @@ impl<B: Backend> LlamaModel<B> {
                 (seq_len * self.config.intermediate_size) as u32,
             )?;
 
-            let down_2d = B::Tensor::zeros(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
+            let down_2d =
+                B::Tensor::uninit_pooled(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
             runner.broadcast_matmul(
                 swiglu_out
                     .as_metal()
@@ -614,7 +639,7 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
             )?;
 
-            let x_new2 = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
+            let x_new2 = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
             runner.add(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -628,7 +653,7 @@ impl<B: Backend> LlamaModel<B> {
             x = x_new2;
         }
 
-        let final_norm = B::Tensor::zeros(&x.shape(), x.dtype(), x.device())?;
+        let final_norm = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
         runner.rms_norm(
             x.as_metal()
                 .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
@@ -663,20 +688,14 @@ impl<B: Backend> LlamaModel<B> {
                 .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
         )?;
 
+        let t_encode = _t_encode_start.elapsed(); // _t_encode_start = Instant::now() right after alloc.reset()
+        let t_finish_start = std::time::Instant::now();
         runner.finish()?;
 
         let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
         let logits_vec = logits.to_vec_f32()?;
         let nan_count = logits_vec.iter().filter(|v| v.is_nan()).count();
         let inf_count = logits_vec.iter().filter(|v| v.is_infinite()).count();
-        if nan_count > 0 || inf_count > 0 {
-            println!(
-                "logits: {} NaN, {} Inf (of {})",
-                nan_count,
-                inf_count,
-                logits_vec.len()
-            );
-        }
 
         Ok(logits)
     }

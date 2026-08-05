@@ -307,13 +307,27 @@ impl<'a> MetalRunner<'a> {
         seq_len: u32,
         current_pos: u32,
     ) -> Result<()> {
+        // q.block() alone ignores q's own tensor-level offset_bytes -- fine as
+        // long as every caller only ever passed a fresh, non-narrowed tensor
+        // (offset always 0), which was true when this only ran for
+        // single-token decode. forward_metal now passes narrow()'d views (one
+        // query position out of a multi-position batch) for prefill, so the
+        // offset has to be folded in here, same as broadcast_matmul already
+        // does for its operands.
+        let mut block_q = (*q.block()).clone();
+        block_q.offset_bytes += q.metal_offset();
+        let mut block_k = (*k_cache.block()).clone();
+        block_k.offset_bytes += k_cache.metal_offset();
+        let mut block_scores = (*scores.block()).clone();
+        block_scores.offset_bytes += scores.metal_offset();
+
         match q.metal_dtype() {
             DType::F32 => self.state.kernels.attention_qk_f32(
                 &self.encoder,
                 self.allocator,
-                q.block(),
-                k_cache.block(),
-                scores.block(),
+                &block_q,
+                &block_k,
+                &block_scores,
                 n_heads,
                 n_kv_heads,
                 head_dim,
@@ -323,9 +337,9 @@ impl<'a> MetalRunner<'a> {
             DType::F16 => self.state.kernels.attention_qk_f16(
                 &self.encoder,
                 self.allocator,
-                q.block(),
-                k_cache.block(),
-                scores.block(),
+                &block_q,
+                &block_k,
+                &block_scores,
                 n_heads,
                 head_dim,
                 seq_len,
@@ -347,13 +361,24 @@ impl<'a> MetalRunner<'a> {
         head_dim: u32,
         current_pos: u32,
     ) -> Result<()> {
+        // See attention_qk: `out` is now often a narrow()'d row (p) of a shared
+        // [seq_len, n_heads, head_dim] buffer during prefill, so its
+        // tensor-level offset has to be folded into the block before binding,
+        // or every position would silently write to row 0.
+        let mut block_scores = (*scores.block()).clone();
+        block_scores.offset_bytes += scores.metal_offset();
+        let mut block_v = (*v_cache.block()).clone();
+        block_v.offset_bytes += v_cache.metal_offset();
+        let mut block_out = (*out.block()).clone();
+        block_out.offset_bytes += out.metal_offset();
+
         match scores.metal_dtype() {
             DType::F32 => self.state.kernels.attention_pv_f32(
                 &self.encoder,
                 self.allocator,
-                scores.block(),
-                v_cache.block(),
-                out.block(),
+                &block_scores,
+                &block_v,
+                &block_out,
                 n_heads,
                 n_kv_heads,
                 seq_len,
@@ -363,9 +388,9 @@ impl<'a> MetalRunner<'a> {
             DType::F16 => self.state.kernels.attention_pv_f16(
                 &self.encoder,
                 self.allocator,
-                scores.block(),
-                v_cache.block(),
-                out.block(),
+                &block_scores,
+                &block_v,
+                &block_out,
                 n_heads,
                 seq_len,
                 head_dim,

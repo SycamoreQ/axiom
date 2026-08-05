@@ -74,7 +74,14 @@ impl MetalAllocator {
     }
 
     pub fn alloc(&self, size: usize, alignment: usize) -> Result<BlockHandle> {
-        if let Some(pos) = self.free_list.borrow().iter().position(|b| {
+        // Split the lookup from the removal on purpose: `self.free_list.borrow()`
+        // inside an `if let` scrutinee has its temporary Ref kept alive for the
+        // whole if-let body (same rule behind the classic
+        // `match mutex.lock().unwrap() { .. }` footgun), so calling
+        // `.borrow_mut()` inside that body panics with "already borrowed:
+        // BorrowMutError" the moment this branch is taken. Binding `found`
+        // first drops the Ref before the body runs.
+        let found = self.free_list.borrow().iter().position(|b| {
             let remainder = b.offset_bytes % alignment;
             let padding = if remainder == 0 {
                 0
@@ -82,7 +89,8 @@ impl MetalAllocator {
                 alignment - remainder
             };
             b.size >= size + padding
-        }) {
+        });
+        if let Some(pos) = found {
             let block = self.free_list.borrow_mut().remove(pos);
             let remainder = block.offset_bytes % alignment;
             let padding = if remainder == 0 {

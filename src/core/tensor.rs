@@ -205,6 +205,9 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn zeros_pooled(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
         Self::zeros(shape, dtype, device)
     }
+    fn uninit_pooled(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
+        Self::zeros_pooled(shape, dtype, device)
+    }
     fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self>;
     fn ones(shape: &Shape, dtype: DType, device: &Device) -> crate::core::error::Result<Self>;
     fn from_slice<E: Element>(data: &[E], shape: &Shape, device: &Device) -> Result<Self>;
@@ -1015,10 +1018,32 @@ impl TensorOps for MetalTensor {
         let state = global_metal_state()
             .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
         let size_bytes = shape.numel() * dtype.size_in_bytes();
-        let block = state.alloc.alloc(size_bytes, 16)?;
+        // 256-byte alignment, matching MetalTensor::zeros_pooled (the inherent
+        // method) -- keep the two implementations from silently diverging on
+        // what alignment Metal kernels actually get handed.
+        let block = state.alloc.alloc(size_bytes, 256)?;
         unsafe {
             std::ptr::write_bytes(block.ptr, 0, size_bytes);
         }
+        Ok(Self::new_contiguous(
+            state,
+            Arc::new(block),
+            shape.clone(),
+            dtype,
+            device.clone(),
+        ))
+    }
+
+    fn uninit_pooled(shape: &Shape, dtype: DType, device: &Device) -> Result<Self> {
+        let state = global_metal_state()
+            .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
+        let size_bytes = shape.numel() * dtype.size_in_bytes();
+        let block = state.alloc.alloc(size_bytes, 256)?;
+        // Deliberately no zero-fill: every call site for this (the ephemeral
+        // scratch tensors in forward_metal) is fully overwritten by the GPU
+        // kernel dispatched immediately after allocation, before anything
+        // ever reads it. Zeroing first is CPU work computed then thrown away
+        // the instant that kernel runs.
         Ok(Self::new_contiguous(
             state,
             Arc::new(block),
