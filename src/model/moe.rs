@@ -8,6 +8,8 @@ use crate::core::tensor::TopKLastDimOp;
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
 use crate::model::moe_loss::{compute_aux_loss, AuxLossConfig, MoeLossOutput};
+use crate::weights::gguf::GgufDType;
+use crate::weights::lazy::QuantizedWeight;
 
 /*
 The Mixture Of Expert Backend. Very derivative from what vLLM did and the LLM seriving stratergies for the Megatron Core
@@ -231,17 +233,16 @@ impl<B: Backend> Router<B> {
 
         let scores = match self.config.score_fn {
             ScoreFunction::Sigmoid => logits.sigmoid()?,
-            ScoreFunction::Softmax => logits.softmax(logits.rank() - 1)?, // not sure how to get -1
+            ScoreFunction::Softmax => logits.softmax(logits.rank() - 1)?,
         };
 
         let topk_out = TopKLastDimOp::topk(&scores, self.config.experts_per_token)?;
         let routing_weights = topk_out.values;
         let expert_indices = topk_out.indices;
 
-        //Renormalize (if using Softmax)
         let final_weights = if let ScoreFunction::Softmax = self.config.score_fn {
             let sum = routing_weights.sum_keepdim(routing_weights.rank() - 1)?;
-            routing_weights.broadcast_div(&sum)?
+            routing_weights.broadcast_div_rows(&sum)?
         } else {
             routing_weights
         };
@@ -310,6 +311,15 @@ impl<B: Backend> Router<B> {
             &device,
         )
     }
+
+    /// Build a Router from an already-loaded gate weight, skipping the
+    /// zero-allocation Router::new does.
+    pub fn from_weight(gate_weight: B::Tensor, config: RouterConfig) -> Self {
+        Self {
+            gate: Linear::new(gate_weight, None),
+            config,
+        }
+    }
 }
 
 /* Expert  (single routed expert)
@@ -358,6 +368,74 @@ impl<B: Backend> Expert<B> {
         let gate = self.gate_proj.forward(x)?.silu()?;
         let up = self.up_proj.forward(x)?;
         self.down_proj.forward(&gate.mul(&up)?)
+    }
+
+    pub fn from_weights(
+        gate_w: B::Tensor,
+        up_w: B::Tensor,
+        down_w: B::Tensor,
+        index: ExpertIndex,
+    ) -> Self {
+        Self {
+            gate_proj: Linear::new(gate_w, None),
+            up_proj: Linear::new(up_w, None),
+            down_proj: Linear::new(down_w, None),
+            index,
+        }
+    }
+}
+
+pub struct LazyExpertBank<B: Backend> {
+    gate_exps: QuantizedWeight, // raw bytes, shape-equivalent to [num_experts * intermediate, hidden]
+    up_exps: QuantizedWeight,   // same layout
+    down_exps: QuantizedWeight, // [num_experts * hidden, intermediate]
+    num_experts: usize,
+    intermediate_size: usize,
+    hidden_size: usize,
+    device: Device,
+    _marker: std::marker::PhantomData<B>,
+}
+
+// as opposed to the eager expert.
+
+impl<B: Backend> LazyExpertBank<B> {
+    pub fn new(
+        gate_exps: QuantizedWeight,
+        up_exps: QuantizedWeight,
+        down_exps: QuantizedWeight,
+        num_experts: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        device: Device,
+    ) -> Self {
+        Self {
+            gate_exps,
+            up_exps,
+            down_exps,
+            num_experts,
+            intermediate_size,
+            hidden_size,
+            device,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Dequantize just expert `idx`'s three weight matrices and hand back a
+    /// throwaway Expert -- everything about it (the F32 tensors, the
+    /// wrapping Linears) drops as soon as the caller is done with it.
+    pub fn materialize(&self, idx: ExpertIndex) -> Result<Expert<B>> {
+        let i = self.intermediate_size;
+        let h = self.hidden_size;
+
+        let gate_rows = self.gate_exps.materialize_rows(idx.0 * i, (idx.0 + 1) * i);
+        let up_rows = self.up_exps.materialize_rows(idx.0 * i, (idx.0 + 1) * i);
+        let down_rows = self.down_exps.materialize_rows(idx.0 * h, (idx.0 + 1) * h);
+
+        let gate_w = B::Tensor::from_slice(&gate_rows, &Shape::new(&[i, h]), &self.device)?;
+        let up_w = B::Tensor::from_slice(&up_rows, &Shape::new(&[i, h]), &self.device)?;
+        let down_w = B::Tensor::from_slice(&down_rows, &Shape::new(&[h, i]), &self.device)?;
+
+        Ok(Expert::from_weights(gate_w, up_w, down_w, idx))
     }
 }
 
@@ -802,6 +880,249 @@ impl<B: Backend> MoeLayer<B> {
 
     pub fn is_prefetched(&self, e: ExpertIndex) -> bool {
         self.prefetch_experts().contains(&e)
+    }
+}
+
+pub struct LazyMoeLayer<B: Backend> {
+    pub router: Router<B>,
+    pub expert_bank: LazyExpertBank<B>,
+    pub shared_expert: Option<SharedExpert<B>>,
+    pub latent: Option<LatentProjection<B>>,
+    pub pregate_buffer: Option<PreGateBuffer>,
+    pub config: RouterConfig,
+    pub hidden_size: usize,
+    pub expert_dim: usize,
+    pub aux_loss_config: AuxLossConfig,
+}
+
+impl<B: Backend> LazyMoeLayer<B> {
+    /// Mirrors MoeLayer::new, except the loader hands in an already-loaded
+    /// router gate weight and expert_bank directly, instead of a
+    /// ModelConfig this constructs zero-initialized weights from.
+    /// Qwen3-30B-A3B needs shared_expert: None, latent_dim: None -- both
+    /// kept as parameters for parity with MoeLayer / future models that do
+    /// use them.
+    pub fn new(
+        router_gate_weight: B::Tensor,
+        expert_bank: LazyExpertBank<B>,
+        shared_expert: Option<SharedExpert<B>>,
+        latent_dim: Option<usize>,
+        config: &ModelConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        let router_config = RouterConfig::from_model_config(config);
+        let hidden_size = config.hidden_size;
+        let expert_dim = latent_dim.unwrap_or(hidden_size);
+
+        let router = Router::from_weight(router_gate_weight, router_config.clone());
+
+        let latent = if let Some(ldim) = latent_dim {
+            Some(LatentProjection::new(
+                LatentConfig::new(hidden_size, ldim),
+                device,
+                hidden_size,
+            )?)
+        } else {
+            None
+        };
+
+        let pregate_buffer = config
+            .prefetch_threshold
+            .map(|_| PreGateBuffer::new(config.max_position_embeddings));
+
+        Ok(Self {
+            router,
+            expert_bank,
+            shared_expert,
+            latent,
+            pregate_buffer,
+            config: router_config,
+            hidden_size,
+            expert_dim,
+            aux_loss_config: AuxLossConfig::inference(),
+        })
+    }
+
+    pub fn forward(&mut self, x: &B::Tensor, token_offset: usize) -> Result<MoeOutput<B>> {
+        let batch = x.shape().dim(0)?;
+        let seq_len = x.shape().dim(1)?;
+        let hidden_dim = x.shape().dim(2)?;
+        let t = batch * seq_len;
+        let routing_output = self.router.forward(x)?;
+
+        let loss_output = compute_aux_loss::<B>(
+            &routing_output.router_logits,
+            &routing_output.expert_indices,
+            self.expert_bank.num_experts,
+            &self.aux_loss_config,
+            x.device(),
+        )
+        .ok();
+
+        let x_flat = x.reshape(&Shape::new(&[t, hidden_dim]))?;
+
+        let shared_out = if let Some(shared) = &self.shared_expert {
+            Some(shared.forward(&x_flat)?)
+        } else {
+            None
+        };
+
+        let routed_input = if let Some(proj) = &self.latent {
+            proj.project_down(&x_flat)?
+        } else {
+            x_flat.clone()
+        };
+
+        let _correction_mask = if let Some(ref buf) = self.pregate_buffer {
+            let device = x.device();
+            Router::<B>::speculative_correction(&routing_output, buf, device).ok()
+        } else {
+            None
+        };
+
+        let mut accumulator: Vec<Option<B::Tensor>> = vec![None; t];
+
+        for e in 0..self.expert_bank.num_experts {
+            let (gathered, positions, k_slots) =
+                dispatch::<B>(&routed_input, ExpertIndex(e), &routing_output)?;
+            if positions.is_empty() {
+                continue;
+            }
+            // Only the experts_per_token experts actually selected for this
+            // batch ever reach here -- the other ~120 hit continue above.
+            let expert = self.expert_bank.materialize(ExpertIndex(e))?;
+            let expert_out = expert.forward(&gathered)?;
+            combine::<B>(
+                &expert_out,
+                &routing_output.routing_weights,
+                &positions,
+                &k_slots,
+                &mut accumulator,
+            )?;
+            // `expert`'s three F32 tensors drop here, before the next
+            // iteration's materialize call.
+        }
+
+        let routed_refs: Vec<&B::Tensor> = accumulator
+            .iter()
+            .map(|opt| {
+                opt.as_ref()
+                    .expect("every token must have at least one expert")
+            })
+            .collect();
+        let mut routed_out = B::Tensor::cat(&routed_refs, 0)?;
+
+        if let Some(proj) = &self.latent {
+            routed_out = proj.project_up(&routed_out)?;
+        }
+
+        let mut hidden_states = if let Some(s) = shared_out {
+            routed_out.add(&s)?
+        } else {
+            routed_out
+        };
+
+        self.update_pregate_buffer(&routing_output, token_offset, t)?;
+
+        hidden_states = hidden_states.reshape(&Shape::new(&[batch, seq_len, hidden_dim]))?;
+
+        Ok(MoeOutput {
+            hidden_states,
+            aux_loss: loss_output
+                .as_ref()
+                .and_then(|l| l.total_aux_loss.as_ref())
+                .cloned(),
+            loss_output,
+        })
+    }
+
+    fn update_pregate_buffer(
+        &mut self,
+        routing_output: &RoutingOutput<B>,
+        token_offset: usize,
+        num_tokens: usize,
+    ) -> Result<()> {
+        let buf = match &mut self.pregate_buffer {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let weights_flat = routing_output.routing_weights.to_vec_f32()?;
+        let indices_flat = routing_output.expert_indices.to_vec_u32()?;
+        let k = routing_output.routing_weights.shape().dim(1)?;
+
+        for t in 0..num_tokens {
+            let max_score = (0..k)
+                .map(|ki| weights_flat[t * k + ki])
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            let expert_indices: Vec<ExpertIndex> = (0..k)
+                .map(|ki| ExpertIndex(indices_flat[t * k + ki] as usize))
+                .collect();
+
+            buf.write(
+                TokenPos(token_offset + t),
+                SpeculativeRecord {
+                    token_pos: TokenPos(token_offset + t),
+                    expert_indices,
+                    max_score,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn reset_speculation(&mut self) {
+        if let Some(buf) = &mut self.pregate_buffer {
+            buf.clear();
+        }
+    }
+
+    /// Skeleton with an empty expert bank and a zero-initialized router
+    /// gate -- built at Block::new time, before any real GGUF tensor bytes
+    /// have been read. The loader replaces this wholesale via
+    /// Block::set_lazy_moe once it's collected the layer's real tensors.
+    pub fn placeholder(config: &ModelConfig, device: &Device) -> Result<Self> {
+        let router_config = RouterConfig::from_model_config(config);
+        let hidden_size = config.hidden_size;
+        let intermediate_size = config.intermediate_size;
+        let num_experts = config.num_local_experts.unwrap_or(1);
+
+        let gate_weight =
+            B::Tensor::zeros(&Shape::new(&[num_experts, hidden_size]), DType::F32, device)?;
+        let router = Router::from_weight(gate_weight, router_config.clone());
+
+        let empty = |shape: Vec<usize>| QuantizedWeight {
+            dtype: GgufDType::F32,
+            data: Vec::new(),
+            shape,
+            numel: 0,
+        };
+        let expert_bank = LazyExpertBank::new(
+            empty(vec![num_experts * intermediate_size, hidden_size]),
+            empty(vec![num_experts * intermediate_size, hidden_size]),
+            empty(vec![num_experts * hidden_size, intermediate_size]),
+            num_experts,
+            intermediate_size,
+            hidden_size,
+            device.clone(),
+        );
+
+        let pregate_buffer = config
+            .prefetch_threshold
+            .map(|_| PreGateBuffer::new(config.max_position_embeddings));
+
+        Ok(Self {
+            router,
+            expert_bank,
+            shared_expert: None,
+            latent: None,
+            pregate_buffer,
+            config: router_config,
+            hidden_size,
+            expert_dim: hidden_size,
+            aux_loss_config: AuxLossConfig::inference(),
+        })
     }
 }
 

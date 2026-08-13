@@ -8,6 +8,7 @@ use axiom::inference::engine::Engine;
 use axiom::inference::sampler::SamplerConfig;
 use axiom::tokenizer::tokenizer::{EncodeOptions, Tokenizer};
 use axiom::weights::loader::load_from_gguf;
+use axiom::weights::loader::load_from_gguf_qwen3moe;
 use std::io::Write;
 use std::path::Path;
 
@@ -62,7 +63,7 @@ fn main() {
         print!("Loading model... ");
         std::io::stdout().flush().unwrap();
 
-        let mut model = load_from_gguf::<MetalBackend>(Path::new(&gguf_path), &device)
+        let mut model = load_from_gguf_qwen3moe::<MetalBackend>(Path::new(&gguf_path), &device)
             .expect("failed to load model");
         model
             .prepare_metal()
@@ -130,8 +131,21 @@ fn main() {
 
     let mut engine = engine;
 
+    let im_end_id: u32 = engine
+        .tokenizer()
+        .encode(
+            "<|im_end|>",
+            EncodeOptions {
+                add_bos: false,
+                add_eos: false,
+            },
+        )
+        .first()
+        .copied()
+        .expect("<|im_end|> not found in tokenizer vocab") as u32;
+
     let formatted_prompt = format!(
-        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
         prompt
     );
 
@@ -159,7 +173,7 @@ fn main() {
         for (sid, token) in &results {
             if *sid == session_id {
                 let t = *token as u32;
-                if t == 128255 || t == 128001 || t == 128009 || t == 2 {
+                if t == im_end_id {
                     stop_reason = Some("Stop token generated");
                     break;
                 }

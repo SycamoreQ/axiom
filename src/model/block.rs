@@ -8,12 +8,14 @@ use crate::model::attention::Attention;
 use crate::model::config::ModelConfig;
 use crate::model::feedforward::FeedForward;
 use crate::model::linear::Linear;
+use crate::model::moe::LazyMoeLayer;
 use crate::model::moe::MoeLayer;
 use crate::model::norm::RmsNorm;
 
 pub enum FeedForwardLayer<B: Backend> {
     Dense(FeedForward<B>),
     Moe(MoeLayer<B>),
+    LazyMoe(LazyMoeLayer<B>),
 }
 
 impl<B: Backend> FeedForwardLayer<B> {
@@ -21,6 +23,7 @@ impl<B: Backend> FeedForwardLayer<B> {
         match self {
             FeedForwardLayer::Dense(ff) => ff.gate_proj(),
             FeedForwardLayer::Moe(_) => panic!("gate_proj not supported for MoE layer"),
+            FeedForwardLayer::LazyMoe(_) => panic!("gate_proj not supported for MoE layer"),
         }
     }
 
@@ -28,6 +31,7 @@ impl<B: Backend> FeedForwardLayer<B> {
         match self {
             FeedForwardLayer::Dense(ff) => ff.up_proj(),
             FeedForwardLayer::Moe(_) => panic!("up_proj not supported for MoE layer"),
+            FeedForwardLayer::LazyMoe(_) => panic!("up_proj not supported for MoE layer"),
         }
     }
 
@@ -35,6 +39,7 @@ impl<B: Backend> FeedForwardLayer<B> {
         match self {
             FeedForwardLayer::Dense(ff) => ff.down_proj(),
             FeedForwardLayer::Moe(_) => panic!("down_proj not supported for MoE layer"),
+            FeedForwardLayer::LazyMoe(_) => panic!("down_proj not supported for MoE layer"),
         }
     }
 
@@ -42,6 +47,7 @@ impl<B: Backend> FeedForwardLayer<B> {
         match self {
             FeedForwardLayer::Dense(ff) => ff.prepare_metal_weights(),
             FeedForwardLayer::Moe(_) => Ok(()), // not on the Metal fast path yet
+            FeedForwardLayer::LazyMoe(_) => Ok(()), // not on the Metal fast path yet
         }
     }
 }
@@ -72,7 +78,11 @@ impl<B: Backend> Block<B> {
         let attn = Attention::new(config, device)?;
 
         let ffn = if config.is_moe_layer(layer_idx) {
-            FeedForwardLayer::Moe(MoeLayer::new(config, None, device)?)
+            if config.lazy_moe {
+                FeedForwardLayer::LazyMoe(LazyMoeLayer::placeholder(config, device)?)
+            } else {
+                FeedForwardLayer::Moe(MoeLayer::new(config, None, device)?)
+            }
         } else {
             FeedForwardLayer::Dense(FeedForward::new(config, device)?)
         };
@@ -105,6 +115,7 @@ impl<B: Backend> Block<B> {
         let ffn_out = match &mut self.ffn {
             FeedForwardLayer::Dense(ff) => ff.forward(&h)?,
             FeedForwardLayer::Moe(moe) => moe.forward(&h, offset)?.hidden_states,
+            FeedForwardLayer::LazyMoe(moe) => moe.forward(&h, offset)?.hidden_states,
         };
 
         let x = x.add(&ffn_out)?;
@@ -173,6 +184,19 @@ impl<B: Backend> Block<B> {
     pub fn prepare_metal(&mut self) -> Result<()> {
         self.attn.prepare_metal_weights()?;
         self.ffn.prepare_metal_weights()
+    }
+
+    pub fn set_lazy_moe(&mut self, layer: LazyMoeLayer<B>) {
+        self.ffn = FeedForwardLayer::LazyMoe(layer);
+    }
+
+    pub fn set_attn_q_norm(&mut self, w: B::Tensor) {
+        let eps = self.attn_norm.eps(); // same global rms_norm_eps as everything else
+        self.attn.set_q_norm(RmsNorm::new(w, eps));
+    }
+    pub fn set_attn_k_norm(&mut self, w: B::Tensor) {
+        let eps = self.attn_norm.eps();
+        self.attn.set_k_norm(RmsNorm::new(w, eps));
     }
 }
 

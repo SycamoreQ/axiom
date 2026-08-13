@@ -6,6 +6,7 @@ use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
+use crate::model::norm::RmsNorm;
 use crate::model::rope::RotaryEmbedding;
 
 pub struct Attention<B: Backend> {
@@ -18,7 +19,9 @@ pub struct Attention<B: Backend> {
     num_kv_heads: usize,
     rope_theta: f64,
     head_dim: usize,
-    scale: f32, // 1/sqrt(head_dim) — precomputed
+    scale: f32,
+    q_norm: Option<RmsNorm<B>>,
+    k_norm: Option<RmsNorm<B>>,
     pub metal_q_weight: Option<B::Tensor>,
     pub metal_k_weight: Option<B::Tensor>,
     pub metal_v_weight: Option<B::Tensor>,
@@ -59,6 +62,8 @@ impl<B: Backend> Attention<B> {
             rope,
             num_heads,
             num_kv_heads,
+            q_norm: None,
+            k_norm: None,
             head_dim,
             rope_theta,
             scale,
@@ -116,7 +121,6 @@ impl<B: Backend> Attention<B> {
         let batch = x.shape().dim(0)?;
         let seq_len = x.shape().dim(1)?;
         let q_pre_reshape = self.q_proj.forward(x)?;
-
         let q = q_pre_reshape.reshape(&Shape::new(&[
             batch,
             seq_len,
@@ -135,6 +139,15 @@ impl<B: Backend> Attention<B> {
             self.num_kv_heads,
             self.head_dim,
         ]))?;
+
+        let q = match &self.q_norm {
+            Some(norm) => norm.forward(&q)?,
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(norm) => norm.forward(&k)?,
+            None => k,
+        };
 
         let q = q.rope(offset, self.rope_theta, self.head_dim)?;
         let k = k.rope(offset, self.rope_theta, self.head_dim)?;
@@ -195,17 +208,23 @@ impl<B: Backend> Attention<B> {
         Ok((out, k_cache, v_cache))
     }
 
-    pub fn set_q_proj(&mut self, l: Linear<B>) {
-        self.q_proj = l;
+    pub fn set_q_norm(&mut self, n: RmsNorm<B>) {
+        self.q_norm = Some(n);
     }
-    pub fn set_k_proj(&mut self, l: Linear<B>) {
-        self.k_proj = l;
+    pub fn set_k_norm(&mut self, n: RmsNorm<B>) {
+        self.k_norm = Some(n);
     }
     pub fn set_v_proj(&mut self, l: Linear<B>) {
         self.v_proj = l;
     }
     pub fn set_o_proj(&mut self, l: Linear<B>) {
         self.o_proj = l;
+    }
+    pub fn set_q_proj(&mut self, l: Linear<B>) {
+        self.q_proj = l;
+    }
+    pub fn set_k_proj(&mut self, l: Linear<B>) {
+        self.k_proj = l;
     }
 }
 

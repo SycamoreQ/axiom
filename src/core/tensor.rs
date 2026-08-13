@@ -87,11 +87,25 @@ impl MetalTensor {
 
         let raw_device = state.ctx.device.raw();
 
+        // Metal rejects a genuinely 0-byte buffer request outright. Zero-sized
+        // tensors are a legitimate degenerate case though -- dispatch() in the
+        // MoE routing path returns a [0, hidden] placeholder for every expert
+        // that got no tokens this batch (the common case), and nothing ever
+        // reads from it. Pad the underlying allocation to a minimum of 1 byte;
+        // the tensor's own shape/numel still correctly report 0 either way.
+        let alloc_len = data.len().max(1);
+        let dummy_byte = [0u8; 1];
+        let src_ptr = if data.is_empty() {
+            dummy_byte.as_ptr()
+        } else {
+            data.as_ptr()
+        };
+
         let buffer = unsafe {
             raw_device.newBufferWithBytes_length_options(
-                NonNull::new_unchecked(data.as_ptr() as *mut std::ffi::c_void),
-                data.len(),
-                MTLResourceOptions(0), // StorageModeShared = 0
+                NonNull::new_unchecked(src_ptr as *mut std::ffi::c_void),
+                alloc_len,
+                MTLResourceOptions(0),
             )
         }
         .ok_or_else(|| {
@@ -273,6 +287,35 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn log(&self) -> Result<Self>;
     fn as_metal(&self) -> Option<&MetalTensor> {
         None
+    }
+    // in TensorOps trait definition
+    fn broadcast_div_rows(&self, other: &Self) -> Result<Self> {
+        let dims = self.shape().dims().to_vec();
+        let last_dim = *dims.last().ok_or_else(|| {
+            CoreError::Internal("broadcast_div_rows: input must have rank >= 1".into())
+        })?;
+        let n = self.numel();
+        let num_rows = n / last_dim;
+        if other.numel() != num_rows {
+            return Err(CoreError::Internal(format!(
+                "broadcast_div_rows: divisor numel {} does not match row count {}",
+                other.numel(),
+                num_rows
+            ))
+            .into());
+        }
+
+        let a = self.to_vec_f32()?;
+        let b = other.to_vec_f32()?;
+        let mut out = vec![0.0f32; n];
+        for row in 0..num_rows {
+            let divisor = b[row];
+            for col in 0..last_dim {
+                let i = row * last_dim + col;
+                out[i] = a[i] / divisor;
+            }
+        }
+        Self::from_slice(&out, &Shape::new(&dims), self.device())
     }
 }
 

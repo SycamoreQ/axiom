@@ -6,7 +6,9 @@ use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 use crate::model::config::ModelConfig;
 use crate::model::model::LlamaModel;
+use crate::model::moe::{LazyExpertBank, LazyMoeLayer};
 use crate::weights::gguf::{GgufDType, GgufFile, GgufValue};
+use crate::weights::lazy::QuantizedWeight;
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +55,8 @@ pub enum BlockLayer {
     AttnK,
     AttnV,
     AttnOutput,
+    AttnQNorm,
+    AttnKNorm,
     FfnNorm,
     FfnGate,
     FfnUp,
@@ -90,6 +94,8 @@ impl LlamaTensor {
                 "attn_q" => BlockLayer::AttnQ,
                 "attn_k" => BlockLayer::AttnK,
                 "attn_v" => BlockLayer::AttnV,
+                "attn_q_norm" => BlockLayer::AttnQNorm,
+                "attn_k_norm" => BlockLayer::AttnKNorm,
                 "attn_output" => BlockLayer::AttnOutput,
                 "ffn_norm" => BlockLayer::FfnNorm,
                 "ffn_gate" => BlockLayer::FfnGate,
@@ -101,6 +107,36 @@ impl LlamaTensor {
         }
         None
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MoeTensorKind {
+    GateInp,
+    GateExps,
+    UpExps,
+    DownExps,
+}
+
+// Not part of LlamaTensor/BlockLayer -- these need raw-bytes (QuantizedWeight)
+// handling, not the load_bytes_as_tensor + set_tensor path everything else
+// goes through.
+pub fn parse_moe_tensor(key: &str) -> Option<(usize, MoeTensorKind)> {
+    if !key.starts_with("blk.") {
+        return None;
+    }
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let i = parts[1].parse::<usize>().ok()?;
+    let kind = match parts[2] {
+        "ffn_gate_inp" => MoeTensorKind::GateInp,
+        "ffn_gate_exps" => MoeTensorKind::GateExps,
+        "ffn_up_exps" => MoeTensorKind::UpExps,
+        "ffn_down_exps" => MoeTensorKind::DownExps,
+        _ => return None,
+    };
+    Some((i, kind))
 }
 
 //Build a ModelConfig from GGUF metadata.
@@ -183,6 +219,91 @@ pub fn config_from_gguf(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
         prefetch_threshold: None,
         architectures: Some(vec!["LlamaForCausalLM".to_string()]),
         model_type: Some("llama".to_string()),
+        head_dim_override: None,
+        lazy_moe: false,
+    })
+}
+
+pub fn config_from_gguf_qwen3moe(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
+    let get_u32 = |key: &str| -> Result<usize, LoaderError> {
+        let value = gguf
+            .metadata
+            .get(key)
+            .ok_or_else(|| LoaderError::MissingMetadata(key.to_string()))?;
+        let num = match value {
+            GgufValue::Uint32(v) => *v as usize,
+            GgufValue::Uint64(v) => *v as usize,
+            GgufValue::Int32(v) => *v as usize,
+            GgufValue::Int64(v) => *v as usize,
+            _ => {
+                return Err(LoaderError::MissingMetadata(format!(
+                    "{} has wrong type",
+                    key
+                )))
+            }
+        };
+        Ok(num)
+    };
+    let get_f32 = |key: &str| -> Result<f32, LoaderError> {
+        let value = gguf
+            .metadata
+            .get(key)
+            .ok_or_else(|| LoaderError::MissingMetadata(key.to_string()))?;
+        match value {
+            GgufValue::Float32(v) => Ok(*v),
+            GgufValue::Float64(v) => Ok(*v as f32),
+            GgufValue::Uint32(v) => Ok(*v as f32),
+            GgufValue::Int32(v) => Ok(*v as f32),
+            _ => Err(LoaderError::MissingMetadata(format!(
+                "{} has wrong type",
+                key
+            ))),
+        }
+    };
+
+    // Ground truth regardless of whether qwen3moe.vocab_size exists as a key.
+    let vocab_size = gguf
+        .tensors
+        .get("token_embd.weight")
+        .map(|info| info.shape[0] as usize)
+        .ok_or_else(|| LoaderError::MissingTensor("token_embd.weight".to_string()))?;
+
+    // qwen3moe.attention.key_length -- confirmed from a real GGUF metadata
+    // dump I found (128 for the variant I saw), but not verified against
+    // your specific file. If this key is missing, that's the one to check
+    // first against your actual dump.
+    let head_dim = gguf
+        .tensors
+        .get("blk.0.attn_q_norm.weight")
+        .map(|info| info.shape[0] as usize)
+        .ok_or_else(|| LoaderError::MissingTensor("blk.0.attn_q_norm.weight".to_string()))?;
+
+    Ok(ModelConfig {
+        hidden_size: get_u32("qwen3moe.embedding_length")?,
+        num_hidden_layers: get_u32("qwen3moe.block_count")?,
+        num_attention_heads: get_u32("qwen3moe.attention.head_count")?,
+        num_key_value_heads: get_u32("qwen3moe.attention.head_count_kv")?,
+        // Per-expert FFN size -- every layer in this model is MoE, so
+        // there's no dense FFN and this field only ever gets read via the
+        // MoE path (LazyExpertBank, LazyMoeLayer::placeholder).
+        intermediate_size: get_u32("qwen3moe.expert_feed_forward_length")?,
+        vocab_size,
+        max_position_embeddings: get_u32("qwen3moe.context_length")?,
+        rms_norm_eps: get_f32("qwen3moe.attention.layer_norm_rms_epsilon")? as f64,
+        hidden_act: "silu".to_string(),
+        rope_theta: get_f32("qwen3moe.rope.freq_base")? as f64,
+        rope_scaling: None,
+        torch_dtype: "float32".to_string(),
+        num_local_experts: Some(get_u32("qwen3moe.expert_count")?),
+        num_experts_per_tok: Some(get_u32("qwen3moe.expert_used_count")?),
+        rope_freqs: None,
+        num_shared_experts: None, // confirmed: no _shexp tensors in your dump
+        expert_interval: None,    // every layer is MoE
+        prefetch_threshold: None,
+        architectures: Some(vec!["Qwen3MoeForCausalLM".to_string()]),
+        model_type: Some("qwen3moe".to_string()),
+        lazy_moe: true,
+        head_dim_override: Some(head_dim),
     })
 }
 
@@ -301,6 +422,128 @@ pub fn load_from_gguf<B: Backend>(
                 .set_tensor(&LlamaTensor::Output, embd)
                 .map_err(|e| LoaderError::Backend(e.to_string()))?;
         }
+    }
+
+    Ok(model)
+}
+
+#[derive(Default)]
+struct PendingExpertTensors {
+    gate_inp: Option<QuantizedWeight>,
+    gate_exps: Option<QuantizedWeight>,
+    up_exps: Option<QuantizedWeight>,
+    down_exps: Option<QuantizedWeight>,
+}
+
+// shape MUST be the flattened [num_experts * out_dim, in_dim] for the three
+// stacked _exps tensors -- materialize_rows treats shape as strictly 2D
+// [total_rows, row_len], not the raw 3D GGUF shape.
+fn quantized_weight_from_gguf(
+    data: &[u8],
+    info: &crate::weights::gguf::GgufTensorInfo,
+    flat_shape: Vec<usize>,
+) -> QuantizedWeight {
+    QuantizedWeight {
+        dtype: info.dtype,
+        data: data.to_vec(),
+        shape: flat_shape,
+        numel: info.numel() as usize,
+    }
+}
+
+pub fn load_from_gguf_qwen3moe<B: Backend>(
+    path: &Path,
+    device: &Device,
+) -> Result<LlamaModel<B>, LoaderError> {
+    let gguf = GgufFile::from_file(path)?;
+    let config = config_from_gguf_qwen3moe(&gguf)?;
+    let num_experts = config.num_local_experts.unwrap_or(0);
+    let intermediate_size = config.intermediate_size;
+    let hidden_size = config.hidden_size;
+
+    let mut model = LlamaModel::<B>::new(&config, device)?;
+    let mut pending: Vec<PendingExpertTensors> = (0..config.num_hidden_layers)
+        .map(|_| PendingExpertTensors::default())
+        .collect();
+
+    for (name, info) in gguf.tensors.iter() {
+        let data = gguf
+            .get_tensor_data(name)
+            .ok_or_else(|| LoaderError::MissingTensor(name.clone()))?;
+
+        if let Some((layer_idx, kind)) = parse_moe_tensor(name) {
+            let dims = &info.shape;
+            let flat_shape = match kind {
+                MoeTensorKind::GateInp => dims.iter().map(|&d| d as usize).collect(),
+                // [num_experts, out, in] -> [num_experts * out, in]
+                MoeTensorKind::GateExps | MoeTensorKind::UpExps | MoeTensorKind::DownExps => {
+                    vec![(dims[0] * dims[1]) as usize, dims[2] as usize]
+                }
+            };
+            let qw = quantized_weight_from_gguf(data, info, flat_shape);
+            let slot = pending.get_mut(layer_idx).ok_or_else(|| {
+                LoaderError::Gguf(format!(
+                    "expert tensor references out-of-range layer {layer_idx}"
+                ))
+            })?;
+            match kind {
+                MoeTensorKind::GateInp => slot.gate_inp = Some(qw),
+                MoeTensorKind::GateExps => slot.gate_exps = Some(qw),
+                MoeTensorKind::UpExps => slot.up_exps = Some(qw),
+                MoeTensorKind::DownExps => slot.down_exps = Some(qw),
+            }
+            continue;
+        }
+
+        if let Some(kind) = LlamaTensor::parse(name) {
+            let tensor = load_bytes_as_tensor::<B>(data, info, device)?;
+            model.set_tensor(&kind, tensor)?;
+        }
+        // anything else is silently skipped, same as the llama path
+    }
+
+    for (layer_idx, slot) in pending.into_iter().enumerate() {
+        let (gate_inp, gate_exps, up_exps, down_exps) =
+            match (slot.gate_inp, slot.gate_exps, slot.up_exps, slot.down_exps) {
+                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                _ => {
+                    return Err(LoaderError::MissingTensor(format!(
+                        "layer {layer_idx} is missing one or more of ffn_gate_inp/ffn_gate_exps/ffn_up_exps/ffn_down_exps"
+                    )))
+                }
+            };
+
+        // gate_inp is small (~[128, 2048], ~1MB) -- fine to eagerly
+        // dequantize, unlike the three stacked expert tensors.
+        let gate_inp_floats = gate_inp.materialize();
+        let gate_inp_tensor = B::Tensor::from_slice(
+            &gate_inp_floats,
+            &Shape::new(&[num_experts, hidden_size]),
+            device,
+        )
+        .map_err(|e| LoaderError::Backend(e.to_string()))?;
+
+        let expert_bank = LazyExpertBank::<B>::new(
+            gate_exps,
+            up_exps,
+            down_exps,
+            num_experts,
+            intermediate_size,
+            hidden_size,
+            device.clone(),
+        );
+
+        let lazy_moe = LazyMoeLayer::<B>::new(
+            gate_inp_tensor,
+            expert_bank,
+            None, // no shared expert -- confirmed absent from your dump
+            None, // no latent projection
+            &config,
+            device,
+        )
+        .map_err(|e| LoaderError::Backend(e.to_string()))?;
+
+        model.set_block_lazy_moe(layer_idx, lazy_moe);
     }
 
     Ok(model)

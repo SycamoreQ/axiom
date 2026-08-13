@@ -62,6 +62,9 @@ pub struct ModelConfig {
     pub architectures: Option<Vec<String>>, // e.g. ["LlamaForCausalLM"]
     #[serde(default)]
     pub model_type: Option<String>, // e.g. "llama", "mistral", "deepseek"
+
+    pub lazy_moe: bool,
+    pub head_dim_override: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +99,8 @@ impl ModelConfig {
 
     // hidden_size / num_attention_heads
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim_override
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     pub fn num_kv_groups(&self) -> usize {
@@ -154,6 +158,7 @@ mod tests {
             torch_dtype: "bfloat16".to_string(),
             architectures: Some(vec!["LlamaForCausalLM".to_string()]),
             model_type: Some("llama".to_string()),
+            head_dim_override: None,
         }
     }
 
@@ -179,6 +184,7 @@ mod tests {
             torch_dtype: "bfloat16".to_string(),
             architectures: None,
             model_type: Some("deepseek".to_string()),
+            head_dim_override: None,
         }
     }
 

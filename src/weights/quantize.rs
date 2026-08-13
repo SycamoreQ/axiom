@@ -18,6 +18,21 @@ use crate::weights::gguf::GgufDType;
 //Dequantize a block-quantized byte slice into f32 values.
 pub fn dequantize(data: &[u8], dtype: GgufDType, numel: usize) -> Vec<f32> {
     match dtype {
+        GgufDType::F32 => data
+            .chunks_exact(4)
+            .take(numel)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        GgufDType::F16 => data
+            .chunks_exact(2)
+            .take(numel)
+            .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+            .collect(),
+        GgufDType::BF16 => data
+            .chunks_exact(2)
+            .take(numel)
+            .map(|b| half::bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+            .collect(),
         GgufDType::Q4_0 => dequantize_q4_0(data, numel),
         GgufDType::Q4_1 => dequantize_q4_1(data, numel),
         GgufDType::Q8_0 => dequantize_q8_0(data, numel),

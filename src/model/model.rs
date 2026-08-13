@@ -94,7 +94,7 @@ impl<B: Backend> LlamaModel<B> {
         max_seq_len: usize,
     ) -> Result<B::Tensor> {
         // Use the Metal fast path only for single‑token decode (seq_len == 1)
-        if self.embedding.weight().device().is_metal() {
+        if self.embedding.weight().device().is_metal() && !self.config.is_moe() {
             #[cfg(feature = "metal")]
             return self.forward_metal(token_ids, kv_cache, offset, max_seq_len);
             #[cfg(not(feature = "metal"))]
@@ -555,6 +555,11 @@ impl<B: Backend> LlamaModel<B> {
                         "MoE not supported on the Metal fast path yet".into(),
                     ))
                 }
+                FeedForwardLayer::LazyMoe(_) => {
+                    return Err(CoreError::Internal(
+                        "MoE not supported on the Metal fast path yet".into(),
+                    ))
+                }
             };
 
             let gate_weight = ff.metal_gate_weight.as_ref().ok_or_else(|| {
@@ -741,10 +746,18 @@ impl<B: Backend> LlamaModel<B> {
                     BlockLayer::FfnGate => block.set_ffn_gate(tensor),
                     BlockLayer::FfnUp => block.set_ffn_up(tensor),
                     BlockLayer::FfnDown => block.set_ffn_down(tensor),
+                    BlockLayer::AttnQNorm => block.set_attn_q_norm(tensor),
+                    BlockLayer::AttnKNorm => block.set_attn_k_norm(tensor),
                 }
             }
         }
         Ok(())
+    }
+
+    pub fn set_block_lazy_moe(&mut self, i: usize, layer: crate::model::moe::LazyMoeLayer<B>) {
+        if let Some(block) = self.blocks.get_mut(i) {
+            block.set_lazy_moe(layer);
+        }
     }
 }
 
