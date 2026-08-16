@@ -14,6 +14,7 @@ pub struct Attention<B: Backend> {
     pub k_proj: Linear<B>,
     pub v_proj: Linear<B>,
     pub o_proj: Linear<B>,
+    is_neox: bool,
     rope: RotaryEmbedding<B>,
     num_heads: usize,
     num_kv_heads: usize,
@@ -53,12 +54,17 @@ impl<B: Backend> Attention<B> {
         )?;
         let scale = 1.0 / (head_dim as f32).sqrt();
         let rope_theta = config.rope_theta;
+        let is_neox = matches!(
+            config.model_type.as_deref(),
+            Some("qwen3moe") | Some("qwen2moe") | Some("qwen3") | Some("qwen2")
+        );
 
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            is_neox,
             rope,
             num_heads,
             num_kv_heads,
@@ -149,9 +155,17 @@ impl<B: Backend> Attention<B> {
             None => k,
         };
 
-        let q = q.rope(offset, self.rope_theta, self.head_dim)?;
-        let k = k.rope(offset, self.rope_theta, self.head_dim)?;
-
+        let (q, k) = if self.is_neox {
+            (
+                q.rope_neox(offset, self.rope_theta, self.head_dim)?,
+                k.rope_neox(offset, self.rope_theta, self.head_dim)?,
+            )
+        } else {
+            (
+                q.rope(offset, self.rope_theta, self.head_dim)?,
+                k.rope(offset, self.rope_theta, self.head_dim)?,
+            )
+        };
         let (mut k, mut v) = match kv_cache {
             Some((past_k, past_v)) => (
                 B::Tensor::cat(&[past_k, &k], 1)?,
@@ -159,6 +173,7 @@ impl<B: Backend> Attention<B> {
             ),
             None => (k, v),
         };
+
         let k_cache = k.clone();
         let v_cache = v.clone();
 

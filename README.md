@@ -166,6 +166,9 @@ Starting point, per-tensor dedicated Metal buffers, decode-only fast path:
 Result: **9.0 tok/s**, decode and prefill both running through Metal kernels,
 on Llama 3.2 1B Instruct (Q4_K_M) on Apple Silicon.
 
+
+
+
 ## Build & Run
 
 ```bash

@@ -13,6 +13,7 @@ use objc2_metal::MTLCommandBuffer;
 #[cfg(feature = "metal")]
 use objc2_metal::MTLCommandEncoder;
 use std::sync::Arc;
+use std::todo;
 
 fn candle_device_from(device: &Device) -> Result<candle_core::Device> {
     match device {
@@ -265,6 +266,12 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     // sequence's first token (0 for prefill, session.offset for decode
     // steps with a growing KV cache) — angle = (offset + token) * freq.
     fn rope(&self, offset: usize, theta: f64, head_dim: usize) -> crate::core::error::Result<Self>;
+    fn rope_neox(
+        &self,
+        offset: usize,
+        theta: f64,
+        head_dim: usize,
+    ) -> crate::core::error::Result<Self>;
     fn broadcast_add(&self, other: &Self) -> Result<Self>;
     fn broadcast_matmul(&self, other: &Self) -> Result<Self>;
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self>;
@@ -862,6 +869,33 @@ impl TensorOps for CandleTensor {
             device: self.device.clone(),
         })
     }
+
+    fn rope_neox(&self, offset: usize, theta: f64, head_dim: usize) -> Result<Self> {
+        // NeoX/split-half pairing (i, i+head_dim/2) — used by Qwen2/Qwen3,
+        // GPT-NeoX, StableLM. Contrast with `rope`'s interleaved (2i, 2i+1)
+        // pairing, which matches LLaMA's GGUF weight-permutation convention.
+        let seq_len = self.shape().dim(1)?;
+        let n_heads = self.shape().dim(2)?;
+        let data = self.to_vec_f32()?;
+        let mut out = vec![0.0f32; data.len()];
+        let half_dim = head_dim / 2;
+        for token in 0..seq_len {
+            for head in 0..n_heads {
+                let idx = (token * n_heads + head) * head_dim;
+                for i in 0..half_dim {
+                    let freq = 1.0f64 / theta.powf((2 * i) as f64 / head_dim as f64);
+                    let angle = (offset + token) as f64 * freq;
+                    let (sin_a, cos_a) = angle.sin_cos();
+                    let (sin_a, cos_a) = (sin_a as f32, cos_a as f32);
+                    let x0 = data[idx + i];
+                    let x1 = data[idx + i + half_dim];
+                    out[idx + i] = x0 * cos_a - x1 * sin_a;
+                    out[idx + i + half_dim] = x0 * sin_a + x1 * cos_a;
+                }
+            }
+        }
+        Self::from_slice(&out, &self.shape(), &self.device())
+    }
 }
 
 // todo component as Cudarc tensors yet to implemented in itslf for kernel logic
@@ -1025,6 +1059,15 @@ impl TensorOps for CudarcTensor {
     }
 
     fn log(&self) -> Result<Self> {
+        todo!("phase 4")
+    }
+
+    fn rope_neox(
+        &self,
+        offset: usize,
+        theta: f64,
+        head_dim: usize,
+    ) -> crate::core::error::Result<Self> {
         todo!("phase 4")
     }
 }
@@ -1670,6 +1713,61 @@ impl TensorOps for MetalTensor {
                 offset as u32,
             )?,
             _ => return Err(CoreError::Internal("rope: unsupported dtype".into())),
+        }
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        Ok(output)
+    }
+
+    fn rope_neox(&self, offset: usize, theta: f64, head_dim: usize) -> Result<Self> {
+        // Same layout assumptions as `rope`: [batch, seq_len, n_heads, head_dim],
+        // batch=1 only. This is the NeoX/split-half pairing (i, i+head_dim/2)
+        // used by Qwen2/Qwen3 — as opposed to `rope`'s interleaved (2i, 2i+1)
+        // pairing, which matches LLaMA's GGUF weight-permutation convention.
+        let seq_len = self.shape.dims()[1];
+        let n_heads = self.shape.dims()[2];
+
+        let self_ = self.contiguous()?;
+        let output = Self::zeros(&self_.shape, self_.dtype, &self_.device)?;
+
+        // Same in-place-kernel-on-a-copy contract as `rope`.
+        let nbytes = self_.shape.numel() * self_.dtype.size_in_bytes();
+        unsafe {
+            let src = (self_.block.as_ref().ptr as *const u8).add(self_.offset_bytes);
+            let dst = (output.block.as_ref().ptr as *mut u8).add(output.offset_bytes);
+            std::ptr::copy_nonoverlapping(src, dst, nbytes);
+        }
+
+        let state = self_.state.clone();
+        let cmd_buf = state.ctx.command_buffer()?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| CoreError::Internal("failed to create compute encoder".into()))?;
+
+        match self_.dtype {
+            DType::F32 => state.kernels.rope_neox_f32(
+                &encoder,
+                &state.alloc,
+                &output.block,
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                theta as f32,
+                offset as u32,
+            )?,
+            DType::F16 => state.kernels.rope_neox_f16(
+                &encoder,
+                &state.alloc,
+                &output.block,
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                theta as f32,
+                offset as u32,
+            )?,
+            _ => return Err(CoreError::Internal("rope_neox: unsupported dtype".into())),
         }
         encoder.endEncoding();
         cmd_buf.commit();

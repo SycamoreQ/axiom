@@ -9,6 +9,7 @@ fn main() {
 
     println!("=== architecture ===");
     println!("{:?}", gguf.metadata.get("general.architecture"));
+    println!("{:?}", gguf.tensors.contains_key("output.weight"));
 
     println!("\n=== moe-relevant metadata ===");
     let mut keys: Vec<&String> = gguf

@@ -28,6 +28,8 @@ const ATTN_PV_F32_MSL: &str = include_str!("kernels/attention_pv_f32.metal");
 const ADD_F16_MSL: &str = include_str!("kernels/add_f16.metal");
 const CACHE_WRITE_F32_MSL: &str = include_str!("kernels/cache_write_f32.metal");
 const CACHE_WRITE_F16_MSL: &str = include_str!("kernels/cache_write_f16.metal");
+const ROPE_NEOX_F16_MSL: &str = include_str!("kernels/rope_neox_f16.metal");
+const ROPE_NEOX_F32_MSL: &str = include_str!("kernels/rope_neox_f32.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -48,6 +50,8 @@ pub struct MetalKernels {
     pub add_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub cache_write_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub cache_write_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub rope_neox_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub rope_neox_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -111,6 +115,8 @@ impl MetalKernels {
             add_f16_pipeline: build_pipeline(ADD_F16_MSL, "add_f16")?,
             cache_write_f32_pipeline: build_pipeline(CACHE_WRITE_F32_MSL, "cache_write_f32")?,
             cache_write_f16_pipeline: build_pipeline(CACHE_WRITE_F16_MSL, "cache_write_f16")?,
+            rope_neox_pipeline: build_pipeline(ROPE_NEOX_F16_MSL, "rope_neox_f16")?,
+            rope_neox_f32_pipeline: build_pipeline(ROPE_NEOX_F32_MSL, "rope_neox_f32")?,
         })
     }
 
@@ -389,6 +395,67 @@ impl MetalKernels {
         Ok(())
     }
 
+    pub fn rope_neox_f16(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        x: &BlockHandle,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        theta: f32,
+        offset: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.rope_neox_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 0);
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&seq_len as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_heads as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&head_dim as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&theta as *const f32 as *mut c_void),
+                std::mem::size_of::<f32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&offset as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+        }
+
+        let grid = MTLSize {
+            width: seq_len as usize,
+            height: n_heads as usize,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        Ok(())
+    }
+
     pub fn rope_f32(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -401,6 +468,67 @@ impl MetalKernels {
         offset: u32,
     ) -> Result<()> {
         encoder.setComputePipelineState(&self.rope_f32_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 0);
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&seq_len as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_heads as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&head_dim as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&theta as *const f32 as *mut c_void),
+                std::mem::size_of::<f32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&offset as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+        }
+
+        let grid = MTLSize {
+            width: seq_len as usize,
+            height: n_heads as usize,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        Ok(())
+    }
+
+    pub fn rope_neox_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        x: &BlockHandle,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        theta: f32,
+        offset: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.rope_neox_f32_pipeline);
 
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 0);

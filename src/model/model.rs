@@ -150,6 +150,25 @@ impl<B: Backend> LlamaModel<B> {
         }
 
         let w_lm_head = self.lm_head.weight().to_vec_f32()?;
+        if offset == 0 {
+            eprintln!(
+                "[dbg] w_lm_head.len()={} vocab_size*hidden_size={} vocab_size={}",
+                w_lm_head.len(),
+                vocab_size * hidden_size,
+                vocab_size
+            );
+        }
+
+        if offset == 0 {
+            let w = self.lm_head.weight().to_vec_f32()?;
+            for tok in [151667usize, 872, 1000, 29728] {
+                // suspect token, "user", arbitrary normal, "neural"
+                let row = &w[tok * hidden_size..(tok + 1) * hidden_size];
+                let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let max = row.iter().cloned().fold(f32::MIN, f32::max);
+                eprintln!("[dbg] lm_head row {tok}: norm={norm} max={max}");
+            }
+        }
         let mut logits_cpu = vec![0.0f32; seq_len * vocab_size];
         for pos in 0..seq_len {
             let hidden_start = pos * hidden_size;
@@ -165,6 +184,16 @@ impl<B: Backend> LlamaModel<B> {
         }
 
         let logits_shape = Shape::new(&[1, seq_len, vocab_size]);
+        if offset == 0 {
+            let last_start = (seq_len - 1) * vocab_size;
+            let last_row = &logits_cpu[last_start..last_start + vocab_size];
+            let mut indexed: Vec<(usize, f32)> = last_row.iter().cloned().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+            eprintln!(
+                "[dbg] top-5 logits (last prefill position): {:?}",
+                &indexed[0..5]
+            );
+        }
         let logits = B::Tensor::from_slice(&logits_cpu, &logits_shape, &device)?;
 
         Ok(logits)

@@ -466,6 +466,12 @@ pub fn load_from_gguf_qwen3moe<B: Backend>(
         .map(|_| PendingExpertTensors::default())
         .collect();
 
+    // Qwen3-30B-A3B may use tied embeddings (no separate output.weight
+    // tensor) -- track this the same way load_from_gguf does, and fall
+    // back to token_embd.weight for lm_head if output.weight never shows up.
+    let mut has_output_weight = false;
+    let mut token_embd_tensor: Option<B::Tensor> = None;
+
     for (name, info) in gguf.tensors.iter() {
         let data = gguf
             .get_tensor_data(name)
@@ -475,7 +481,6 @@ pub fn load_from_gguf_qwen3moe<B: Backend>(
             let dims = &info.shape;
             let flat_shape = match kind {
                 MoeTensorKind::GateInp => dims.iter().map(|&d| d as usize).collect(),
-                // [num_experts, out, in] -> [num_experts * out, in]
                 MoeTensorKind::GateExps | MoeTensorKind::UpExps | MoeTensorKind::DownExps => {
                     vec![(dims[0] * dims[1]) as usize, dims[2] as usize]
                 }
@@ -497,9 +502,22 @@ pub fn load_from_gguf_qwen3moe<B: Backend>(
 
         if let Some(kind) = LlamaTensor::parse(name) {
             let tensor = load_bytes_as_tensor::<B>(data, info, device)?;
+
+            if matches!(kind, LlamaTensor::Output) {
+                has_output_weight = true;
+            }
+            if matches!(kind, LlamaTensor::TokenEmbd) {
+                token_embd_tensor = Some(tensor.clone());
+            }
+
             model.set_tensor(&kind, tensor)?;
         }
-        // anything else is silently skipped, same as the llama path
+    }
+
+    if !has_output_weight {
+        if let Some(embd) = token_embd_tensor {
+            model.set_tensor(&LlamaTensor::Output, embd)?;
+        }
     }
 
     for (layer_idx, slot) in pending.into_iter().enumerate() {
