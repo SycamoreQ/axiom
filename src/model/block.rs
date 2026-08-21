@@ -115,7 +115,7 @@ impl<B: Backend> Block<B> {
         let ffn_out = match &mut self.ffn {
             FeedForwardLayer::Dense(ff) => ff.forward(&h)?,
             FeedForwardLayer::Moe(moe) => moe.forward(&h, offset)?.hidden_states,
-            FeedForwardLayer::LazyMoe(moe) => moe.forward(&h, offset)?.hidden_states,
+            FeedForwardLayer::LazyMoe(moe) => moe.forward(&h, offset, None)?.hidden_states,
         };
 
         let x = x.add(&ffn_out)?;

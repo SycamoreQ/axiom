@@ -577,101 +577,106 @@ impl<B: Backend> LlamaModel<B> {
 
             let ffn_2d = ffn_norm_out.reshape(&Shape::new(&[seq_len, hidden]))?;
 
-            let ff = match &block.ffn {
-                FeedForwardLayer::Dense(ff) => ff,
+            let down_2d: B::Tensor = match &mut block.ffn {
+                FeedForwardLayer::Dense(ff) => {
+                    let gate_weight = ff.metal_gate_weight.as_ref().ok_or_else(|| {
+                        CoreError::Internal(
+                            "metal weights not prepared — call model.prepare_metal()".into(),
+                        )
+                    })?;
+                    let up_weight = ff.metal_up_weight.as_ref().ok_or_else(|| {
+                        CoreError::Internal(
+                            "metal weights not prepared — call model.prepare_metal()".into(),
+                        )
+                    })?;
+                    let down_weight = ff.metal_down_weight.as_ref().ok_or_else(|| {
+                        CoreError::Internal(
+                            "metal weights not prepared — call model.prepare_metal()".into(),
+                        )
+                    })?;
+
+                    let gate_2d = B::Tensor::uninit_pooled(
+                        &Shape::new(&[seq_len, self.config.intermediate_size]),
+                        x.dtype(),
+                        x.device(),
+                    )?;
+                    runner.broadcast_matmul(
+                        ffn_2d
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("ffn_2d not Metal".into()))?,
+                        gate_weight
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("gate_weight not Metal".into()))?,
+                        gate_2d
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
+                    )?;
+
+                    let up_2d = B::Tensor::uninit_pooled(
+                        &Shape::new(&[seq_len, self.config.intermediate_size]),
+                        x.dtype(),
+                        x.device(),
+                    )?;
+                    runner.broadcast_matmul(
+                        ffn_2d
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("ffn_2d not Metal".into()))?,
+                        up_weight
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("up_weight not Metal".into()))?,
+                        up_2d
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
+                    )?;
+
+                    let swiglu_out = B::Tensor::uninit_pooled(
+                        &Shape::new(&[seq_len, self.config.intermediate_size]),
+                        x.dtype(),
+                        x.device(),
+                    )?;
+                    runner.swiglu(
+                        gate_2d
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
+                        up_2d
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
+                        swiglu_out
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("swiglu_out not Metal".into()))?,
+                        (seq_len * self.config.intermediate_size) as u32,
+                    )?;
+
+                    let down_2d = B::Tensor::uninit_pooled(
+                        &Shape::new(&[seq_len, hidden]),
+                        x.dtype(),
+                        x.device(),
+                    )?;
+                    runner.broadcast_matmul(
+                        swiglu_out
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("swiglu_out not Metal".into()))?,
+                        down_weight
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("down_weight not Metal".into()))?,
+                        down_2d
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
+                    )?;
+                    down_2d
+                }
                 FeedForwardLayer::Moe(_) => {
                     return Err(CoreError::Internal(
-                        "MoE not supported on the Metal fast path yet".into(),
-                    ))
+                        "dense-eager MoE not supported on the Metal fast path yet".into(),
+                    ));
                 }
-                FeedForwardLayer::LazyMoe(_) => {
-                    return Err(CoreError::Internal(
-                        "MoE not supported on the Metal fast path yet".into(),
-                    ))
+                FeedForwardLayer::LazyMoe(moe) => {
+                    let moe_out = moe.forward(&ffn_norm_out, offset, Some(&mut runner))?;
+                    moe_out
+                        .hidden_states
+                        .reshape(&Shape::new(&[seq_len, hidden]))?
                 }
             };
-
-            let gate_weight = ff.metal_gate_weight.as_ref().ok_or_else(|| {
-                CoreError::Internal(
-                    "metal weights not prepared — call model.prepare_metal()".into(),
-                )
-            })?;
-            let up_weight = ff.metal_up_weight.as_ref().ok_or_else(|| {
-                CoreError::Internal(
-                    "metal weights not prepared — call model.prepare_metal()".into(),
-                )
-            })?;
-            let down_weight = ff.metal_down_weight.as_ref().ok_or_else(|| {
-                CoreError::Internal(
-                    "metal weights not prepared — call model.prepare_metal()".into(),
-                )
-            })?;
-
-            let gate_2d = B::Tensor::uninit_pooled(
-                &Shape::new(&[seq_len, self.config.intermediate_size]),
-                x.dtype(),
-                x.device(),
-            )?;
-            runner.broadcast_matmul(
-                ffn_2d
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("ffn_2d not Metal".into()))?,
-                gate_weight
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("gate_weight not Metal".into()))?,
-                gate_2d
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
-            )?;
-
-            let up_2d = B::Tensor::uninit_pooled(
-                &Shape::new(&[seq_len, self.config.intermediate_size]),
-                x.dtype(),
-                x.device(),
-            )?;
-            runner.broadcast_matmul(
-                ffn_2d
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("ffn_2d not Metal".into()))?,
-                up_weight
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("up_weight not Metal".into()))?,
-                up_2d
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
-            )?;
-
-            let swiglu_out = B::Tensor::uninit_pooled(
-                &Shape::new(&[seq_len, self.config.intermediate_size]),
-                x.dtype(),
-                x.device(),
-            )?;
-            runner.swiglu(
-                gate_2d
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
-                up_2d
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
-                swiglu_out
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("swiglu_out not Metal".into()))?,
-                (seq_len * self.config.intermediate_size) as u32,
-            )?;
-
-            let down_2d =
-                B::Tensor::uninit_pooled(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
-            runner.broadcast_matmul(
-                swiglu_out
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("swiglu_out not Metal".into()))?,
-                down_weight
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("down_weight not Metal".into()))?,
-                down_2d
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
-            )?;
 
             let x_new2 = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
             runner.add(

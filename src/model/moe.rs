@@ -1,10 +1,14 @@
+use std::eprint;
+
 use crate::core::backend::Backend;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
+use crate::core::error::CoreError;
 use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 use crate::core::tensor::TopKLastDimOp;
+use crate::metal::runner::MetalRunner;
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
 use crate::model::moe_loss::{compute_aux_loss, AuxLossConfig, MoeLossOutput};
@@ -330,6 +334,7 @@ each expert is `gate_proj`, `up_proj`, `down_proj`.
 gate and up are parallel; their hadamard product feeds down.
 */
 
+#[derive(Clone)]
 pub struct Expert<B: Backend> {
     gate_proj: Linear<B>, // [intermediate, d]
     up_proj: Linear<B>,   // [intermediate, d]
@@ -943,7 +948,12 @@ impl<B: Backend> LazyMoeLayer<B> {
         })
     }
 
-    pub fn forward(&mut self, x: &B::Tensor, token_offset: usize) -> Result<MoeOutput<B>> {
+    pub fn forward(
+        &mut self,
+        x: &B::Tensor,
+        token_offset: usize,
+        mut runner: Option<&mut MetalRunner>,
+    ) -> Result<MoeOutput<B>> {
         let batch = x.shape().dim(0)?;
         let seq_len = x.shape().dim(1)?;
         let hidden_dim = x.shape().dim(2)?;
@@ -981,17 +991,20 @@ impl<B: Backend> LazyMoeLayer<B> {
         };
 
         let mut accumulator: Vec<Option<B::Tensor>> = vec![None; t];
-
         for e in 0..self.expert_bank.num_experts {
             let (gathered, positions, k_slots) =
                 dispatch::<B>(&routed_input, ExpertIndex(e), &routing_output)?;
             if positions.is_empty() {
                 continue;
             }
-            // Only the experts_per_token experts actually selected for this
-            // batch ever reach here -- the other ~120 hit continue above.
             let expert = self.expert_bank.materialize(ExpertIndex(e))?;
-            let expert_out = expert.forward(&gathered)?;
+
+            let expert_out = if let Some(r) = runner.as_deref_mut() {
+                Self::expert_forward_via_runner(&expert, &gathered, r)?
+            } else {
+                expert.forward(&gathered)?
+            };
+
             combine::<B>(
                 &expert_out,
                 &routing_output.routing_weights,
@@ -999,8 +1012,6 @@ impl<B: Backend> LazyMoeLayer<B> {
                 &k_slots,
                 &mut accumulator,
             )?;
-            // `expert`'s three F32 tensors drop here, before the next
-            // iteration's materialize call.
         }
 
         let routed_refs: Vec<&B::Tensor> = accumulator
@@ -1034,6 +1045,91 @@ impl<B: Backend> LazyMoeLayer<B> {
                 .cloned(),
             loss_output,
         })
+    }
+
+    fn expert_forward_via_runner(
+        expert: &Expert<B>,
+        gathered: &B::Tensor,
+        runner: &mut MetalRunner,
+    ) -> Result<B::Tensor> {
+        let n_tok = gathered.shape().dim(0)?;
+        let intermediate = expert.gate_proj.weight().shape().dim(0)?; // [intermediate, hidden]
+        let hidden = expert.down_proj.weight().shape().dim(0)?; // [hidden, intermediate]
+        let device = gathered.device();
+
+        let gate_2d = B::Tensor::uninit_pooled(
+            &Shape::new(&[n_tok, intermediate]),
+            gathered.dtype(),
+            device,
+        )?;
+        runner.matmul(
+            gathered
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("gathered not Metal".into()))?,
+            expert
+                .gate_proj
+                .weight()
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("gate weight not Metal".into()))?,
+            gate_2d
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
+        )?;
+
+        let up_2d = B::Tensor::uninit_pooled(
+            &Shape::new(&[n_tok, intermediate]),
+            gathered.dtype(),
+            device,
+        )?;
+        runner.matmul(
+            gathered
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("gathered not Metal".into()))?,
+            expert
+                .up_proj
+                .weight()
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("up weight not Metal".into()))?,
+            up_2d
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
+        )?;
+
+        let swiglu_out = B::Tensor::uninit_pooled(
+            &Shape::new(&[n_tok, intermediate]),
+            gathered.dtype(),
+            device,
+        )?;
+        runner.swiglu(
+            gate_2d
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("gate_2d not Metal".into()))?,
+            up_2d
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("up_2d not Metal".into()))?,
+            swiglu_out
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("swiglu_out not Metal".into()))?,
+            (n_tok * intermediate) as u32,
+        )?;
+
+        let down_2d =
+            B::Tensor::uninit_pooled(&Shape::new(&[n_tok, hidden]), gathered.dtype(), device)?;
+        runner.matmul(
+            swiglu_out
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("swiglu_out not Metal".into()))?,
+            expert
+                .down_proj
+                .weight()
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("down weight not Metal".into()))?,
+            down_2d
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
+        )?;
+
+        Ok(down_2d)
     }
 
     fn update_pregate_buffer(

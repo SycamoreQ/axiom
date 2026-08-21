@@ -3,6 +3,7 @@ use crate::core::backend::CandleBackend;
 use crate::core::error::Result;
 use crate::core::tensor::TensorOps;
 
+#[derive(Clone)]
 pub struct Linear<B: Backend> {
     weight: B::Tensor,
     bias: Option<B::Tensor>,
