@@ -8,11 +8,13 @@ use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 use crate::core::tensor::TopKLastDimOp;
+use crate::metal::allocator::BlockHandle;
 use crate::metal::runner::MetalRunner;
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
 use crate::model::moe_loss::{compute_aux_loss, AuxLossConfig, MoeLossOutput};
 use crate::weights::gguf::GgufDType;
+use crate::weights::lazy::block_info;
 use crate::weights::lazy::QuantizedWeight;
 
 /*
@@ -399,6 +401,9 @@ pub struct LazyExpertBank<B: Backend> {
     hidden_size: usize,
     device: Device,
     _marker: std::marker::PhantomData<B>,
+    gate_exps_metal: Option<B::Tensor>,
+    up_exps_metal: Option<B::Tensor>,
+    down_exps_metal: Option<B::Tensor>,
 }
 
 // as opposed to the eager expert.
@@ -412,6 +417,9 @@ impl<B: Backend> LazyExpertBank<B> {
         intermediate_size: usize,
         hidden_size: usize,
         device: Device,
+        gate_exps_metal: Option<B::Tensor>,
+        up_exps_metal: Option<B::Tensor>,
+        down_exps_metal: Option<B::Tensor>,
     ) -> Self {
         Self {
             gate_exps,
@@ -422,7 +430,29 @@ impl<B: Backend> LazyExpertBank<B> {
             hidden_size,
             device,
             _marker: std::marker::PhantomData,
+            gate_exps_metal,
+            up_exps_metal,
+            down_exps_metal,
         }
+    }
+
+    pub fn prepare_metal(&mut self) -> Result<()> {
+        self.gate_exps_metal = Some(Self::upload_raw_bytes(&self.gate_exps.data, &self.device)?);
+        self.up_exps_metal = Some(Self::upload_raw_bytes(&self.up_exps.data, &self.device)?);
+        self.down_exps_metal = Some(Self::upload_raw_bytes(&self.down_exps.data, &self.device)?);
+        Ok(())
+    }
+
+    // Raw bytes uploaded as u32 chunks purely as a transport unit — the
+    // kernel reads the resulting buffer as `device const uchar*` regardless,
+    // so this doesn't reinterpret the actual quantized values at all.
+    fn upload_raw_bytes(data: &[u8], device: &Device) -> Result<B::Tensor> {
+        assert_eq!(data.len() % 4, 0, "quantized blob must be 4-byte aligned");
+        let as_u32: Vec<u32> = data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        B::Tensor::from_slice(&as_u32, &Shape::new(&[as_u32.len()]), device)
     }
 
     /// Dequantize just expert `idx`'s three weight matrices and hand back a
@@ -432,15 +462,102 @@ impl<B: Backend> LazyExpertBank<B> {
         let i = self.intermediate_size;
         let h = self.hidden_size;
 
-        let gate_rows = self.gate_exps.materialize_rows(idx.0 * i, (idx.0 + 1) * i);
-        let up_rows = self.up_exps.materialize_rows(idx.0 * i, (idx.0 + 1) * i);
-        let down_rows = self.down_exps.materialize_rows(idx.0 * h, (idx.0 + 1) * h);
+        let (gate_rows, (up_rows, down_rows)) = rayon::join(
+            || self.gate_exps.materialize_rows(idx.0 * i, (idx.0 + 1) * i),
+            || {
+                rayon::join(
+                    || self.up_exps.materialize_rows(idx.0 * i, (idx.0 + 1) * i),
+                    || self.down_exps.materialize_rows(idx.0 * h, (idx.0 + 1) * h),
+                )
+            },
+        );
 
         let gate_w = B::Tensor::from_slice(&gate_rows, &Shape::new(&[i, h]), &self.device)?;
         let up_w = B::Tensor::from_slice(&up_rows, &Shape::new(&[i, h]), &self.device)?;
         let down_w = B::Tensor::from_slice(&down_rows, &Shape::new(&[h, i]), &self.device)?;
 
         Ok(Expert::from_weights(gate_w, up_w, down_w, idx))
+    }
+
+    fn dequantize_expert_via_runner(
+        &self,
+        idx: ExpertIndex,
+        runner: &mut MetalRunner,
+    ) -> Result<Expert<B>> {
+        let i = self.intermediate_size;
+        let h = self.hidden_size;
+
+        let gate_w = self.dequant_one(
+            &self.gate_exps,
+            self.gate_exps_metal.as_ref().unwrap(),
+            idx.0 * i,
+            (idx.0 + 1) * i,
+            i,
+            h,
+            runner,
+        )?;
+        let up_w = self.dequant_one(
+            &self.up_exps,
+            self.up_exps_metal.as_ref().unwrap(),
+            idx.0 * i,
+            (idx.0 + 1) * i,
+            i,
+            h,
+            runner,
+        )?;
+        let down_w = self.dequant_one(
+            &self.down_exps,
+            self.down_exps_metal.as_ref().unwrap(),
+            idx.0 * h,
+            (idx.0 + 1) * h,
+            h,
+            i,
+            runner,
+        )?;
+
+        Ok(Expert::from_weights(gate_w, up_w, down_w, idx))
+    }
+
+    fn dequant_one(
+        &self,
+        meta: &QuantizedWeight,
+        uploaded: &B::Tensor,
+        row_start: usize,
+        row_end: usize,
+        out_rows: usize,
+        out_cols: usize,
+        runner: &mut MetalRunner,
+    ) -> Result<B::Tensor> {
+        let (block_elems, block_bytes) =
+            block_info(meta.dtype).expect("dequant_one: unsupported dtype");
+        let bytes_per_row = (meta.shape[1] / block_elems) * block_bytes;
+        let byte_offset = row_start * bytes_per_row;
+        let numel = (row_end - row_start) * meta.shape[1];
+        let num_blocks = (numel / block_elems) as u32;
+
+        let uploaded_metal = uploaded
+            .as_metal()
+            .ok_or_else(|| CoreError::Internal("uploaded buffer not Metal".into()))?;
+        let base_block = uploaded_metal.block();
+        // View into the shared buffer at this expert's byte range — same
+        // underlying MTLBuffer (owned_buffer clone is a refcount bump), just a
+        // different offset. No re-upload, no new allocation for the input side.
+        let view_block = BlockHandle {
+            index: base_block.index,
+            ptr: unsafe { base_block.ptr.add(byte_offset) },
+            offset_bytes: base_block.offset_bytes + byte_offset,
+            size_bytes: numel / block_elems * block_bytes,
+            owned_buffer: base_block.owned_buffer.clone(),
+        };
+
+        let out =
+            B::Tensor::uninit_pooled(&Shape::new(&[out_rows, out_cols]), DType::F32, &self.device)?;
+        let out_metal = out
+            .as_metal()
+            .ok_or_else(|| CoreError::Internal("out not Metal".into()))?;
+        runner.dequantize_q4k_raw(&view_block, out_metal.block(), num_blocks, numel as u32)?;
+
+        Ok(out)
     }
 }
 
@@ -997,7 +1114,12 @@ impl<B: Backend> LazyMoeLayer<B> {
             if positions.is_empty() {
                 continue;
             }
-            let expert = self.expert_bank.materialize(ExpertIndex(e))?;
+            let expert = if let Some(r) = runner.as_deref_mut() {
+                self.expert_bank
+                    .dequantize_expert_via_runner(ExpertIndex(e), r)?
+            } else {
+                self.expert_bank.materialize(ExpertIndex(e))?
+            };
 
             let expert_out = if let Some(r) = runner.as_deref_mut() {
                 Self::expert_forward_via_runner(&expert, &gathered, r)?
@@ -1202,6 +1324,9 @@ impl<B: Backend> LazyMoeLayer<B> {
             intermediate_size,
             hidden_size,
             device.clone(),
+            None,
+            None,
+            None,
         );
 
         let pregate_buffer = config

@@ -187,66 +187,67 @@ const Q4_K_BLOCK_SIZE: usize = 256;
 const Q4_K_BLOCK_BYTES: usize = 4 + 12 + Q4_K_BLOCK_SIZE / 2; // 144 bytes
 
 fn dequantize_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+
     let mut out = vec![0.0f32; numel];
-    let mut out_idx = 0;
 
-    for block in data.chunks_exact(Q4_K_BLOCK_BYTES) {
-        if out_idx >= numel {
-            break;
-        }
+    data.par_chunks_exact(Q4_K_BLOCK_BYTES)
+        .zip(out.par_chunks_mut(256))
+        .for_each(|(block, out_chunk)| {
+            let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+            let dmin = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
 
-        let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
-        let dmin = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
+            let sc = &block[4..16];
+            let qs = &block[16..144];
 
-        let sc = &block[4..16];
-        let qs = &block[16..144];
-        // scale/min unpacking — this part was already correct, unchanged
-        let mut scales = [0u8; 8];
-        let mut mins = [0u8; 8];
-        scales[0] = sc[0] & 0x3F;
-        scales[1] = sc[1] & 0x3F;
-        scales[2] = sc[2] & 0x3F;
-        scales[3] = sc[3] & 0x3F;
-        scales[4] = (sc[8] & 0x0F) | ((sc[0] >> 6) << 4);
-        scales[5] = (sc[9] & 0x0F) | ((sc[1] >> 6) << 4);
-        scales[6] = (sc[10] & 0x0F) | ((sc[2] >> 6) << 4);
-        scales[7] = (sc[11] & 0x0F) | ((sc[3] >> 6) << 4);
+            let mut scales = [0u8; 8];
+            let mut mins = [0u8; 8];
+            scales[0] = sc[0] & 0x3F;
+            scales[1] = sc[1] & 0x3F;
+            scales[2] = sc[2] & 0x3F;
+            scales[3] = sc[3] & 0x3F;
+            scales[4] = (sc[8] & 0x0F) | ((sc[0] >> 6) << 4);
+            scales[5] = (sc[9] & 0x0F) | ((sc[1] >> 6) << 4);
+            scales[6] = (sc[10] & 0x0F) | ((sc[2] >> 6) << 4);
+            scales[7] = (sc[11] & 0x0F) | ((sc[3] >> 6) << 4);
 
-        mins[0] = sc[4] & 0x3F;
-        mins[1] = sc[5] & 0x3F;
-        mins[2] = sc[6] & 0x3F;
-        mins[3] = sc[7] & 0x3F;
-        mins[4] = (sc[8] >> 4) | ((sc[4] >> 6) << 4);
-        mins[5] = (sc[9] >> 4) | ((sc[5] >> 6) << 4);
-        mins[6] = (sc[10] >> 4) | ((sc[6] >> 6) << 4);
-        mins[7] = (sc[11] >> 4) | ((sc[7] >> 6) << 4);
-        // 4 chunks of 32 bytes -> 64 elements each, alternating scale pairs
-        let mut is = 0;
-        for c in 0..4 {
-            let q = &qs[c * 32..(c + 1) * 32];
+            mins[0] = sc[4] & 0x3F;
+            mins[1] = sc[5] & 0x3F;
+            mins[2] = sc[6] & 0x3F;
+            mins[3] = sc[7] & 0x3F;
+            mins[4] = (sc[8] >> 4) | ((sc[4] >> 6) << 4);
+            mins[5] = (sc[9] >> 4) | ((sc[5] >> 6) << 4);
+            mins[6] = (sc[10] >> 4) | ((sc[6] >> 6) << 4);
+            mins[7] = (sc[11] >> 4) | ((sc[7] >> 6) << 4);
 
-            let d1 = d * scales[is] as f32;
-            let m1 = dmin * mins[is] as f32;
-            let d2 = d * scales[is + 1] as f32;
-            let m2 = dmin * mins[is + 1] as f32;
+            let mut out_idx = 0usize;
+            let mut is = 0;
+            for c in 0..4 {
+                let q = &qs[c * 32..(c + 1) * 32];
 
-            for l in 0..32 {
-                if out_idx >= numel {
-                    break;
+                let d1 = d * scales[is] as f32;
+                let m1 = dmin * mins[is] as f32;
+                let d2 = d * scales[is + 1] as f32;
+                let m2 = dmin * mins[is + 1] as f32;
+
+                for l in 0..32 {
+                    if out_idx >= out_chunk.len() {
+                        return;
+                    }
+                    out_chunk[out_idx] = d1 * (q[l] & 0x0F) as f32 - m1;
+                    out_idx += 1;
                 }
-                out[out_idx] = d1 * (q[l] & 0x0F) as f32 - m1;
-                out_idx += 1;
-            }
-            for l in 0..32 {
-                if out_idx >= numel {
-                    break;
+                for l in 0..32 {
+                    if out_idx >= out_chunk.len() {
+                        return;
+                    }
+                    out_chunk[out_idx] = d2 * (q[l] >> 4) as f32 - m2;
+                    out_idx += 1;
                 }
-                out[out_idx] = d2 * (q[l] >> 4) as f32 - m2;
-                out_idx += 1;
+                is += 2;
             }
-            is += 2;
-        }
-    }
+        });
+
     out
 }
 //

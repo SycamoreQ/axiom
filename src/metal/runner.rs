@@ -2,6 +2,7 @@ use crate::core::backend::MetalTensor;
 use crate::core::dtype::DType;
 use crate::core::error::{CoreError, Result};
 use crate::core::tensor::TensorOps;
+use crate::metal::allocator::BlockHandle;
 use crate::metal::allocator::MetalAllocator;
 use crate::metal::error::MetalError;
 use crate::metal::state::MetalState;
@@ -164,6 +165,42 @@ impl<'a> MetalRunner<'a> {
             }
             _ => return Err(MetalError::Internal("rope: unsupported dtype".into()).into()),
         }
+        Ok(())
+    }
+
+    pub fn dequantize_q4k(
+        &self,
+        data: &MetalTensor,
+        out: &MetalTensor,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        self.state.kernels.dequantize_q4_k_f32(
+            &self.encoder,
+            self.allocator,
+            data.block(),
+            out.block(),
+            num_blocks,
+            numel,
+        )?;
+        Ok(())
+    }
+
+    pub fn dequantize_q4k_raw(
+        &self,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        self.state.kernels.dequantize_q4_k_f32(
+            &self.encoder,
+            self.allocator,
+            data,
+            out,
+            num_blocks,
+            numel,
+        )?;
         Ok(())
     }
 

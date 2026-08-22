@@ -549,6 +549,9 @@ pub fn load_from_gguf_qwen3moe<B: Backend>(
             intermediate_size,
             hidden_size,
             device.clone(),
+            None,
+            None,
+            None,
         );
 
         let lazy_moe = LazyMoeLayer::<B>::new(

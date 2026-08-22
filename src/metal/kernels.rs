@@ -30,6 +30,7 @@ const CACHE_WRITE_F32_MSL: &str = include_str!("kernels/cache_write_f32.metal");
 const CACHE_WRITE_F16_MSL: &str = include_str!("kernels/cache_write_f16.metal");
 const ROPE_NEOX_F16_MSL: &str = include_str!("kernels/rope_neox_f16.metal");
 const ROPE_NEOX_F32_MSL: &str = include_str!("kernels/rope_neox_f32.metal");
+const DEQUANTIZE_Q4_K_MSL: &str = include_str!("kernels/dequantize_q4_k.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -52,6 +53,7 @@ pub struct MetalKernels {
     pub cache_write_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rope_neox_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rope_neox_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub dequantize_q4_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -117,6 +119,7 @@ impl MetalKernels {
             cache_write_f16_pipeline: build_pipeline(CACHE_WRITE_F16_MSL, "cache_write_f16")?,
             rope_neox_pipeline: build_pipeline(ROPE_NEOX_F16_MSL, "rope_neox_f16")?,
             rope_neox_f32_pipeline: build_pipeline(ROPE_NEOX_F32_MSL, "rope_neox_f32")?,
+            dequantize_q4_k_pipeline: build_pipeline(DEQUANTIZE_Q4_K_MSL, "dequantize_q4_k_f32")?,
         })
     }
 
@@ -1265,6 +1268,56 @@ impl MetalKernels {
         unsafe {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
+        Ok(())
+    }
+
+    pub fn dequantize_q4_k_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.dequantize_q4_k_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(data.metal_buffer(allocator)),
+                data.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(out.metal_buffer(allocator)),
+                out.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&num_blocks as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&numel as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let threads_per_group = 256usize.min(num_blocks as usize).max(1);
+        let grid_size = MTLSize {
+            width: num_blocks as usize,
+            height: 1,
+            depth: 1,
+        };
+        let group_size = MTLSize {
+            width: threads_per_group,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, group_size);
+
         Ok(())
     }
 }
