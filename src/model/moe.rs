@@ -438,8 +438,14 @@ impl<B: Backend> LazyExpertBank<B> {
 
     pub fn prepare_metal(&mut self) -> Result<()> {
         self.gate_exps_metal = Some(Self::upload_raw_bytes(&self.gate_exps.data, &self.device)?);
+        self.gate_exps.data = Vec::new(); // drop the CPU copy now that it's on the GPU
+
         self.up_exps_metal = Some(Self::upload_raw_bytes(&self.up_exps.data, &self.device)?);
+        self.up_exps.data = Vec::new();
+
         self.down_exps_metal = Some(Self::upload_raw_bytes(&self.down_exps.data, &self.device)?);
+        self.down_exps.data = Vec::new();
+
         Ok(())
     }
 
@@ -487,33 +493,43 @@ impl<B: Backend> LazyExpertBank<B> {
         let i = self.intermediate_size;
         let h = self.hidden_size;
 
-        let gate_w = self.dequant_one(
-            &self.gate_exps,
-            self.gate_exps_metal.as_ref().unwrap(),
-            idx.0 * i,
-            (idx.0 + 1) * i,
-            i,
-            h,
-            runner,
-        )?;
-        let up_w = self.dequant_one(
-            &self.up_exps,
-            self.up_exps_metal.as_ref().unwrap(),
-            idx.0 * i,
-            (idx.0 + 1) * i,
-            i,
-            h,
-            runner,
-        )?;
-        let down_w = self.dequant_one(
-            &self.down_exps,
-            self.down_exps_metal.as_ref().unwrap(),
-            idx.0 * h,
-            (idx.0 + 1) * h,
-            h,
-            i,
-            runner,
-        )?;
+        let gate_w = self
+            .dequant_one(
+                &self.gate_exps,
+                self.gate_exps_metal.as_ref().unwrap(),
+                idx.0 * i,
+                (idx.0 + 1) * i,
+                i,
+                h,
+                runner,
+            )?
+            .transpose(0, 1)?
+            .contiguous()?;
+
+        let up_w = self
+            .dequant_one(
+                &self.up_exps,
+                self.up_exps_metal.as_ref().unwrap(),
+                idx.0 * i,
+                (idx.0 + 1) * i,
+                i,
+                h,
+                runner,
+            )?
+            .transpose(0, 1)?
+            .contiguous()?;
+        let down_w = self
+            .dequant_one(
+                &self.down_exps,
+                self.down_exps_metal.as_ref().unwrap(),
+                idx.0 * h,
+                (idx.0 + 1) * h,
+                h,
+                i,
+                runner,
+            )?
+            .transpose(0, 1)?
+            .contiguous()?;
 
         Ok(Expert::from_weights(gate_w, up_w, down_w, idx))
     }
@@ -1114,6 +1130,8 @@ impl<B: Backend> LazyMoeLayer<B> {
             if positions.is_empty() {
                 continue;
             }
+            let checkpoint = runner.as_deref().map(|r| r.allocator.checkpoint());
+
             let expert = if let Some(r) = runner.as_deref_mut() {
                 self.expert_bank
                     .dequantize_expert_via_runner(ExpertIndex(e), r)?
@@ -1134,6 +1152,10 @@ impl<B: Backend> LazyMoeLayer<B> {
                 &k_slots,
                 &mut accumulator,
             )?;
+
+            if let (Some(r), Some(cp)) = (runner.as_deref_mut(), checkpoint) {
+                r.allocator.reset_to(cp);
+            }
         }
 
         let routed_refs: Vec<&B::Tensor> = accumulator
@@ -1175,8 +1197,8 @@ impl<B: Backend> LazyMoeLayer<B> {
         runner: &mut MetalRunner,
     ) -> Result<B::Tensor> {
         let n_tok = gathered.shape().dim(0)?;
-        let intermediate = expert.gate_proj.weight().shape().dim(0)?; // [intermediate, hidden]
-        let hidden = expert.down_proj.weight().shape().dim(0)?; // [hidden, intermediate]
+        let intermediate = expert.gate_proj.weight().shape().dim(1)?; // [hidden, intermediate] (post-transpose)
+        let hidden = expert.down_proj.weight().shape().dim(1)?; // [intermediate, hidden] (post-transpose)
         let device = gathered.device();
 
         let gate_2d = B::Tensor::uninit_pooled(
@@ -1184,6 +1206,7 @@ impl<B: Backend> LazyMoeLayer<B> {
             gathered.dtype(),
             device,
         )?;
+
         runner.matmul(
             gathered
                 .as_metal()
@@ -1222,6 +1245,7 @@ impl<B: Backend> LazyMoeLayer<B> {
             gathered.dtype(),
             device,
         )?;
+
         runner.swiglu(
             gate_2d
                 .as_metal()

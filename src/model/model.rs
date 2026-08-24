@@ -94,7 +94,7 @@ impl<B: Backend> LlamaModel<B> {
         max_seq_len: usize,
     ) -> Result<B::Tensor> {
         // Use the Metal fast path only for single‑token decode (seq_len == 1)
-        if self.embedding.weight().device().is_metal() && !self.config.is_moe() {
+        if self.embedding.weight().device().is_metal() {
             #[cfg(feature = "metal")]
             return self.forward_metal(token_ids, kv_cache, offset, max_seq_len);
             #[cfg(not(feature = "metal"))]
@@ -218,7 +218,7 @@ impl<B: Backend> LlamaModel<B> {
         let hidden = self.config.hidden_size;
         let n_heads = self.config.num_attention_heads;
         let n_kv_heads = self.config.num_key_value_heads;
-        let head_dim = hidden / n_heads;
+        let head_dim = self.config.head_dim();
         let theta = self.config.rope_theta as f32;
         let eps = self.config.rms_norm_eps as f32;
 
@@ -273,8 +273,11 @@ impl<B: Backend> LlamaModel<B> {
                 )
             })?;
 
-            let q_2d =
-                B::Tensor::uninit_pooled(&Shape::new(&[seq_len, hidden]), x.dtype(), x.device())?;
+            let q_2d = B::Tensor::uninit_pooled(
+                &Shape::new(&[seq_len, n_heads * head_dim]),
+                x.dtype(),
+                x.device(),
+            )?;
             runner.broadcast_matmul(
                 norm_2d
                     .as_metal()
@@ -517,7 +520,8 @@ impl<B: Backend> LlamaModel<B> {
                 )?;
             }
 
-            let attn_reshaped = attn_out_all.reshape(&Shape::new(&[1, seq_len, hidden]))?;
+            let attn_reshaped =
+                attn_out_all.reshape(&Shape::new(&[1, seq_len, n_heads * head_dim]))?;
 
             let o_weight = block.attn.metal_o_weight.as_ref().ok_or_else(|| {
                 CoreError::Internal(

@@ -178,6 +178,20 @@ impl MetalAllocator {
         self.free_list.borrow_mut().clear();
     }
 
+    pub fn checkpoint(&self) -> usize {
+        self.current_offset.get()
+    }
+
+    pub fn reset_to(&self, checkpoint: usize) {
+        self.current_offset.set(checkpoint);
+        // Anything in free_list at or past this offset was inside the region we
+        // just bulk-reclaimed — it's stale now, purge it rather than let alloc()
+        // waste time scanning entries that no longer mean anything.
+        self.free_list
+            .borrow_mut()
+            .retain(|b| b.offset_bytes < checkpoint);
+    }
+
     pub fn free_count(&self) -> usize {
         self.free_list.borrow().len()
     }

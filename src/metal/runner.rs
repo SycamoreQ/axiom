@@ -15,7 +15,7 @@ pub struct MetalRunner<'a> {
     state: &'a MetalState,
     cmd_buf: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
-    allocator: &'a MetalAllocator,
+    pub allocator: &'a MetalAllocator,
 }
 
 impl<'a> MetalRunner<'a> {
@@ -524,6 +524,18 @@ impl<'a> MetalRunner<'a> {
             _ => return Err(MetalError::Internal("cache_write: unsupported dtype".into()).into()),
         }
         Ok(())
+    }
+
+    pub fn free_tensor(&self, t: &MetalTensor) {
+        let block = t.block();
+        let handle = BlockHandle {
+            index: block.index,
+            ptr: block.ptr,
+            offset_bytes: block.offset_bytes,
+            size_bytes: block.size_bytes,
+            owned_buffer: block.owned_buffer.clone(),
+        };
+        self.allocator.free(handle);
     }
 
     pub fn finish(self) -> Result<()> {

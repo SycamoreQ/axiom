@@ -47,7 +47,7 @@ impl<B: Backend> FeedForwardLayer<B> {
         match self {
             FeedForwardLayer::Dense(ff) => ff.prepare_metal_weights(),
             FeedForwardLayer::Moe(_) => Ok(()), // not on the Metal fast path yet
-            FeedForwardLayer::LazyMoe(_) => Ok(()), // not on the Metal fast path yet
+            FeedForwardLayer::LazyMoe(moe) => moe.expert_bank.prepare_metal(),
         }
     }
 }

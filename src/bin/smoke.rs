@@ -53,7 +53,7 @@ fn main() {
         print!("Initializing Metal... ");
         std::io::stdout().flush().unwrap();
 
-        let pool_size = 512usize * 1024 * 1024;
+        let pool_size = 4096usize * 1024 * 1024;
         println!("Metal pool: {} MB", pool_size / 1024 / 1024);
         axiom::metal::state::init_global_metal_state(pool_size)
             .expect("failed to initialize Metal state");
