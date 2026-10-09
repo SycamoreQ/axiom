@@ -4,6 +4,7 @@ use crate::core::error::{CoreError, Result};
 use crate::core::tensor::TensorOps;
 use crate::metal::allocator::BlockHandle;
 use crate::metal::allocator::MetalAllocator;
+use crate::weights::gguf::GgufDType;
 use crate::metal::error::MetalError;
 use crate::metal::state::MetalState;
 use objc2::rc::Retained;
@@ -168,6 +169,45 @@ impl<'a> MetalRunner<'a> {
         Ok(())
     }
 
+    pub fn rope_neox(
+        &self,
+        x: &MetalTensor,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        theta: f32,
+        offset: u32,
+    ) -> Result<()> {
+        match x.metal_dtype() {
+            DType::F32 => {
+                self.state.kernels.rope_neox_f32(
+                    &self.encoder,
+                    self.allocator,
+                    x.block(),
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    theta,
+                    offset,
+                )?;
+            }
+            DType::F16 => {
+                self.state.kernels.rope_neox_f16(
+                    &self.encoder,
+                    self.allocator,
+                    x.block(),
+                    seq_len,
+                    n_heads,
+                    head_dim,
+                    theta,
+                    offset,
+                )?;
+            }
+            _ => return Err(MetalError::Internal("rope_neox: unsupported dtype".into()).into()),
+        }
+        Ok(())
+    }
+
     pub fn dequantize_q4k(
         &self,
         data: &MetalTensor,
@@ -202,6 +242,77 @@ impl<'a> MetalRunner<'a> {
             numel,
         )?;
         Ok(())
+    }
+
+    pub fn dequantize_q6k_raw(
+        &self,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        self.state.kernels.dequantize_q6_k_f32(
+            &self.encoder,
+            self.allocator,
+            data,
+            out,
+            num_blocks,
+            numel,
+        )?;
+        Ok(())
+    }
+
+    pub fn dequantize_q3k_raw(
+        &self,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        self.state.kernels.dequantize_q3_k_f32(
+            &self.encoder,
+            self.allocator,
+            data,
+            out,
+            num_blocks,
+            numel,
+        )?;
+        Ok(())
+    }
+
+    pub fn dequantize_q2k_raw(
+        &self,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        self.state.kernels.dequantize_q2_k_f32(
+            &self.encoder,
+            self.allocator,
+            data,
+            out,
+            num_blocks,
+            numel,
+        )?;
+        Ok(())
+    }
+
+    pub fn dequantize_raw(
+        &self,
+        dtype: GgufDType,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        match dtype {
+            GgufDType::Q4_K => self.dequantize_q4k_raw(data, out, num_blocks, numel),
+            GgufDType::Q6_K => self.dequantize_q6k_raw(data, out, num_blocks, numel),
+            GgufDType::Q3_K => self.dequantize_q3k_raw(data, out, num_blocks, numel),
+            GgufDType::Q2_K => self.dequantize_q2k_raw(data, out, num_blocks, numel),
+            other => Err(CoreError::Internal(format!("unsupported metal dequant dtype: {:?}", other))),
+        }
     }
 
     pub fn matmul(&self, a: &MetalTensor, b: &MetalTensor, c: &MetalTensor) -> Result<()> {
@@ -244,6 +355,24 @@ impl<'a> MetalRunner<'a> {
             }
             _ => return Err(MetalError::Internal("matmul: unsupported dtype".into()).into()),
         }
+        Ok(())
+    }
+
+    pub fn transpose(&self, a: &MetalTensor, b: &MetalTensor) -> Result<()> {
+        let a_shape = a.metal_shape();
+        if a_shape.rank() != 2 {
+            return Err(MetalError::Internal("transpose only supports 2D tensors".into()).into());
+        }
+        let rows = a_shape.dims()[0];
+        let cols = a_shape.dims()[1];
+        self.state.kernels.transpose_f32(
+            &self.encoder,
+            self.allocator,
+            a.block(),
+            b.block(),
+            rows as u32,
+            cols as u32,
+        )?;
         Ok(())
     }
 

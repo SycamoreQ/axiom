@@ -149,6 +149,16 @@ impl<B: Backend> Block<B> {
         self.attn.set_o_proj(Linear::new(w, None));
     }
 
+    pub fn set_attn_q_bias(&mut self, b: B::Tensor) {
+        self.attn.set_q_bias(b);
+    }
+    pub fn set_attn_k_bias(&mut self, b: B::Tensor) {
+        self.attn.set_k_bias(b);
+    }
+    pub fn set_attn_v_bias(&mut self, b: B::Tensor) {
+        self.attn.set_v_bias(b);
+    }
+
     pub fn set_ffn_gate(&mut self, w: B::Tensor) {
         if let FeedForwardLayer::Dense(ff) = &mut self.ffn {
             ff.set_gate(Linear::new(w, None))
@@ -237,6 +247,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("llama".to_string()),
+            head_dim_override: None,
+            lazy_moe: false,
         }
     }
 
@@ -262,6 +274,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("deepseek".to_string()),
+            head_dim_override: None,
+            lazy_moe: false,
         }
     }
 

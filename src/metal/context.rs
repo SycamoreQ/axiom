@@ -35,6 +35,13 @@ impl MetalContext {
             .commandBuffer()
             .ok_or(MetalError::NoCommandBuffer)
     }
+
+    pub fn synchronize(&self) -> Result<()> {
+        let cmd = self.command_buffer()?;
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Ok(())
+    }
 }
 
 #[cfg(test)]

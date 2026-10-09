@@ -130,15 +130,25 @@ mod tests {
     #[test]
     fn test_encode_basic() {
         let tok = get_tokenizer();
+        let expected = if tok.vocab().size() > 130_000 {
+            vec![9707, 1879]
+        } else {
+            vec![9906, 1917]
+        };
         assert_eq!(
             tok.encode("Hello world", EncodeOptions::default()),
-            vec![9906, 1917]
+            expected
         );
     }
 
     #[test]
     fn test_encode_with_bos() {
         let tok = get_tokenizer();
+        let (bos, expected) = if tok.vocab().size() > 130_000 {
+            (151644, vec![9707, 1879])
+        } else {
+            (128000, vec![9906, 1917])
+        };
         let ids = tok.encode(
             "Hello world",
             EncodeOptions {
@@ -146,13 +156,18 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(ids[0], 128000);
-        assert_eq!(&ids[1..], &[9906, 1917]);
+        assert_eq!(ids[0], bos);
+        assert_eq!(&ids[1..], &expected[..]);
     }
 
     #[test]
     fn test_encode_with_eos() {
         let tok = get_tokenizer();
+        let (eos, expected) = if tok.vocab().size() > 130_000 {
+            (151643, vec![9707, 1879])
+        } else {
+            (128001, vec![9906, 1917])
+        };
         let ids = tok.encode(
             "Hello world",
             EncodeOptions {
@@ -160,13 +175,18 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(*ids.last().unwrap(), 128001);
-        assert_eq!(&ids[..ids.len() - 1], &[9906, 1917]);
+        assert_eq!(*ids.last().unwrap(), eos);
+        assert_eq!(&ids[..ids.len() - 1], &expected[..]);
     }
 
     #[test]
     fn test_encode_with_bos_and_eos() {
         let tok = get_tokenizer();
+        let (bos, eos, expected) = if tok.vocab().size() > 130_000 {
+            (151644, 151643, vec![9707, 1879])
+        } else {
+            (128000, 128001, vec![9906, 1917])
+        };
         let ids = tok.encode(
             "Hello world",
             EncodeOptions {
@@ -174,23 +194,35 @@ mod tests {
                 add_eos: true,
             },
         );
-        assert_eq!(ids[0], 128000);
-        assert_eq!(*ids.last().unwrap(), 128001);
-        assert_eq!(&ids[1..ids.len() - 1], &[9906, 1917]);
+        assert_eq!(ids[0], bos);
+        assert_eq!(*ids.last().unwrap(), eos);
+        assert_eq!(&ids[1..ids.len() - 1], &expected[..]);
     }
 
     #[test]
     fn test_decode_basic() {
         let tok = get_tokenizer();
-        let decoded = tok.decode(&[9906, 1917]);
+        let tokens = if tok.vocab().size() > 130_000 {
+            vec![9707, 1879]
+        } else {
+            vec![9906, 1917]
+        };
+        let decoded = tok.decode(&tokens);
         assert_eq!(decoded, "Hello world");
     }
 
     #[test]
     fn test_decode_skips_special_tokens() {
         let tok = get_tokenizer();
-        // BOS + "Hello world" + EOS — special tokens should not appear in output
-        let decoded = tok.decode(&[128000, 9906, 1917, 128001]);
+        let (bos, eos, tokens) = if tok.vocab().size() > 130_000 {
+            (151644, 151643, vec![9707, 1879])
+        } else {
+            (128000, 128001, vec![9906, 1917])
+        };
+        let mut full = vec![bos];
+        full.extend(tokens);
+        full.push(eos);
+        let decoded = tok.decode(&full);
         assert_eq!(decoded, "Hello world");
     }
 
@@ -226,7 +258,12 @@ mod tests {
     #[test]
     fn test_bos_eos_accessors() {
         let tok = get_tokenizer();
-        assert_eq!(tok.bos_id(), Some(128000));
-        assert_eq!(tok.eos_id(), Some(128001));
+        if tok.vocab().size() > 130_000 {
+            assert_eq!(tok.bos_id(), Some(151644));
+            assert_eq!(tok.eos_id(), Some(151643));
+        } else {
+            assert_eq!(tok.bos_id(), Some(128000));
+            assert_eq!(tok.eos_id(), Some(128001));
+        }
     }
 }

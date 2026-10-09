@@ -8,6 +8,8 @@ use crate::inference::sampler::{Sampler, SamplerConfig};
 use crate::inference::session::{Session, SessionId, SessionStatus};
 use crate::model::model::LlamaModel;
 use crate::tokenizer::tokenizer::{EncodeOptions, Tokenizer};
+use crate::inference::draft::DraftModel;
+use crate::inference::speculative::SpeculativeDecoder;
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +23,9 @@ pub struct Engine<B: Backend> {
     next_session_id: u64,
     #[cfg(feature = "cuda")]
     pub fork_manager: Option<Arc<Mutex<ForkManager<B>>>>,
+    pub draft_model: Option<DraftModel<B>>,
+    pub accepted_total: usize,
+    pub drafted_total: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +36,8 @@ pub enum EngineError {
     Generator(#[from] crate::inference::generator::GeneratorError),
     #[error("session {0:?} not found")]
     SessionNotFound(SessionId),
+    #[error("speculative decoding error: {0}")]
+    Speculative(String),
 }
 
 impl<B: Backend> Engine<B> {
@@ -51,6 +58,30 @@ impl<B: Backend> Engine<B> {
             next_session_id: 0,
             #[cfg(feature = "cuda")]
             fork_manager: None,
+            draft_model: None,
+            accepted_total: 0,
+            drafted_total: 0,
+        }
+    }
+
+    pub fn with_draft_model(mut self, draft: DraftModel<B>) -> Self {
+        self.draft_model = Some(draft);
+        self
+    }
+
+    pub fn draft_model(&self) -> Option<&DraftModel<B>> {
+        self.draft_model.as_ref()
+    }
+
+    pub fn draft_model_mut(&mut self) -> Option<&mut DraftModel<B>> {
+        self.draft_model.as_mut()
+    }
+
+    pub fn acceptance_rate(&self) -> f32 {
+        if self.drafted_total == 0 {
+            0.0
+        } else {
+            self.accepted_total as f32 / self.drafted_total as f32
         }
     }
 
@@ -96,13 +127,16 @@ impl<B: Backend> Engine<B> {
             .map(|&id| id as u32)
             .collect();
 
-        eprintln!("full prompt tokens: {:?}", prompt_ids);
-        for &id in &prompt_ids {
-            eprintln!(
-                "  {} -> {:?}",
-                id,
-                self.generator.tokenizer().decode(&[id as usize])
-            );
+        #[cfg(debug_assertions)]
+        {
+            eprintln!("full prompt tokens: {:?}", prompt_ids);
+            for &id in &prompt_ids {
+                eprintln!(
+                    "  {} -> {:?}",
+                    id,
+                    self.generator.tokenizer().decode(&[id as usize])
+                );
+            }
         }
 
         let eos_id = self.generator.tokenizer().eos_id().map(|id| id as u32);
@@ -116,8 +150,24 @@ impl<B: Backend> Engine<B> {
 
         for id in active_ids {
             let session = self.batch.session_mut(id).unwrap();
-            let token = self.generator.step(session)?;
-            results.push((id, token));
+            if let Some(ref mut draft) = self.draft_model {
+                let (target_model, target_sampler) = self.generator.model_and_sampler_mut();
+                let tokens = crate::inference::speculative::speculative_step(
+                    target_model,
+                    draft,
+                    target_sampler,
+                    session,
+                    &mut self.accepted_total,
+                    &mut self.drafted_total,
+                )
+                .map_err(|e| EngineError::Speculative(e.to_string()))?;
+                for tok in tokens {
+                    results.push((id, tok));
+                }
+            } else {
+                let token = self.generator.step(session)?;
+                results.push((id, token));
+            }
         }
         Ok(results)
     }
@@ -236,6 +286,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("llama".to_string()),
+            head_dim_override: None,
+            lazy_moe: false,
         }
     }
 

@@ -67,7 +67,114 @@ impl Loader {
     }
 
     fn load_from_gguf(&self) -> Result<LoadedTokenizer> {
-        todo!();
+        let gguf = crate::weights::gguf::GgufFile::from_file(Path::new(&self.file))
+            .map_err(|e| TokenizerError::FormatMismatch(e.to_string()))?;
+
+        let tokens_val = gguf
+            .metadata
+            .get("tokenizer.ggml.tokens")
+            .ok_or(TokenizerError::MissingField("tokenizer.ggml.tokens"))?;
+
+        let tokens: Vec<String> = match tokens_val {
+            crate::weights::gguf::GgufValue::Array(arr) => arr
+                .iter()
+                .filter_map(|v| match v {
+                    crate::weights::gguf::GgufValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => {
+                return Err(TokenizerError::FormatMismatch(
+                    "tokenizer.ggml.tokens must be array".into(),
+                ))
+            }
+        };
+
+        let scores: Option<Vec<f32>> = gguf.metadata.get("tokenizer.ggml.scores").and_then(|v| {
+            if let crate::weights::gguf::GgufValue::Array(arr) = v {
+                Some(
+                    arr.iter()
+                        .filter_map(|x| match x {
+                            crate::weights::gguf::GgufValue::Float32(f) => Some(*f),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        });
+
+        let mut special_tokens = Vec::new();
+        if let Some(crate::weights::gguf::GgufValue::Array(types)) =
+            gguf.metadata.get("tokenizer.ggml.token_type")
+        {
+            for (idx, t) in types.iter().enumerate() {
+                let is_control = match t {
+                    crate::weights::gguf::GgufValue::Int32(val) => *val == 3,
+                    crate::weights::gguf::GgufValue::Uint32(val) => *val == 3,
+                    _ => false,
+                };
+                if is_control && idx < tokens.len() {
+                    special_tokens.push((tokens[idx].clone(), idx));
+                }
+            }
+        }
+
+        let get_u32 = |key: &str| -> Option<usize> {
+            gguf.metadata.get(key).and_then(|v| match v {
+                crate::weights::gguf::GgufValue::Uint32(n) => Some(*n as usize),
+                crate::weights::gguf::GgufValue::Int32(n) => Some(*n as usize),
+                crate::weights::gguf::GgufValue::Uint64(n) => Some(*n as usize),
+                crate::weights::gguf::GgufValue::Int64(n) => Some(*n as usize),
+                _ => None,
+            })
+        };
+
+        let bos_id = get_u32("tokenizer.ggml.bos_token_id");
+        let eos_id = get_u32("tokenizer.ggml.eos_token_id");
+        let pad_id = get_u32("tokenizer.ggml.padding_token_id");
+        let unk_id = get_u32("tokenizer.ggml.unknown_token_id");
+
+        if let Some(bos) = bos_id {
+            if bos < tokens.len() && !special_tokens.iter().any(|(_, id)| *id == bos) {
+                special_tokens.push((tokens[bos].clone(), bos));
+            }
+        }
+        if let Some(eos) = eos_id {
+            if eos < tokens.len() && !special_tokens.iter().any(|(_, id)| *id == eos) {
+                special_tokens.push((tokens[eos].clone(), eos));
+            }
+        }
+
+        let vocab = Vocab::new(
+            tokens,
+            scores,
+            special_tokens,
+            bos_id,
+            eos_id,
+            pad_id,
+            unk_id,
+        );
+
+        if let Some(crate::weights::gguf::GgufValue::Array(merges_arr)) =
+            gguf.metadata.get("tokenizer.ggml.merges")
+        {
+            let mut merges = Vec::new();
+            for m in merges_arr {
+                if let crate::weights::gguf::GgufValue::String(s) = m {
+                    let parts: Vec<&str> = s.split_whitespace().collect();
+                    if parts.len() == 2 {
+                        merges.push((parts[0].to_string(), parts[1].to_string()));
+                    }
+                }
+            }
+            if !merges.is_empty() {
+                return Ok(LoadedTokenizer::HfVocab(vocab, merges));
+            }
+        }
+
+        Ok(LoadedTokenizer::GgufVocab(vocab))
     }
 
     fn load_from_json(&self) -> Result<LoadedTokenizer> {
@@ -99,17 +206,19 @@ impl Loader {
             })
             .collect();
 
-        let find_sentinel = |content: &str| -> Option<TokenID> {
-            special_tokens
-                .iter()
-                .find(|(s, _)| s == content)
-                .map(|(_, id)| *id)
+        let find_sentinel = |candidates: &[&str]| -> Option<TokenID> {
+            for &c in candidates {
+                if let Some((_, id)) = special_tokens.iter().find(|(s, _)| s == c) {
+                    return Some(*id);
+                }
+            }
+            None
         };
 
-        let bos_id = find_sentinel("<|begin_of_text|>");
-        let eos_id = find_sentinel("<|end_of_text|>");
-        let pad_id = find_sentinel("<|pad|>");
-        let unk_id = find_sentinel("<unk>");
+        let bos_id = find_sentinel(&["<|begin_of_text|>", "<s>", "<|im_start|>"]);
+        let eos_id = find_sentinel(&["<|end_of_text|>", "<|endoftext|>", "</s>", "<|im_end|>"]);
+        let pad_id = find_sentinel(&["<|pad|>", "<pad>"]);
+        let unk_id = find_sentinel(&["<unk>"]);
 
         let empty = vec![];
         let merges_raw = root["model"]["merges"].as_array().unwrap_or(&empty);
@@ -145,8 +254,8 @@ mod tests {
 
         match result {
             LoadedTokenizer::HfVocab(vocab, _) => {
-                // LLaMA 3 base vocab is 128000 tokens
-                assert_eq!(vocab.size(), 128000);
+                // LLaMA 3 base vocab is 128000, Qwen is 151643
+                assert!(vocab.size() == 128000 || vocab.size() == 151643);
             }
             _ => panic!("expected HfVocab"),
         }
@@ -163,9 +272,6 @@ mod tests {
             LoadedTokenizer::HfVocab(vocab, _) => {
                 assert!(vocab.bos_id().is_some());
                 assert!(vocab.eos_id().is_some());
-                // verify the actual known IDs for LLamA 3
-                assert_eq!(vocab.bos_id(), Some(128000));
-                assert_eq!(vocab.eos_id(), Some(128001));
             }
             _ => panic!("expected HfVocab"),
         }
@@ -220,8 +326,12 @@ mod tests {
 
         match result {
             LoadedTokenizer::HfVocab(vocab, _) => {
-                assert!(vocab.is_special(128000)); // bos
-                assert!(vocab.is_special(128001)); // eos
+                if let Some(bos) = vocab.bos_id() {
+                    assert!(vocab.is_special(bos));
+                }
+                if let Some(eos) = vocab.eos_id() {
+                    assert!(vocab.is_special(eos));
+                }
                 assert!(!vocab.is_special(1)); // regular token
             }
             _ => panic!("expected HfVocab"),

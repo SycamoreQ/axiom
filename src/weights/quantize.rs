@@ -35,9 +35,12 @@ pub fn dequantize(data: &[u8], dtype: GgufDType, numel: usize) -> Vec<f32> {
             .collect(),
         GgufDType::Q4_0 => dequantize_q4_0(data, numel),
         GgufDType::Q4_1 => dequantize_q4_1(data, numel),
+        GgufDType::Q5_0 => dequantize_q5_0(data, numel),
         GgufDType::Q8_0 => dequantize_q8_0(data, numel),
         GgufDType::Q4_K => dequantize_q4_k(data, numel),
         GgufDType::Q6_K => dequantize_q6_k(data, numel),
+        GgufDType::Q2_K => dequantize_q2_k(data, numel),
+        GgufDType::Q3_K => dequantize_q3_k(data, numel),
         _ => {
             eprintln!(
                 "WARNING: dequantize called for unsupported dtype {:?} — returning zeros",
@@ -125,6 +128,53 @@ fn dequantize_q4_1(data: &[u8], numel: usize) -> Vec<f32> {
                 break;
             }
             out[out_idx] = (qs[j] >> 4) as f32 * d + m;
+            out_idx += 1;
+        }
+    }
+
+    out
+}
+
+//
+// Block layout (22 bytes, 32 elements):
+//   bytes [0..2]  : f16 scale `d`
+//   bytes [2..6]  : u32 high bits `qh` (1 bit per element)
+//   bytes [6..22] : 16 bytes of nibbles `qs` (low 4 bits per element)
+//     element j      = (((qs[j] & 0x0F) | ((qh >> j) << 4) & 0x10) - 16) * d
+//     element j + 16 = (((qs[j] >>   4) | (qh >> (j + 12)) & 0x10) - 16) * d
+
+const Q5_0_BLOCK_BYTES: usize = 22;
+
+fn dequantize_q5_0(data: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let mut out_idx = 0;
+
+    for block in data.chunks_exact(Q5_0_BLOCK_BYTES) {
+        if out_idx >= numel {
+            break;
+        }
+
+        let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let qs = &block[6..22];
+
+        for j in 0..16 {
+            if out_idx >= numel {
+                break;
+            }
+            let xh_0 = ((qh >> j) << 4) & 0x10;
+            let x0 = ((qs[j] & 0x0F) as u32 | xh_0) as i32 - 16;
+            out[out_idx] = x0 as f32 * d;
+            out_idx += 1;
+        }
+
+        for j in 0..16 {
+            if out_idx >= numel {
+                break;
+            }
+            let xh_1 = (qh >> (j + 12)) & 0x10;
+            let x1 = ((qs[j] >> 4) as u32 | xh_1) as i32 - 16;
+            out[out_idx] = x1 as f32 * d;
             out_idx += 1;
         }
     }
@@ -314,6 +364,163 @@ fn dequantize_q6_k(data: &[u8], numel: usize) -> Vec<f32> {
                     out[base + l + 96] = d * s4 * q4 as f32;
                 }
             }
+        }
+    }
+
+    out
+}
+
+// ─── Q2_K ────────────────────────────────────────────────────────────────────
+//
+// Super-block of 256 elements.
+// Block layout (84 bytes):
+//   bytes [0..16]   : 16 bytes of scales and mins (packed 4-bit)
+//   bytes [16..80]  : 64 bytes of 2-bit quants
+//   bytes [80..82]  : f16 super-block scale `d`
+//   bytes [82..84]  : f16 super-block min `dmin`
+
+const Q2_K_BLOCK_SIZE: usize = 256;
+const Q2_K_BLOCK_BYTES: usize = 84;
+
+fn dequantize_q2_k(data: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let mut out_idx = 0;
+
+    for block in data.chunks_exact(Q2_K_BLOCK_BYTES) {
+        if out_idx >= numel {
+            break;
+        }
+
+        let sc = &block[0..16];
+        let q = &block[16..80];
+        let d = half::f16::from_bits(u16::from_le_bytes([block[80], block[81]])).to_f32();
+        let min = half::f16::from_bits(u16::from_le_bytes([block[82], block[83]])).to_f32();
+
+        let mut is = 0;
+        let mut q_offset = 0;
+
+        for _ in 0..2 {
+            let mut shift = 0;
+            for _ in 0..4 {
+                let sc_val1 = sc[is];
+                is += 1;
+                let dl1 = d * (sc_val1 & 0x0F) as f32;
+                let ml1 = min * (sc_val1 >> 4) as f32;
+                for l in 0..16 {
+                    if out_idx >= numel {
+                        return out;
+                    }
+                    let val = ((q[q_offset + l] >> shift) & 3) as i8;
+                    out[out_idx] = dl1 * val as f32 - ml1;
+                    out_idx += 1;
+                }
+
+                let sc_val2 = sc[is];
+                is += 1;
+                let dl2 = d * (sc_val2 & 0x0F) as f32;
+                let ml2 = min * (sc_val2 >> 4) as f32;
+                for l in 0..16 {
+                    if out_idx >= numel {
+                        return out;
+                    }
+                    let val = ((q[q_offset + 16 + l] >> shift) & 3) as i8;
+                    out[out_idx] = dl2 * val as f32 - ml2;
+                    out_idx += 1;
+                }
+
+                shift += 2;
+            }
+            q_offset += 32;
+        }
+    }
+
+    out
+}
+
+// ─── Q3_K ────────────────────────────────────────────────────────────────────
+//
+// Super-block of 256 elements.
+// Block layout (110 bytes):
+//   bytes [0..32]   : 32 bytes of high bit mask `hmask`
+//   bytes [32..96]  : 64 bytes of low 2-bit quants `qs`
+//   bytes [96..108] : 12 bytes of packed 6-bit scales
+//   bytes [108..110]: f16 super-block scale `d`
+
+const Q3_K_BLOCK_SIZE: usize = 256;
+const Q3_K_BLOCK_BYTES: usize = 110;
+
+fn dequantize_q3_k(data: &[u8], numel: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; numel];
+    let mut out_idx = 0;
+
+    let kmask1: u32 = 0x03030303;
+    let kmask2: u32 = 0x0f0f0f0f;
+
+    for block in data.chunks_exact(Q3_K_BLOCK_BYTES) {
+        if out_idx >= numel {
+            break;
+        }
+
+        let hm = &block[0..32];
+        let q = &block[32..96];
+        let sc = &block[96..108];
+        let d_all = half::f16::from_bits(u16::from_le_bytes([block[108], block[109]])).to_f32();
+
+        let mut aux = [0u32; 4];
+        aux[0] = u32::from_le_bytes([sc[0], sc[1], sc[2], sc[3]]);
+        aux[1] = u32::from_le_bytes([sc[4], sc[5], sc[6], sc[7]]);
+        aux[2] = u32::from_le_bytes([sc[8], sc[9], sc[10], sc[11]]);
+
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+        let mut scales = [0i8; 16];
+        for i in 0..4 {
+            let b = aux[i].to_le_bytes();
+            scales[i * 4 + 0] = b[0] as i8;
+            scales[i * 4 + 1] = b[1] as i8;
+            scales[i * 4 + 2] = b[2] as i8;
+            scales[i * 4 + 3] = b[3] as i8;
+        }
+
+        let mut is = 0;
+        let mut m = 1u8;
+        let mut q_offset = 0;
+
+        for _ in 0..2 {
+            let mut shift = 0;
+            for _ in 0..4 {
+                let dl1 = d_all * (scales[is] as f32 - 32.0);
+                is += 1;
+                for l in 0..16 {
+                    if out_idx >= numel {
+                        return out;
+                    }
+                    let bit = if (hm[l] & m) != 0 { 0 } else { 4 };
+                    let val = (((q[q_offset + l] >> shift) & 3) as i8) - bit;
+                    out[out_idx] = dl1 * val as f32;
+                    out_idx += 1;
+                }
+
+                let dl2 = d_all * (scales[is] as f32 - 32.0);
+                is += 1;
+                for l in 0..16 {
+                    if out_idx >= numel {
+                        return out;
+                    }
+                    let bit = if (hm[16 + l] & m) != 0 { 0 } else { 4 };
+                    let val = (((q[q_offset + 16 + l] >> shift) & 3) as i8) - bit;
+                    out[out_idx] = dl2 * val as f32;
+                    out_idx += 1;
+                }
+
+                shift += 2;
+                m = m.wrapping_shl(1);
+            }
+            q_offset += 32;
         }
     }
 
@@ -584,6 +791,66 @@ mod tests {
     fn test_dequantize_dispatch_q6_k() {
         let block = vec![0u8; Q6_K_BLOCK_BYTES];
         let out = dequantize(&block, GgufDType::Q6_K, 256);
+        assert_eq!(out.len(), 256);
+    }
+
+    #[test]
+    fn test_q2_k_block_bytes() {
+        assert_eq!(Q2_K_BLOCK_BYTES, 84);
+        assert_eq!(Q2_K_BLOCK_SIZE, 256);
+    }
+
+    #[test]
+    fn test_q2_k_zero_scale_produces_zeros() {
+        let block = vec![0u8; Q2_K_BLOCK_BYTES];
+        let out = dequantize_q2_k(&block, 256);
+        assert_eq!(out.len(), 256);
+        for v in &out {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_q2_k_numel_truncation() {
+        let block = vec![0u8; Q2_K_BLOCK_BYTES];
+        let out = dequantize_q2_k(&block, 64);
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn test_dequantize_dispatch_q2_k() {
+        let block = vec![0u8; Q2_K_BLOCK_BYTES];
+        let out = dequantize(&block, GgufDType::Q2_K, 256);
+        assert_eq!(out.len(), 256);
+    }
+
+    #[test]
+    fn test_q3_k_block_bytes() {
+        assert_eq!(Q3_K_BLOCK_BYTES, 110);
+        assert_eq!(Q3_K_BLOCK_SIZE, 256);
+    }
+
+    #[test]
+    fn test_q3_k_zero_scale_produces_zeros() {
+        let block = vec![0u8; Q3_K_BLOCK_BYTES];
+        let out = dequantize_q3_k(&block, 256);
+        assert_eq!(out.len(), 256);
+        for v in &out {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_q3_k_numel_truncation() {
+        let block = vec![0u8; Q3_K_BLOCK_BYTES];
+        let out = dequantize_q3_k(&block, 64);
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn test_dequantize_dispatch_q3_k() {
+        let block = vec![0u8; Q3_K_BLOCK_BYTES];
+        let out = dequantize(&block, GgufDType::Q3_K, 256);
         assert_eq!(out.len(), 256);
     }
 }

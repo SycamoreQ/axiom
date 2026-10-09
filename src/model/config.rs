@@ -40,7 +40,7 @@ pub struct ModelConfig {
     pub rope_scaling: Option<RopeScaling>,
 
     //MoE
-    #[serde(default)]
+    #[serde(default, alias = "num_experts")]
     pub num_local_experts: Option<usize>,
     #[serde(default)]
     pub num_experts_per_tok: Option<usize>,
@@ -63,7 +63,9 @@ pub struct ModelConfig {
     #[serde(default)]
     pub model_type: Option<String>, // e.g. "llama", "mistral", "deepseek"
 
+    #[serde(default)]
     pub lazy_moe: bool,
+    #[serde(default)]
     pub head_dim_override: Option<usize>,
 }
 
@@ -159,6 +161,7 @@ mod tests {
             architectures: Some(vec!["LlamaForCausalLM".to_string()]),
             model_type: Some("llama".to_string()),
             head_dim_override: None,
+            lazy_moe: false,
         }
     }
 
@@ -185,6 +188,7 @@ mod tests {
             architectures: None,
             model_type: Some("deepseek".to_string()),
             head_dim_override: None,
+            lazy_moe: false,
         }
     }
 
@@ -326,8 +330,8 @@ mod tests {
             return;
         }
         let config = ModelConfig::from_file(path).unwrap();
-        assert_eq!(config.hidden_size, 4096);
-        assert!(!config.is_moe());
+        assert_eq!(config.hidden_size, 2048);
+        assert!(config.is_moe());
         assert!(config.is_gqa());
     }
 

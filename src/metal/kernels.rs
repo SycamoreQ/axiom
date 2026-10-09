@@ -31,6 +31,10 @@ const CACHE_WRITE_F16_MSL: &str = include_str!("kernels/cache_write_f16.metal");
 const ROPE_NEOX_F16_MSL: &str = include_str!("kernels/rope_neox_f16.metal");
 const ROPE_NEOX_F32_MSL: &str = include_str!("kernels/rope_neox_f32.metal");
 const DEQUANTIZE_Q4_K_MSL: &str = include_str!("kernels/dequantize_q4_k.metal");
+const DEQUANTIZE_Q6_K_MSL: &str = include_str!("kernels/dequantize_q6_k.metal");
+const DEQUANTIZE_Q3_K_MSL: &str = include_str!("kernels/dequantize_q3_k.metal");
+const DEQUANTIZE_Q2_K_MSL: &str = include_str!("kernels/dequantize_q2_k.metal");
+const TRANSPOSE_F32_MSL: &str = include_str!("kernels/transpose_f32.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -54,6 +58,10 @@ pub struct MetalKernels {
     pub rope_neox_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rope_neox_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub dequantize_q4_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub dequantize_q6_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub dequantize_q3_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub dequantize_q2_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub transpose_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -120,6 +128,10 @@ impl MetalKernels {
             rope_neox_pipeline: build_pipeline(ROPE_NEOX_F16_MSL, "rope_neox_f16")?,
             rope_neox_f32_pipeline: build_pipeline(ROPE_NEOX_F32_MSL, "rope_neox_f32")?,
             dequantize_q4_k_pipeline: build_pipeline(DEQUANTIZE_Q4_K_MSL, "dequantize_q4_k_f32")?,
+            dequantize_q6_k_pipeline: build_pipeline(DEQUANTIZE_Q6_K_MSL, "dequantize_q6_k_f32")?,
+            dequantize_q3_k_pipeline: build_pipeline(DEQUANTIZE_Q3_K_MSL, "dequantize_q3_k_f32")?,
+            dequantize_q2_k_pipeline: build_pipeline(DEQUANTIZE_Q2_K_MSL, "dequantize_q2_k_f32")?,
+            transpose_f32_pipeline: build_pipeline(TRANSPOSE_F32_MSL, "transpose_f32")?,
         })
     }
 
@@ -1320,6 +1332,204 @@ impl MetalKernels {
 
         Ok(())
     }
+
+    pub fn dequantize_q6_k_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.dequantize_q6_k_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(data.metal_buffer(allocator)),
+                data.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(out.metal_buffer(allocator)),
+                out.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&num_blocks as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&numel as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let threads_per_group = 256usize.min(num_blocks as usize).max(1);
+        let grid_size = MTLSize {
+            width: num_blocks as usize,
+            height: 1,
+            depth: 1,
+        };
+        let group_size = MTLSize {
+            width: threads_per_group,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, group_size);
+
+        Ok(())
+    }
+
+    pub fn dequantize_q3_k_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.dequantize_q3_k_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(data.metal_buffer(allocator)),
+                data.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(out.metal_buffer(allocator)),
+                out.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&num_blocks as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&numel as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let threads_per_group = 256usize.min(num_blocks as usize).max(1);
+        let grid_size = MTLSize {
+            width: num_blocks as usize,
+            height: 1,
+            depth: 1,
+        };
+        let group_size = MTLSize {
+            width: threads_per_group,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, group_size);
+
+        Ok(())
+    }
+
+    pub fn dequantize_q2_k_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        data: &BlockHandle,
+        out: &BlockHandle,
+        num_blocks: u32,
+        numel: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.dequantize_q2_k_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(data.metal_buffer(allocator)),
+                data.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(out.metal_buffer(allocator)),
+                out.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&num_blocks as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&numel as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let threads_per_group = 256usize.min(num_blocks as usize).max(1);
+        let grid_size = MTLSize {
+            width: num_blocks as usize,
+            height: 1,
+            depth: 1,
+        };
+        let group_size = MTLSize {
+            width: threads_per_group,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, group_size);
+
+        Ok(())
+    }
+
+    pub fn transpose_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        in_buf: &BlockHandle,
+        out_buf: &BlockHandle,
+        rows: u32,
+        cols: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.transpose_f32_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(in_buf.metal_buffer(allocator)),
+                in_buf.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(out_buf.metal_buffer(allocator)),
+                out_buf.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&rows as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&cols as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let grid_size = MTLSize {
+            width: cols as usize,
+            height: rows as usize,
+            depth: 1,
+        };
+        let group_size = MTLSize {
+            width: 16.min(cols as usize).max(1),
+            height: 16.min(rows as usize).max(1),
+            depth: 1,
+        };
+        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, group_size);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1377,8 +1587,8 @@ mod tests {
         gate.iter()
             .zip(up.iter())
             .map(|(&g, &u)| {
-                let silu_up = u * (1.0 / (1.0 + (-u).exp()));
-                g * silu_up
+                let silu_gate = g * (1.0 / (1.0 + (-g).exp()));
+                silu_gate * u
             })
             .collect()
     }

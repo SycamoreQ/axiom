@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn test_hello_world() {
         let bpe = make_bpe();
-        assert_eq!(encode_string(&bpe, "Hello world"), vec![9906, 1917]);
+        assert_eq!(encode_string(&bpe, "Hello world"), vec![9707, 1879]);
     }
 
     #[test]
@@ -259,7 +259,7 @@ mod tests {
         let bpe = make_bpe();
         assert_eq!(
             encode_string(&bpe, "don't you think?"),
-            vec![15357, 956, 499, 1781, 30]
+            vec![15007, 944, 498, 1744, 30]
         );
     }
 
@@ -268,7 +268,7 @@ mod tests {
         let bpe = make_bpe();
         assert_eq!(
             encode_string(&bpe, "The quick brown fox jumps over the lazy dog"),
-            vec![791, 4062, 14198, 39935, 35308, 927, 279, 16053, 5679]
+            vec![785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562]
         );
     }
 
@@ -277,20 +277,23 @@ mod tests {
         let bpe = make_bpe();
         assert_eq!(
             encode_string(&bpe, "hello     world"),
-            vec![15339, 257, 1917]
+            vec![14990, 257, 1879]
         );
     }
 
     #[test]
     fn test_digits() {
         let bpe = make_bpe();
-        assert_eq!(encode_string(&bpe, "123456789"), vec![4513, 10961, 16474]);
+        assert_eq!(
+            encode_string(&bpe, "123456789"),
+            vec![16, 17, 18, 19, 20, 21, 22, 23, 24]
+        );
     }
 
     #[test]
     fn test_newline() {
         let bpe = make_bpe();
-        assert_eq!(encode_string(&bpe, "Hello\nworld"), vec![9906, 198, 14957]);
+        assert_eq!(encode_string(&bpe, "Hello\nworld"), vec![9707, 198, 14615]);
     }
 
     #[test]
@@ -302,12 +305,12 @@ mod tests {
     #[test]
     fn test_special_token_passthrough() {
         let bpe = make_bpe();
-        let pretokens = pretokenize("<|begin_of_text|>Hello", &bpe.vocab);
+        let pretokens = pretokenize("<|endoftext|>Hello", &bpe.vocab);
         let ids = bpe.encode(pretokens);
-        // first ID must be the BOS token
-        assert_eq!(ids[0], 128000);
+        // first ID must be the special token
+        assert_eq!(ids[0], 151643);
         // followed by Hello
-        assert_eq!(ids[1], 9906);
+        assert_eq!(ids[1], 9707);
     }
 
     #[test]
@@ -317,7 +320,7 @@ mod tests {
         let cases = vec![
             ("Hello world", 2),
             ("don't you think?", 5),
-            ("123456789", 3),
+            ("123456789", 9),
             ("Hello\nworld", 3),
         ];
         for (s, expected_count) in cases {

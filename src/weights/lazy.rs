@@ -37,6 +37,8 @@ pub fn block_info(dtype: GgufDType) -> Option<(usize, usize)> {
         GgufDType::Q4_0 => Some((32, 18)),
         GgufDType::Q4_1 => Some((32, 20)),
         GgufDType::Q8_0 => Some((32, 34)),
+        GgufDType::Q2_K => Some((256, 84)),
+        GgufDType::Q3_K => Some((256, 110)),
         GgufDType::Q4_K => Some((256, 144)),
         GgufDType::Q6_K => Some((256, 210)),
         _ => None,

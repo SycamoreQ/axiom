@@ -241,6 +241,8 @@ pub mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("llama".to_string()),
+            lazy_moe: false,
+            head_dim_override: None,
         };
 
         if !std::path::Path::new("testdata/tokenizer.json").exists() {

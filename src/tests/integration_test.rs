@@ -33,6 +33,8 @@ mod integration_tests {
             torch_dtype: "float32".to_string(),
             architectures: Some(vec!["LlamaForCausalLM".to_string()]),
             model_type: Some("llama".to_string()),
+            lazy_moe: false,
+            head_dim_override: None,
         }
     }
 
@@ -76,8 +78,12 @@ mod integration_tests {
                 add_eos: true,
             },
         );
-        assert_eq!(ids[0], tok.bos_id().unwrap());
-        assert_eq!(*ids.last().unwrap(), tok.eos_id().unwrap());
+        if let Some(bos) = tok.bos_id() {
+            assert_eq!(ids[0], bos);
+        }
+        if let Some(eos) = tok.eos_id() {
+            assert_eq!(*ids.last().unwrap(), eos);
+        }
     }
 
     // --- Model integration ---
@@ -87,7 +93,7 @@ mod integration_tests {
         let config = make_small_config(1000);
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
         let token_ids = vec![1u32, 2, 3];
-        let logits = model.forward(&token_ids, None, 0).unwrap();
+        let logits = model.forward(&token_ids, None, 0, 128).unwrap();
         // logits shape [1, seq_len, vocab_size]
         assert_eq!(logits.shape().dim(0).unwrap(), 1);
         assert_eq!(logits.shape().dim(1).unwrap(), 3);
@@ -103,7 +109,7 @@ mod integration_tests {
 
         // prefill with prompt
         let prompt = vec![1u32, 2, 3];
-        let logits = model.forward(&prompt, Some(&mut cache), 0).unwrap();
+        let logits = model.forward(&prompt, Some(&mut cache), 0, 128).unwrap();
         assert_eq!(logits.shape().dim(1).unwrap(), 3);
         assert_eq!(cache.len(), config.num_hidden_layers);
 
@@ -112,7 +118,7 @@ mod integration_tests {
         for _ in 0..3 {
             let next_token = vec![42u32];
             let logits = model
-                .forward(&next_token, Some(&mut cache), offset)
+                .forward(&next_token, Some(&mut cache), offset, 128)
                 .unwrap();
             assert_eq!(logits.shape().dim(1).unwrap(), 1);
             assert_eq!(logits.shape().dim(2).unwrap(), 1000);
@@ -127,11 +133,11 @@ mod integration_tests {
         let mut cache = Vec::new();
 
         model
-            .forward(&[1u32, 2, 3, 4], Some(&mut cache), 0)
+            .forward(&[1u32, 2, 3, 4], Some(&mut cache), 0, 128)
             .unwrap();
         let initial_seq = cache[0].0.shape().dim(1).unwrap();
 
-        model.forward(&[5u32], Some(&mut cache), 4).unwrap();
+        model.forward(&[5u32], Some(&mut cache), 4, 128).unwrap();
         let grown_seq = cache[0].0.shape().dim(1).unwrap();
 
         assert_eq!(grown_seq, initial_seq + 1);
@@ -144,8 +150,8 @@ mod integration_tests {
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
         let tokens = vec![1u32, 2, 3];
 
-        let out1 = model.forward(&tokens, None, 0).unwrap();
-        let out2 = model.forward(&tokens, None, 0).unwrap();
+        let out1 = model.forward(&tokens, None, 0, 128).unwrap();
+        let out2 = model.forward(&tokens, None, 0, 128).unwrap();
 
         assert_eq!(out1.shape(), out2.shape());
     }
@@ -168,7 +174,7 @@ mod integration_tests {
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
 
         let ids_u32: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        let logits = model.forward(&ids_u32, None, 0).unwrap();
+        let logits = model.forward(&ids_u32, None, 0, 128).unwrap();
 
         assert_eq!(logits.shape().dim(2).unwrap(), vocab_size);
     }
@@ -198,7 +204,7 @@ mod integration_tests {
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
 
         let ids_u32: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        let logits = model.forward(&ids_u32, None, 0).unwrap();
+        let logits = model.forward(&ids_u32, None, 0, 128).unwrap();
 
         let seq_len = logits.shape().dim(1).unwrap();
         let last_logits = logits.narrow(1, seq_len - 1, 1).unwrap();
@@ -226,12 +232,12 @@ mod integration_tests {
         let offset = ids_u32.len();
 
         // prefill
-        model.forward(&ids_u32, Some(&mut cache), 0).unwrap();
+        model.forward(&ids_u32, Some(&mut cache), 0, 128).unwrap();
         assert_eq!(cache.len(), config.num_hidden_layers);
 
         // one generation step
         let next = vec![42u32];
-        let logits = model.forward(&next, Some(&mut cache), offset).unwrap();
+        let logits = model.forward(&next, Some(&mut cache), offset, 128).unwrap();
         assert_eq!(logits.shape().dim(1).unwrap(), 1);
         assert_eq!(logits.shape().dim(2).unwrap(), vocab_size);
     }

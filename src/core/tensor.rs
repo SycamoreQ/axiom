@@ -826,9 +826,10 @@ impl TensorOps for CandleTensor {
 
     fn sum_keepdim(&self, dim: usize) -> Result<Self> {
         let inner = self.inner.sum_keepdim(dim)?;
+        let shape = Shape::new(inner.dims());
         Ok(CandleTensor {
             inner,
-            shape: self.shape.clone(),
+            shape,
             dtype: self.dtype,
             device: self.device.clone(),
         })
@@ -1224,13 +1225,20 @@ impl TensorOps for MetalTensor {
             self.shape.numel(),
             "reshape: element count must match"
         );
-        Ok(Self::new_contiguous(
-            self.state.clone(),
-            self.block.clone(),
-            shape.clone(),
-            self.dtype,
-            self.device.clone(),
-        ))
+        let dims = shape.dims();
+        let mut strides = vec![1; dims.len()];
+        for i in (0..dims.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * dims[i + 1];
+        }
+        Ok(Self {
+            state: self.state.clone(),
+            block: self.block.clone(),
+            shape: shape.clone(),
+            strides,
+            offset_bytes: self.offset_bytes,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
     }
 
     fn transpose(&self, dim1: usize, dim2: usize) -> Result<Self> {

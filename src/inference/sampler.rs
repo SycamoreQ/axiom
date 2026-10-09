@@ -52,6 +52,10 @@ impl Sampler {
         Self { config, rng }
     }
 
+    pub fn config(&self) -> &SamplerConfig {
+        &self.config
+    }
+
     pub fn sample(&mut self, logits: &[f32], previous_tokens: &[u32]) -> u32 {
         let mut logits_vec = logits.to_vec();
 

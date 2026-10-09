@@ -61,6 +61,9 @@ pub enum BlockLayer {
     FfnGate,
     FfnUp,
     FfnDown,
+    AttnQBias,
+    AttnKBias,
+    AttnVBias,
 }
 
 //Identifies a named weight in the LLaMA architecture.
@@ -84,23 +87,26 @@ impl LlamaTensor {
 
         if key.starts_with("blk.") {
             let parts: Vec<&str> = key.split('.').collect();
-            // "blk" . "{i}" . "{layer}" . "weight"
+            // "blk" . "{i}" . "{layer}" . "{weight|bias}"
             if parts.len() < 4 {
                 return None;
             }
             let i = parts[1].parse::<usize>().ok()?;
-            let layer = match parts[2] {
-                "attn_norm" => BlockLayer::AttnNorm,
-                "attn_q" => BlockLayer::AttnQ,
-                "attn_k" => BlockLayer::AttnK,
-                "attn_v" => BlockLayer::AttnV,
-                "attn_q_norm" => BlockLayer::AttnQNorm,
-                "attn_k_norm" => BlockLayer::AttnKNorm,
-                "attn_output" => BlockLayer::AttnOutput,
-                "ffn_norm" => BlockLayer::FfnNorm,
-                "ffn_gate" => BlockLayer::FfnGate,
-                "ffn_up" => BlockLayer::FfnUp,
-                "ffn_down" => BlockLayer::FfnDown,
+            let layer = match (parts[2], parts[3]) {
+                ("attn_norm", "weight") => BlockLayer::AttnNorm,
+                ("attn_q", "weight") => BlockLayer::AttnQ,
+                ("attn_k", "weight") => BlockLayer::AttnK,
+                ("attn_v", "weight") => BlockLayer::AttnV,
+                ("attn_q_norm", "weight") => BlockLayer::AttnQNorm,
+                ("attn_k_norm", "weight") => BlockLayer::AttnKNorm,
+                ("attn_output", "weight") => BlockLayer::AttnOutput,
+                ("ffn_norm", "weight") => BlockLayer::FfnNorm,
+                ("ffn_gate", "weight") => BlockLayer::FfnGate,
+                ("ffn_up", "weight") => BlockLayer::FfnUp,
+                ("ffn_down", "weight") => BlockLayer::FfnDown,
+                ("attn_q", "bias") => BlockLayer::AttnQBias,
+                ("attn_k", "bias") => BlockLayer::AttnKBias,
+                ("attn_v", "bias") => BlockLayer::AttnVBias,
                 _ => return None,
             };
             return Some(Self::Block(i, layer));
@@ -141,6 +147,11 @@ pub fn parse_moe_tensor(key: &str) -> Option<(usize, MoeTensorKind)> {
 
 //Build a ModelConfig from GGUF metadata.
 pub fn config_from_gguf(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
+    let arch = match gguf.metadata.get("general.architecture") {
+        Some(GgufValue::String(s)) => s.as_str(),
+        _ => "llama",
+    };
+
     // Helper to get u32 with better error messages
     let get_u32 = |key: &str| -> Result<usize, LoaderError> {
         let value = gguf
@@ -180,6 +191,17 @@ pub fn config_from_gguf(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
             ))),
         }
     };
+
+    let get_arch_u32 = |prop: &str| -> Result<usize, LoaderError> {
+        get_u32(&format!("{arch}.{prop}"))
+            .or_else(|_| get_u32(&format!("llama.{prop}")))
+    };
+
+    let get_arch_f32 = |prop: &str| -> Result<f32, LoaderError> {
+        get_f32(&format!("{arch}.{prop}"))
+            .or_else(|_| get_f32(&format!("llama.{prop}")))
+    };
+
     let rope_freqs = gguf.tensors.get("rope_freqs.weight").and_then(|info| {
         let data = gguf.get_tensor_data("rope_freqs.weight")?;
         let floats = match info.dtype {
@@ -196,29 +218,42 @@ pub fn config_from_gguf(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
         Some(floats)
     });
 
-    // Read vocab_size - DON'T fall back to token array
-    let vocab_size = get_u32("llama.vocab_size")?;
+    let vocab_size = get_u32(&format!("{arch}.vocab_size"))
+        .or_else(|_| get_u32("llama.vocab_size"))
+        .or_else(|_| {
+            gguf.tensors
+                .get("token_embd.weight")
+                .map(|info| info.shape[0] as usize)
+                .ok_or_else(|| LoaderError::MissingMetadata(format!("{arch}.vocab_size")))
+        })?;
+
+    let arch_name = if arch == "qwen2" {
+        "Qwen2ForCausalLM"
+    } else {
+        "LlamaForCausalLM"
+    };
+
     Ok(ModelConfig {
-        hidden_size: get_u32("llama.embedding_length")?,
-        num_hidden_layers: get_u32("llama.block_count")?,
-        num_attention_heads: get_u32("llama.attention.head_count")?,
-        num_key_value_heads: get_u32("llama.attention.head_count_kv")?,
-        intermediate_size: get_u32("llama.feed_forward_length")?,
+        hidden_size: get_arch_u32("embedding_length")?,
+        num_hidden_layers: get_arch_u32("block_count")?,
+        num_attention_heads: get_arch_u32("attention.head_count")?,
+        num_key_value_heads: get_arch_u32("attention.head_count_kv")?,
+        intermediate_size: get_arch_u32("feed_forward_length")?,
         vocab_size,
-        max_position_embeddings: get_u32("llama.context_length")?,
-        rms_norm_eps: get_f32("llama.attention.layer_norm_rms_epsilon")? as f64,
+        max_position_embeddings: get_arch_u32("context_length")?,
+        rms_norm_eps: get_arch_f32("attention.layer_norm_rms_epsilon")? as f64,
         hidden_act: "silu".to_string(),
-        rope_theta: get_f32("llama.rope.freq_base")? as f64,
+        rope_theta: get_arch_f32("rope.freq_base").unwrap_or(10000.0) as f64,
         rope_scaling: None,
         torch_dtype: "float32".to_string(),
         num_local_experts: None,
         num_experts_per_tok: None,
-        rope_freqs: rope_freqs,
+        rope_freqs,
         num_shared_experts: None,
         expert_interval: None,
         prefetch_threshold: None,
-        architectures: Some(vec!["LlamaForCausalLM".to_string()]),
-        model_type: Some("llama".to_string()),
+        architectures: Some(vec![arch_name.to_string()]),
+        model_type: Some(arch.to_string()),
         head_dim_override: None,
         lazy_moe: false,
     })
@@ -427,12 +462,28 @@ pub fn load_from_gguf<B: Backend>(
     Ok(model)
 }
 
-#[derive(Default)]
-struct PendingExpertTensors {
+struct PendingExpertTensors<B: Backend> {
     gate_inp: Option<QuantizedWeight>,
     gate_exps: Option<QuantizedWeight>,
     up_exps: Option<QuantizedWeight>,
     down_exps: Option<QuantizedWeight>,
+    gate_exps_metal: Option<B::Tensor>,
+    up_exps_metal: Option<B::Tensor>,
+    down_exps_metal: Option<B::Tensor>,
+}
+
+impl<B: Backend> Default for PendingExpertTensors<B> {
+    fn default() -> Self {
+        Self {
+            gate_inp: None,
+            gate_exps: None,
+            up_exps: None,
+            down_exps: None,
+            gate_exps_metal: None,
+            up_exps_metal: None,
+            down_exps_metal: None,
+        }
+    }
 }
 
 // shape MUST be the flattened [num_experts * out_dim, in_dim] for the three
@@ -462,7 +513,7 @@ pub fn load_from_gguf_qwen3moe<B: Backend>(
     let hidden_size = config.hidden_size;
 
     let mut model = LlamaModel::<B>::new(&config, device)?;
-    let mut pending: Vec<PendingExpertTensors> = (0..config.num_hidden_layers)
+    let mut pending: Vec<PendingExpertTensors<B>> = (0..config.num_hidden_layers)
         .map(|_| PendingExpertTensors::default())
         .collect();
 
@@ -485,17 +536,60 @@ pub fn load_from_gguf_qwen3moe<B: Backend>(
                     vec![(dims[0] * dims[1]) as usize, dims[2] as usize]
                 }
             };
-            let qw = quantized_weight_from_gguf(data, info, flat_shape);
             let slot = pending.get_mut(layer_idx).ok_or_else(|| {
                 LoaderError::Gguf(format!(
                     "expert tensor references out-of-range layer {layer_idx}"
                 ))
             })?;
             match kind {
-                MoeTensorKind::GateInp => slot.gate_inp = Some(qw),
-                MoeTensorKind::GateExps => slot.gate_exps = Some(qw),
-                MoeTensorKind::UpExps => slot.up_exps = Some(qw),
-                MoeTensorKind::DownExps => slot.down_exps = Some(qw),
+                MoeTensorKind::GateInp => {
+                    slot.gate_inp = Some(quantized_weight_from_gguf(data, info, flat_shape));
+                }
+                MoeTensorKind::GateExps => {
+                    if device.is_metal() {
+                        let tensor = LazyExpertBank::<B>::upload_raw_bytes(data, device)
+                            .map_err(|e| LoaderError::Backend(e.to_string()))?;
+                        slot.gate_exps_metal = Some(tensor);
+                        slot.gate_exps = Some(QuantizedWeight {
+                            dtype: info.dtype,
+                            data: Vec::new(),
+                            shape: flat_shape,
+                            numel: info.numel() as usize,
+                        });
+                    } else {
+                        slot.gate_exps = Some(quantized_weight_from_gguf(data, info, flat_shape));
+                    }
+                }
+                MoeTensorKind::UpExps => {
+                    if device.is_metal() {
+                        let tensor = LazyExpertBank::<B>::upload_raw_bytes(data, device)
+                            .map_err(|e| LoaderError::Backend(e.to_string()))?;
+                        slot.up_exps_metal = Some(tensor);
+                        slot.up_exps = Some(QuantizedWeight {
+                            dtype: info.dtype,
+                            data: Vec::new(),
+                            shape: flat_shape,
+                            numel: info.numel() as usize,
+                        });
+                    } else {
+                        slot.up_exps = Some(quantized_weight_from_gguf(data, info, flat_shape));
+                    }
+                }
+                MoeTensorKind::DownExps => {
+                    if device.is_metal() {
+                        let tensor = LazyExpertBank::<B>::upload_raw_bytes(data, device)
+                            .map_err(|e| LoaderError::Backend(e.to_string()))?;
+                        slot.down_exps_metal = Some(tensor);
+                        slot.down_exps = Some(QuantizedWeight {
+                            dtype: info.dtype,
+                            data: Vec::new(),
+                            shape: flat_shape,
+                            numel: info.numel() as usize,
+                        });
+                    } else {
+                        slot.down_exps = Some(quantized_weight_from_gguf(data, info, flat_shape));
+                    }
+                }
             }
             continue;
         }
@@ -549,9 +643,9 @@ pub fn load_from_gguf_qwen3moe<B: Backend>(
             intermediate_size,
             hidden_size,
             device.clone(),
-            None,
-            None,
-            None,
+            slot.gate_exps_metal,
+            slot.up_exps_metal,
+            slot.down_exps_metal,
         );
 
         let lazy_moe = LazyMoeLayer::<B>::new(

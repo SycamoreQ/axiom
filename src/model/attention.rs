@@ -14,7 +14,7 @@ pub struct Attention<B: Backend> {
     pub k_proj: Linear<B>,
     pub v_proj: Linear<B>,
     pub o_proj: Linear<B>,
-    is_neox: bool,
+    pub is_neox: bool,
     rope: RotaryEmbedding<B>,
     num_heads: usize,
     num_kv_heads: usize,
@@ -27,6 +27,9 @@ pub struct Attention<B: Backend> {
     pub metal_k_weight: Option<B::Tensor>,
     pub metal_v_weight: Option<B::Tensor>,
     pub metal_o_weight: Option<B::Tensor>,
+    pub metal_q_bias: Option<B::Tensor>,
+    pub metal_k_bias: Option<B::Tensor>,
+    pub metal_v_bias: Option<B::Tensor>,
 }
 
 impl<B: Backend> Attention<B> {
@@ -77,14 +80,29 @@ impl<B: Backend> Attention<B> {
             metal_k_weight: Option::None,
             metal_v_weight: Option::None,
             metal_o_weight: Option::None,
+            metal_q_bias: Option::None,
+            metal_k_bias: Option::None,
+            metal_v_bias: Option::None,
         })
     }
 
     pub fn prepare_metal_weights(&mut self) -> Result<()> {
-        self.metal_q_weight = Some(self.q_proj.weight().transpose(0, 1)?.contiguous()?);
-        self.metal_k_weight = Some(self.k_proj.weight().transpose(0, 1)?.contiguous()?);
-        self.metal_v_weight = Some(self.v_proj.weight().transpose(0, 1)?.contiguous()?);
-        self.metal_o_weight = Some(self.o_proj.weight().transpose(0, 1)?.contiguous()?);
+        let q_trans = self.q_proj.weight().transpose(0, 1)?.contiguous()?;
+        let k_trans = self.k_proj.weight().transpose(0, 1)?.contiguous()?;
+        let v_trans = self.v_proj.weight().transpose(0, 1)?.contiguous()?;
+        let o_trans = self.o_proj.weight().transpose(0, 1)?.contiguous()?;
+
+        let dev = self.q_proj.weight().device();
+        let dummy = B::Tensor::zeros(&Shape::new(&[1, 1]), DType::F32, &dev)?;
+        self.q_proj = Linear::new(dummy.clone(), None);
+        self.k_proj = Linear::new(dummy.clone(), None);
+        self.v_proj = Linear::new(dummy.clone(), None);
+        self.o_proj = Linear::new(dummy, None);
+
+        self.metal_q_weight = Some(q_trans);
+        self.metal_k_weight = Some(k_trans);
+        self.metal_v_weight = Some(v_trans);
+        self.metal_o_weight = Some(o_trans);
         Ok(())
     }
 
@@ -241,6 +259,15 @@ impl<B: Backend> Attention<B> {
     pub fn set_k_proj(&mut self, l: Linear<B>) {
         self.k_proj = l;
     }
+    pub fn set_q_bias(&mut self, b: B::Tensor) {
+        self.metal_q_bias = Some(b);
+    }
+    pub fn set_k_bias(&mut self, b: B::Tensor) {
+        self.metal_k_bias = Some(b);
+    }
+    pub fn set_v_bias(&mut self, b: B::Tensor) {
+        self.metal_v_bias = Some(b);
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +307,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("llama".to_string()),
+            head_dim_override: None,
+            lazy_moe: false,
         }
     }
 

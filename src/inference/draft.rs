@@ -1,5 +1,3 @@
-use std::os::raw;
-
 use crate::core::backend::Backend;
 use crate::core::error::Result;
 use crate::core::tensor::TensorOps;
@@ -11,6 +9,8 @@ pub struct DraftModel<B: Backend> {
     model: LlamaModel<B>,
     sampler: Sampler,
     gamma: usize,
+    pub kv_cache: Vec<(B::Tensor, B::Tensor)>,
+    pub offset: usize,
 }
 
 impl<B: Backend> DraftModel<B> {
@@ -19,23 +19,106 @@ impl<B: Backend> DraftModel<B> {
             model,
             sampler,
             gamma,
+            kv_cache: Vec::new(),
+            offset: 0,
         }
     }
 
+    pub fn gamma(&self) -> usize {
+        self.gamma
+    }
+
+    pub fn model(&self) -> &LlamaModel<B> {
+        &self.model
+    }
+
+    pub fn model_mut(&mut self) -> &mut LlamaModel<B> {
+        &mut self.model
+    }
+
+    pub fn sampler(&self) -> &Sampler {
+        &self.sampler
+    }
+
+    pub fn reset(&mut self) {
+        self.kv_cache.clear();
+        self.offset = 0;
+    }
+
+    pub fn catch_up_to(&mut self, session: &Session<B>) -> Result<()> {
+        let max_seq_len = session.prompt_tokens.len() + session.max_new_tokens;
+        if self.kv_cache.is_empty() && !session.prompt_tokens.is_empty() {
+            self.model.forward(
+                &session.prompt_tokens,
+                Some(&mut self.kv_cache),
+                0,
+                max_seq_len,
+            )?;
+            self.offset = session.prompt_tokens.len();
+        }
+
+        let target_len = session.prompt_tokens.len() + session.generated_tokens.len().saturating_sub(1);
+        if self.offset < target_len {
+            let start = self.offset.saturating_sub(session.prompt_tokens.len());
+            let end = target_len - session.prompt_tokens.len();
+            if start < end && end <= session.generated_tokens.len() {
+                let missing = &session.generated_tokens[start..end];
+                self.model.forward(
+                    missing,
+                    Some(&mut self.kv_cache),
+                    self.offset,
+                    max_seq_len,
+                )?;
+                self.offset += missing.len();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rollback_to(&mut self, new_offset: usize) -> Result<()> {
+        for (k, v) in &mut self.kv_cache {
+            if k.shape().dims().len() > 1 && k.shape().dims()[1] > new_offset {
+                *k = k.narrow(1, 0, new_offset)?;
+                *v = v.narrow(1, 0, new_offset)?;
+            }
+        }
+        self.offset = new_offset;
+        Ok(())
+    }
+
+    /// Generate `gamma` draft tokens using the draft model.
+    ///
+    /// Uses the draft model's own KV cache. Returns a list of (token_id, logits) pairs
+    /// for verification by the target model.
     pub fn draft(&mut self, session: &mut Session<B>) -> Result<Vec<(u32, Vec<f32>)>>
     where
         B::Tensor: Clone,
     {
-        let mut draft_kv = session.kv_cache.clone();
-        let mut draft_offset = session.offset;
-        let mut results: Vec<(u32, Vec<f32>)> = Vec::new();
-        let mut current_input = session.next_input_tokens().to_vec();
+        if self.gamma == 0 {
+            return Ok(Vec::new());
+        }
 
+        self.catch_up_to(session)?;
+
+        let mut current_input = if let Some(&last) = session.generated_tokens.last() {
+            vec![last]
+        } else if let Some(&last) = session.prompt_tokens.last() {
+            vec![last]
+        } else {
+            return Ok(Vec::new());
+        };
+
+        let mut draft_offset = self.offset;
+        let mut results: Vec<(u32, Vec<f32>)> = Vec::new();
         let max_seq_len = session.prompt_tokens.len() + session.max_new_tokens;
-        for i in 0..self.gamma {
-            let logits_tensor =
-                self.model
-                    .forward(&current_input, None, draft_offset, max_seq_len)?;
+
+        for _i in 0..self.gamma {
+            let logits_tensor = self.model.forward(
+                &current_input,
+                Some(&mut self.kv_cache),
+                draft_offset,
+                max_seq_len,
+            )?;
 
             let seq_len = logits_tensor.shape().dims()[1];
             let last_logits_tensor = logits_tensor
@@ -45,13 +128,17 @@ impl<B: Backend> DraftModel<B> {
 
             let last_logits_vec = last_logits_tensor.to_vec_f32()?;
 
-            let next_token = self
-                .sampler
-                .sample(&last_logits_vec, &session.generated_tokens);
+            // Build the all-tokens list including draft tokens for repetition penalty
+            let mut all_tokens = session.all_tokens();
+            for (t, _) in &results {
+                all_tokens.push(*t);
+            }
 
+            let next_token = self.sampler.sample(&last_logits_vec, &all_tokens);
             results.push((next_token, last_logits_vec));
 
             draft_offset += current_input.len();
+            self.offset = draft_offset;
             current_input = vec![next_token];
 
             if let Some(eos_id) = session.eos_token_id {
@@ -62,10 +149,6 @@ impl<B: Backend> DraftModel<B> {
         }
 
         Ok(results)
-    }
-
-    pub fn gamma(&self) -> usize {
-        self.gamma
     }
 }
 
@@ -104,6 +187,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("llama".to_string()),
+            lazy_moe: false,
+            head_dim_override: None,
         }
     }
 

@@ -63,7 +63,11 @@ impl<B: Backend> LlamaModel<B> {
         for block in self.blocks.iter_mut() {
             block.prepare_metal()?;
         }
-        self.metal_lm_head_weight = Some(self.lm_head.weight().transpose(0, 1)?.contiguous()?);
+        let lm_trans = self.lm_head.weight().transpose(0, 1)?.contiguous()?;
+        let dev = self.lm_head.weight().device();
+        let dummy = B::Tensor::zeros(&Shape::new(&[1, 1]), DType::F32, &dev)?;
+        self.lm_head = Linear::new(dummy, None);
+        self.metal_lm_head_weight = Some(lm_trans);
         Ok(())
     }
 
@@ -71,19 +75,20 @@ impl<B: Backend> LlamaModel<B> {
         &self.config
     }
 
-    fn causal_mask(&self, seq_len: usize, device: &Device) -> Result<B::Tensor> {
-        if seq_len == 1 {
+    fn causal_mask(&self, seq_len: usize, offset: usize, device: &Device) -> Result<B::Tensor> {
+        let total_kv_len = offset + seq_len;
+        if seq_len == 1 && total_kv_len == 1 {
             return B::Tensor::from_slice(&[0.0f32], &Shape::new(&[1, 1, 1, 1]), device);
         }
-        let mut mask = vec![0.0f32; seq_len * seq_len];
+        let mut mask = vec![0.0f32; seq_len * total_kv_len];
         for i in 0..seq_len {
-            for j in 0..seq_len {
-                if j > i {
-                    mask[i * seq_len + j] = f32::NEG_INFINITY;
+            for j in 0..total_kv_len {
+                if j > offset + i {
+                    mask[i * total_kv_len + j] = f32::NEG_INFINITY;
                 }
             }
         }
-        B::Tensor::from_slice(&mask, &Shape::new(&[1, 1, seq_len, seq_len]), device)
+        B::Tensor::from_slice(&mask, &Shape::new(&[1, 1, seq_len, total_kv_len]), device)
     }
 
     pub fn forward(
@@ -105,7 +110,7 @@ impl<B: Backend> LlamaModel<B> {
         let x = self.embedding.forward(token_ids)?;
         let mut x = x.unsqueeze(0)?;
         let device = x.device().clone();
-        let mask = self.causal_mask(seq_len, &device)?;
+        let mask = self.causal_mask(seq_len, offset, &device)?;
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
 
@@ -142,33 +147,7 @@ impl<B: Backend> LlamaModel<B> {
             normed[i] = x_pre_norm[i] * w_norm[i % hidden_size] / rms;
         }
 
-        let normed_tensor = B::Tensor::from_slice(&normed, &x.shape(), &device)?;
-        if normed.iter().any(|&x| x.is_nan()) {
-            println!("NaN detected in Post Final Norm!");
-        } else {
-            let preview_len = 10.min(normed.len());
-        }
-
         let w_lm_head = self.lm_head.weight().to_vec_f32()?;
-        if offset == 0 {
-            eprintln!(
-                "[dbg] w_lm_head.len()={} vocab_size*hidden_size={} vocab_size={}",
-                w_lm_head.len(),
-                vocab_size * hidden_size,
-                vocab_size
-            );
-        }
-
-        if offset == 0 {
-            let w = self.lm_head.weight().to_vec_f32()?;
-            for tok in [151667usize, 872, 1000, 29728] {
-                // suspect token, "user", arbitrary normal, "neural"
-                let row = &w[tok * hidden_size..(tok + 1) * hidden_size];
-                let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
-                let max = row.iter().cloned().fold(f32::MIN, f32::max);
-                eprintln!("[dbg] lm_head row {tok}: norm={norm} max={max}");
-            }
-        }
         let mut logits_cpu = vec![0.0f32; seq_len * vocab_size];
         for pos in 0..seq_len {
             let hidden_start = pos * hidden_size;
@@ -184,16 +163,6 @@ impl<B: Backend> LlamaModel<B> {
         }
 
         let logits_shape = Shape::new(&[1, seq_len, vocab_size]);
-        if offset == 0 {
-            let last_start = (seq_len - 1) * vocab_size;
-            let last_row = &logits_cpu[last_start..last_start + vocab_size];
-            let mut indexed: Vec<(usize, f32)> = last_row.iter().cloned().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-            eprintln!(
-                "[dbg] top-5 logits (last prefill position): {:?}",
-                &indexed[0..5]
-            );
-        }
         let logits = B::Tensor::from_slice(&logits_cpu, &logits_shape, &device)?;
 
         Ok(logits)
@@ -288,6 +257,24 @@ impl<B: Backend> LlamaModel<B> {
                 q_2d.as_metal()
                     .ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
             )?;
+            if let Some(ref q_bias) = block.attn.metal_q_bias {
+                if seq_len == 1 {
+                    runner.add(
+                        q_2d.as_metal().ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
+                        q_bias.as_metal().ok_or_else(|| CoreError::Internal("q_bias not Metal".into()))?,
+                        q_2d.as_metal().ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
+                    )?;
+                } else {
+                    for s in 0..seq_len {
+                        let row = q_2d.narrow(0, s, 1)?;
+                        runner.add(
+                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            q_bias.as_metal().ok_or_else(|| CoreError::Internal("q_bias not Metal".into()))?,
+                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                        )?;
+                    }
+                }
+            }
 
             let k_2d = B::Tensor::uninit_pooled(
                 &Shape::new(&[seq_len, n_kv_heads * head_dim]),
@@ -304,6 +291,24 @@ impl<B: Backend> LlamaModel<B> {
                 k_2d.as_metal()
                     .ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
             )?;
+            if let Some(ref k_bias) = block.attn.metal_k_bias {
+                if seq_len == 1 {
+                    runner.add(
+                        k_2d.as_metal().ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
+                        k_bias.as_metal().ok_or_else(|| CoreError::Internal("k_bias not Metal".into()))?,
+                        k_2d.as_metal().ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
+                    )?;
+                } else {
+                    for s in 0..seq_len {
+                        let row = k_2d.narrow(0, s, 1)?;
+                        runner.add(
+                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            k_bias.as_metal().ok_or_else(|| CoreError::Internal("k_bias not Metal".into()))?,
+                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                        )?;
+                    }
+                }
+            }
 
             let v_2d = B::Tensor::uninit_pooled(
                 &Shape::new(&[seq_len, n_kv_heads * head_dim]),
@@ -320,34 +325,72 @@ impl<B: Backend> LlamaModel<B> {
                 v_2d.as_metal()
                     .ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
             )?;
+            if let Some(ref v_bias) = block.attn.metal_v_bias {
+                if seq_len == 1 {
+                    runner.add(
+                        v_2d.as_metal().ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
+                        v_bias.as_metal().ok_or_else(|| CoreError::Internal("v_bias not Metal".into()))?,
+                        v_2d.as_metal().ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
+                    )?;
+                } else {
+                    for s in 0..seq_len {
+                        let row = v_2d.narrow(0, s, 1)?;
+                        runner.add(
+                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            v_bias.as_metal().ok_or_else(|| CoreError::Internal("v_bias not Metal".into()))?,
+                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                        )?;
+                    }
+                }
+            }
 
             let q = q_2d.reshape(&Shape::new(&[1, seq_len, n_heads, head_dim]))?;
             let k = k_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
             let v = v_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
 
-            // RoPE runs in place on the GPU tensors the matmuls just wrote --
-            // no CPU round-trip, no separate q_rope/k_rope upload. q_rope/k_rope
-            // are just aliases so the rest of the function (which references
-            // those names) doesn't need to change.
-            runner.rope(
-                q.as_metal()
-                    .ok_or_else(|| CoreError::Internal("q not Metal".into()))?,
-                seq_len as u32,
-                n_heads as u32,
-                head_dim as u32,
-                theta,
-                offset as u32,
-            )?;
+            // RoPE runs in place on the GPU tensors the matmuls just wrote.
+            // Dispatch rope_neox if the model is neox-style (e.g. Qwen), else standard rope.
+            if block.attn.is_neox {
+                runner.rope_neox(
+                    q.as_metal()
+                        .ok_or_else(|| CoreError::Internal("q not Metal".into()))?,
+                    seq_len as u32,
+                    n_heads as u32,
+                    head_dim as u32,
+                    theta,
+                    offset as u32,
+                )?;
 
-            runner.rope(
-                k.as_metal()
-                    .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
-                seq_len as u32,
-                n_kv_heads as u32,
-                head_dim as u32,
-                theta,
-                offset as u32,
-            )?;
+                runner.rope_neox(
+                    k.as_metal()
+                        .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
+                    seq_len as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    theta,
+                    offset as u32,
+                )?;
+            } else {
+                runner.rope(
+                    q.as_metal()
+                        .ok_or_else(|| CoreError::Internal("q not Metal".into()))?,
+                    seq_len as u32,
+                    n_heads as u32,
+                    head_dim as u32,
+                    theta,
+                    offset as u32,
+                )?;
+
+                runner.rope(
+                    k.as_metal()
+                        .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
+                    seq_len as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    theta,
+                    offset as u32,
+                )?;
+            }
 
             let q_rope = q;
             let k_rope = k;
@@ -457,7 +500,6 @@ impl<B: Backend> LlamaModel<B> {
                 Some(_) => (offset + seq_len) as u32,
                 None => seq_len as u32,
             };
-            let mut attn_out_final: Option<B::Tensor> = None;
 
             // One shared output buffer for the whole batch of query positions --
             // attention_pv writes directly into row p via narrow(0, p, 1) instead of
@@ -731,15 +773,9 @@ impl<B: Backend> LlamaModel<B> {
                 .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
         )?;
 
-        let t_encode = _t_encode_start.elapsed(); // _t_encode_start = Instant::now() right after alloc.reset()
-        let t_finish_start = std::time::Instant::now();
         runner.finish()?;
 
         let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
-        let logits_vec = logits.to_vec_f32()?;
-        let nan_count = logits_vec.iter().filter(|v| v.is_nan()).count();
-        let inf_count = logits_vec.iter().filter(|v| v.is_infinite()).count();
-
         Ok(logits)
     }
 
@@ -786,6 +822,9 @@ impl<B: Backend> LlamaModel<B> {
                     BlockLayer::FfnDown => block.set_ffn_down(tensor),
                     BlockLayer::AttnQNorm => block.set_attn_q_norm(tensor),
                     BlockLayer::AttnKNorm => block.set_attn_k_norm(tensor),
+                    BlockLayer::AttnQBias => block.set_attn_q_bias(tensor),
+                    BlockLayer::AttnKBias => block.set_attn_k_bias(tensor),
+                    BlockLayer::AttnVBias => block.set_attn_v_bias(tensor),
                 }
             }
         }
@@ -836,6 +875,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("llama".to_string()),
+            head_dim_override: None,
+            lazy_moe: false,
         }
     }
 
@@ -861,6 +902,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("deepseek".to_string()),
+            head_dim_override: None,
+            lazy_moe: false,
         }
     }
 
@@ -890,7 +933,7 @@ mod tests {
         let config = make_config();
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
         let token_ids = vec![1u32, 2, 3, 4];
-        let logits = model.forward(&token_ids, None, 0).unwrap();
+        let logits = model.forward(&token_ids, None, 0, 128).unwrap();
         assert_eq!(logits.shape().dim(0).unwrap(), 1);
         assert_eq!(logits.shape().dim(1).unwrap(), 4);
         assert_eq!(logits.shape().dims().last().unwrap(), &256);
@@ -900,7 +943,7 @@ mod tests {
     fn test_forward_single_token() {
         let config = make_config();
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
-        let logits = model.forward(&[42u32], None, 0).unwrap();
+        let logits = model.forward(&[42u32], None, 0, 128).unwrap();
         assert_eq!(logits.shape().dim(0).unwrap(), 1);
         assert_eq!(logits.shape().dim(1).unwrap(), 1);
         assert_eq!(logits.shape().dims().last().unwrap(), &256);
@@ -911,7 +954,7 @@ mod tests {
         let config = make_config();
         let model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
         let device = cpu();
-        let mask = model.causal_mask(4, &device).unwrap();
+        let mask = model.causal_mask(4, 0, &device).unwrap();
         assert_eq!(mask.shape(), &Shape::new(&[1, 1, 4, 4]));
     }
 
@@ -920,7 +963,7 @@ mod tests {
         let config = make_config();
         let model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
         let device = cpu();
-        let mask = model.causal_mask(3, &device).unwrap();
+        let mask = model.causal_mask(3, 0, &device).unwrap();
         let flat = mask.to_vec_f32().unwrap();
         assert_eq!(flat[0], 0.0);
         assert!(flat[1].is_infinite() && flat[1] < 0.0);
@@ -935,10 +978,10 @@ mod tests {
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
         let mut cache = Vec::new();
         let _ = model
-            .forward(&[1u32, 2, 3, 4], Some(&mut cache), 0)
+            .forward(&[1u32, 2, 3, 4], Some(&mut cache), 0, 128)
             .unwrap();
         assert_eq!(cache.len(), config.num_hidden_layers);
-        let logits2 = model.forward(&[5u32], Some(&mut cache), 4).unwrap();
+        let logits2 = model.forward(&[5u32], Some(&mut cache), 4, 128).unwrap();
         assert_eq!(logits2.shape().dim(0).unwrap(), 1);
     }
 
@@ -948,10 +991,10 @@ mod tests {
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
         let mut cache = Vec::new();
         model
-            .forward(&[1u32, 2, 3, 4], Some(&mut cache), 0)
+            .forward(&[1u32, 2, 3, 4], Some(&mut cache), 0, 128)
             .unwrap();
         let first_k_seq = cache[0].0.shape().dim(1).unwrap();
-        model.forward(&[5u32], Some(&mut cache), 4).unwrap();
+        model.forward(&[5u32], Some(&mut cache), 4, 128).unwrap();
         let second_k_seq = cache[0].0.shape().dim(1).unwrap();
         assert_eq!(second_k_seq, first_k_seq + 1);
     }
@@ -960,7 +1003,7 @@ mod tests {
     fn test_moe_model_forward() {
         let config = make_moe_config();
         let mut model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
-        let logits = model.forward(&[1u32, 2, 3], None, 0).unwrap();
+        let logits = model.forward(&[1u32, 2, 3], None, 0, 128).unwrap();
         assert_eq!(logits.shape().dims().last().unwrap(), &256);
     }
 }
@@ -997,8 +1040,9 @@ mod metal_tests {
         let device = ensure_metal_device();
         let config = make_config();
         let mut model = LlamaModel::<MetalBackend>::new(&config, &device).unwrap();
+        model.prepare_metal().unwrap();
         let mut cache = Vec::new();
-        let logits = model.forward(&[42u32], Some(&mut cache), 0).unwrap();
+        let logits = model.forward(&[42u32], Some(&mut cache), 0, 128).unwrap();
         assert_eq!(logits.shape().dim(0).unwrap(), 1);
         assert_eq!(logits.shape().dim(1).unwrap(), 1);
     }
@@ -1008,8 +1052,9 @@ mod metal_tests {
         let device = ensure_metal_device();
         let config = make_config();
         let mut model = LlamaModel::<MetalBackend>::new(&config, &device).unwrap();
+        model.prepare_metal().unwrap();
         let mut cache = Vec::new();
-        let logits = model.forward(&[42u32], Some(&mut cache), 0).unwrap();
+        let logits = model.forward(&[42u32], Some(&mut cache), 0, 128).unwrap();
         let values = logits.to_vec_f32().unwrap();
         assert!(!values.iter().any(|x| x.is_nan()));
         assert!(!values.iter().any(|x| x.is_infinite()));

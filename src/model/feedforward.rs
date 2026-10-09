@@ -40,9 +40,19 @@ impl<B: Backend> FeedForward<B> {
     }
 
     pub fn prepare_metal_weights(&mut self) -> Result<()> {
-        self.metal_gate_weight = Some(self.gate_proj.weight().transpose(0, 1)?.contiguous()?);
-        self.metal_up_weight = Some(self.up_proj.weight().transpose(0, 1)?.contiguous()?);
-        self.metal_down_weight = Some(self.down_proj.weight().transpose(0, 1)?.contiguous()?);
+        let gate_trans = self.gate_proj.weight().transpose(0, 1)?.contiguous()?;
+        let up_trans = self.up_proj.weight().transpose(0, 1)?.contiguous()?;
+        let down_trans = self.down_proj.weight().transpose(0, 1)?.contiguous()?;
+
+        let dev = self.gate_proj.weight().device();
+        let dummy = B::Tensor::zeros(&Shape::new(&[1, 1]), DType::F32, &dev)?;
+        self.gate_proj = Linear::new(dummy.clone(), None);
+        self.up_proj = Linear::new(dummy.clone(), None);
+        self.down_proj = Linear::new(dummy, None);
+
+        self.metal_gate_weight = Some(gate_trans);
+        self.metal_up_weight = Some(up_trans);
+        self.metal_down_weight = Some(down_trans);
         Ok(())
     }
 
@@ -119,6 +129,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("llama".to_string()),
+            head_dim_override: None,
+            lazy_moe: false,
         }
     }
 

@@ -3,9 +3,9 @@ use axiom::core::backend::CandleBackend;
 #[cfg(feature = "metal")]
 use axiom::core::backend::MetalBackend;
 use axiom::core::device::Device;
-use axiom::core::tensor::TensorOps;
 use axiom::inference::engine::Engine;
-use axiom::inference::sampler::SamplerConfig;
+use axiom::inference::draft::DraftModel;
+use axiom::inference::sampler::{Sampler, SamplerConfig};
 use axiom::tokenizer::tokenizer::{EncodeOptions, Tokenizer};
 use axiom::weights::loader::load_from_gguf;
 use axiom::weights::loader::load_from_gguf_qwen3moe;
@@ -13,36 +13,57 @@ use std::io::Write;
 use std::path::Path;
 
 fn main() {
-    let gguf_path = std::env::args()
-        .nth(1)
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let quiet = raw_args.iter().any(|s| s == "--quiet" || s == "-q");
+    let positional: Vec<String> = raw_args.into_iter().filter(|s| !s.starts_with('-')).collect();
+
+    let gguf_path = positional
+        .get(0)
+        .cloned()
         .unwrap_or_else(|| "testdata/tinyllama.gguf".to_string());
-    let tokenizer_path = std::env::args()
-        .nth(2)
+    let tokenizer_path = positional
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| "testdata/tokenizer.json".to_string());
-    let prompt = std::env::args()
-        .nth(3)
+    let prompt = positional
+        .get(2)
+        .cloned()
         .unwrap_or_else(|| "The quick brown fox".to_string());
-    let max_new_tokens: usize = std::env::args()
-        .nth(4)
+    let max_new_tokens: usize = positional
+        .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
-    let temperature: f32 = std::env::args()
-        .nth(5)
+    let temperature: f32 = positional
+        .get(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
+    let draft_path = positional
+        .get(5)
+        .cloned()
+        .filter(|s| Path::new(s).exists())
+        .or_else(|| std::env::var("AXIOM_DRAFT_MODEL").ok().filter(|s| Path::new(s).exists()));
+    let gamma: usize = positional
+        .get(6)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
 
-    println!("Axiom Inference Engine");
-    println!("Model    : {}", gguf_path);
-    println!("Tokenizer: {}", tokenizer_path);
-    println!("Prompt   : {:?}", prompt);
-    println!("Max new  : {}", max_new_tokens);
+    if !quiet {
+        println!("Axiom Inference Engine");
+        println!("Model    : {}", gguf_path);
+        if let Some(ref d) = draft_path {
+            println!("Draft    : {} (gamma: {})", d, gamma);
+        }
+        println!("Tokenizer: {}", tokenizer_path);
+        println!("Prompt   : {:?}", prompt);
+        println!("Max new  : {}", max_new_tokens);
 
-    #[cfg(feature = "metal")]
-    println!("Backend  : Metal (Apple Silicon)");
-    #[cfg(not(feature = "metal"))]
-    println!("Backend  : CPU (Candle)");
-    println!("---");
-    std::io::stdout().flush().unwrap();
+        #[cfg(feature = "metal")]
+        println!("Backend  : Metal (Apple Silicon)");
+        #[cfg(not(feature = "metal"))]
+        println!("Backend  : CPU (Candle)");
+        println!("---");
+        std::io::stdout().flush().unwrap();
+    }
 
     // tokenizer
     let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("failed to load tokenizer");
@@ -53,7 +74,7 @@ fn main() {
         print!("Initializing Metal... ");
         std::io::stdout().flush().unwrap();
 
-        let pool_size = 4096usize * 1024 * 1024;
+        let pool_size = 512usize * 1024 * 1024;
         println!("Metal pool: {} MB", pool_size / 1024 / 1024);
         axiom::metal::state::init_global_metal_state(pool_size)
             .expect("failed to initialize Metal state");
@@ -63,31 +84,18 @@ fn main() {
         print!("Loading model... ");
         std::io::stdout().flush().unwrap();
 
-        let mut model = load_from_gguf_qwen3moe::<MetalBackend>(Path::new(&gguf_path), &device)
-            .expect("failed to load model");
+        let mut model = if gguf_path.contains("moe") || gguf_path.contains("MoE") || gguf_path.contains("A3B") {
+            load_from_gguf_qwen3moe::<MetalBackend>(Path::new(&gguf_path), &device)
+                .expect("failed to load model")
+        } else {
+            load_from_gguf::<MetalBackend>(Path::new(&gguf_path), &device)
+                .expect("failed to load model")
+        };
         model
             .prepare_metal()
             .expect("failed to prepare metal weights");
 
-        let vocab_size = model.config().vocab_size;
-        let hidden = model.config().hidden_size;
-
-        // pre-transpose, canonical [vocab, hidden] — row for a token is contiguous
-        let raw = model.lm_head.weight().to_vec_f32().unwrap();
-        // post-transpose+contiguous, [hidden, vocab] — same token is now a strided column
-        let prepared = model
-            .metal_lm_head_weight
-            .as_ref()
-            .unwrap()
-            .to_vec_f32()
-            .unwrap();
-
-        println!("Ok");
-
-        let embd = model.embedding.weight().to_vec_f32().unwrap();
-        println!("token_embd[0..10]: {:?}", &embd[..10]);
-        let n = embd.len();
-        println!("token_embd[last 10]: {:?}", &embd[n - 10..]);
+        println!("ok");
 
         let vocab_size = model.config().vocab_size;
         let sampler_config = SamplerConfig {
@@ -101,7 +109,33 @@ fn main() {
             no_repeat_ngram_size: Some(3),
         };
 
-        Engine::<MetalBackend>::new(model, tokenizer, sampler_config, 1, device)
+        let mut engine = Engine::<MetalBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
+        if let Some(ref dpath) = draft_path {
+            print!("Loading draft model from {}... ", dpath);
+            std::io::stdout().flush().unwrap();
+            let mut draft_model = if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
+                load_from_gguf_qwen3moe::<MetalBackend>(Path::new(dpath), &device)
+                    .expect("failed to load draft model")
+            } else {
+                load_from_gguf::<MetalBackend>(Path::new(dpath), &device)
+                    .expect("failed to load draft model")
+            };
+            draft_model.prepare_metal().expect("failed to prepare draft metal weights");
+            println!("ok");
+            let draft_sampler = Sampler::new(SamplerConfig {
+                temperature,
+                top_p: Some(0.9),
+                top_k: Some(50),
+                seed: Some(42),
+                max_new_tokens,
+                repetition_penalty: 1.0,
+                vocab_size: Some(draft_model.config().vocab_size),
+                no_repeat_ngram_size: Some(3),
+            });
+            let draft = DraftModel::new(draft_model, draft_sampler, gamma);
+            engine = engine.with_draft_model(draft);
+        }
+        engine
     };
 
     #[cfg(not(feature = "metal"))]
@@ -110,8 +144,13 @@ fn main() {
         print!("Loading model... ");
         std::io::stdout().flush().unwrap();
 
-        let model = load_from_gguf::<CandleBackend>(Path::new(&gguf_path), &device)
-            .expect("failed to load model");
+        let model = if gguf_path.contains("moe") || gguf_path.contains("MoE") || gguf_path.contains("A3B") {
+            load_from_gguf_qwen3moe::<CandleBackend>(Path::new(&gguf_path), &device)
+                .expect("failed to load model")
+        } else {
+            load_from_gguf::<CandleBackend>(Path::new(&gguf_path), &device)
+                .expect("failed to load model")
+        };
         println!("ok");
 
         let vocab_size = model.config().vocab_size;
@@ -126,28 +165,51 @@ fn main() {
             no_repeat_ngram_size: Some(3),
         };
 
-        Engine::<CandleBackend>::new(model, tokenizer, sampler_config, 1, device)
+        let mut engine = Engine::<CandleBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
+        if let Some(ref dpath) = draft_path {
+            print!("Loading draft model from {}... ", dpath);
+            std::io::stdout().flush().unwrap();
+            let draft_model = if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
+                load_from_gguf_qwen3moe::<CandleBackend>(Path::new(dpath), &device)
+                    .expect("failed to load draft model")
+            } else {
+                load_from_gguf::<CandleBackend>(Path::new(dpath), &device)
+                    .expect("failed to load draft model")
+            };
+            println!("ok");
+            let draft_sampler = Sampler::new(SamplerConfig {
+                temperature: 0.0,
+                top_p: Some(0.9),
+                top_k: Some(50),
+                seed: Some(42),
+                max_new_tokens,
+                repetition_penalty: 1.3,
+                vocab_size: Some(draft_model.config().vocab_size),
+                no_repeat_ngram_size: Some(3),
+            });
+            let draft = DraftModel::new(draft_model, draft_sampler, gamma);
+            engine = engine.with_draft_model(draft);
+        }
+        engine
     };
 
     let mut engine = engine;
 
-    let im_end_id: u32 = engine
+    let im_end_id: Option<u32> = engine
         .tokenizer()
-        .encode(
-            "<|im_end|>",
-            EncodeOptions {
-                add_bos: false,
-                add_eos: false,
-            },
-        )
-        .first()
-        .copied()
-        .expect("<|im_end|> not found in tokenizer vocab") as u32;
+        .vocab()
+        .token_to_id("<|im_end|>")
+        .map(|id| id as u32);
+    let eos_id: Option<u32> = engine.tokenizer().eos_id().map(|id| id as u32);
 
-    let formatted_prompt = format!(
-        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-        prompt
-    );
+    let formatted_prompt = if im_end_id.is_some() {
+        format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            prompt
+        )
+    } else {
+        prompt.to_string()
+    };
 
     let session_id = engine
         .submit_text(
@@ -173,7 +235,7 @@ fn main() {
         for (sid, token) in &results {
             if *sid == session_id {
                 let t = *token as u32;
-                if t == im_end_id {
+                if Some(t) == im_end_id || Some(t) == eos_id {
                     stop_reason = Some("Stop token generated");
                     break;
                 }
@@ -204,4 +266,12 @@ fn main() {
         elapsed.as_secs_f64(),
         steps as f64 / elapsed.as_secs_f64()
     );
+    if engine.draft_model().is_some() {
+        println!(
+            "Speculative Acceptance: {:.1}% ({}/{} draft tokens accepted)",
+            engine.acceptance_rate() * 100.0,
+            engine.accepted_total,
+            engine.drafted_total,
+        );
+    }
 }

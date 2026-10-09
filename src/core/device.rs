@@ -24,6 +24,11 @@ impl Device {
         matches!(self, Device::Metal(_))
     }
 
+    #[cfg(not(feature = "metal"))]
+    pub fn is_metal(&self) -> bool {
+        false
+    }
+
     pub fn cuda_ordinal(&self) -> Option<usize> {
         if let Self::Cuda(id) = self {
             Some(*id)

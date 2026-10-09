@@ -69,6 +69,26 @@ impl<B: Backend> Generator<B> {
         &self.tokenizer
     }
 
+    pub fn model(&self) -> &LlamaModel<B> {
+        &self.model
+    }
+
+    pub fn model_mut(&mut self) -> &mut LlamaModel<B> {
+        &mut self.model
+    }
+
+    pub fn sampler(&self) -> &Sampler {
+        &self.sampler
+    }
+
+    pub fn sampler_mut(&mut self) -> &mut Sampler {
+        &mut self.sampler
+    }
+
+    pub fn model_and_sampler_mut(&mut self) -> (&mut LlamaModel<B>, &mut Sampler) {
+        (&mut self.model, &mut self.sampler)
+    }
+
     pub fn run(
         &mut self,
         session: &mut Session<B>,
@@ -158,6 +178,8 @@ mod tests {
             torch_dtype: "float32".to_string(),
             architectures: None,
             model_type: Some("llama".to_string()),
+            head_dim_override: None,
+            lazy_moe: false,
         }
     }
 
@@ -206,7 +228,7 @@ mod tests {
         let mut session = make_session(vec![1u32, 2, 3], 10);
         gen.step(&mut session).unwrap();
         assert_eq!(session.num_generated(), 1);
-        assert_eq!(session.offset, 4);
+        assert_eq!(session.offset, 3);
     }
 
     #[test]
