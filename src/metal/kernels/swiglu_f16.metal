@@ -8,11 +8,19 @@ kernel void swiglu_f16(
     constant     uint& num_elements [[buffer(3)]],
     uint tid [[thread_position_in_grid]]
 ) {
-    if (tid >= num_elements) return;
-
-    float gate_val = float(gate[tid]);
-    float up_val = float(up[tid]);
-
-    float silu_val = gate_val * (1.0f / (1.0f + exp(-gate_val)));
-    output[tid] = silu_val * up_val;
+    uint idx = tid * 4;
+    if (idx + 3 < num_elements) {
+        half4 g = *reinterpret_cast<device const half4*>(gate + idx);
+        half4 u = *reinterpret_cast<device const half4*>(up + idx);
+        float4 gf = float4(g);
+        float4 silu = gf * (1.0f / (1.0f + exp(-gf)));
+        *reinterpret_cast<device half4*>(output + idx) = half4(silu * float4(u));
+    } else {
+        for (uint i = idx; i < num_elements; i++) {
+            float g = float(gate[i]);
+            float u = float(up[i]);
+            float silu = g * (1.0f / (1.0f + exp(-g)));
+            output[i] = half(silu * u);
+        }
+    }
 }

@@ -39,6 +39,8 @@ const GEMV_Q4_K_MSL: &str = include_str!("kernels/gemv_q4_k.metal");
 const GEMV_Q6_K_MSL: &str = include_str!("kernels/gemv_q6_k.metal");
 const GEMV_Q8_0_MSL: &str = include_str!("kernels/gemv_q8_0.metal");
 const ATTN_DECODE_MSL: &str = include_str!("kernels/attention_decode.metal");
+const ADD_RMS_NORM_MSL: &str = include_str!("kernels/add_rms_norm.metal");
+const ROPE_CACHE_WRITE_MSL: &str = include_str!("kernels/rope_cache_write.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -73,6 +75,8 @@ pub struct MetalKernels {
     pub attention_decode_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attention_decode_f32_kv_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub cache_write_f32_to_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub add_rms_norm_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub rope_cache_write_f32_to_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -155,6 +159,11 @@ impl MetalKernels {
             cache_write_f32_to_f16_pipeline: build_pipeline(
                 CACHE_WRITE_F16_MSL,
                 "cache_write_f32_to_f16",
+            )?,
+            add_rms_norm_f32_pipeline: build_pipeline(ADD_RMS_NORM_MSL, "add_rms_norm_f32")?,
+            rope_cache_write_f32_to_f16_pipeline: build_pipeline(
+                ROPE_CACHE_WRITE_MSL,
+                "rope_cache_write_f32_to_f16",
             )?,
         })
     }
@@ -648,13 +657,14 @@ impl MetalKernels {
             );
         }
 
+        let num_vectors = (num_elements as usize + 3) / 4;
         let grid = MTLSize {
-            width: num_elements as usize,
+            width: num_vectors,
             height: 1,
             depth: 1,
         };
         let threadgroup = MTLSize {
-            width: 1,
+            width: 64.min(num_vectors).max(1),
             height: 1,
             depth: 1,
         };
@@ -697,13 +707,14 @@ impl MetalKernels {
             );
         }
 
+        let num_vectors = (num_elements as usize + 3) / 4;
         let grid = MTLSize {
-            width: num_elements as usize,
+            width: num_vectors,
             height: 1,
             depth: 1,
         };
         let threadgroup = MTLSize {
-            width: 1,
+            width: 64.min(num_vectors).max(1),
             height: 1,
             depth: 1,
         };
@@ -1515,6 +1526,144 @@ impl MetalKernels {
             head_dim,
             cache_len,
         )
+    }
+
+    pub fn add_rms_norm_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        x: &BlockHandle,
+        residual: &BlockHandle,
+        weight: &BlockHandle,
+        norm_out: &BlockHandle,
+        num_rows: u32,
+        hidden: u32,
+        eps: f32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.add_rms_norm_f32_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(
+                Some(residual.metal_buffer(allocator)),
+                residual.offset_bytes,
+                1,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(weight.metal_buffer(allocator)),
+                weight.offset_bytes,
+                2,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(norm_out.metal_buffer(allocator)),
+                norm_out.offset_bytes,
+                3,
+            );
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&hidden as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&eps as *const f32 as *mut c_void),
+                std::mem::size_of::<f32>(),
+                5,
+            );
+        }
+
+        let grid = MTLSize {
+            width: 1,
+            height: num_rows as usize,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_cache_write_f32_to_f16(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        src: &BlockHandle,
+        k_cache: &BlockHandle,
+        write_pos: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        write_len: u32,
+        theta: f32,
+        is_neox: bool,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.rope_cache_write_f32_to_f16_pipeline);
+
+        let is_neox_u32 = if is_neox { 1u32 } else { 0u32 };
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src.metal_buffer(allocator)), src.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(
+                Some(k_cache.metal_buffer(allocator)),
+                k_cache.offset_bytes,
+                1,
+            );
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&write_pos as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_kv_heads as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&head_dim as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&write_len as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&theta as *const f32 as *mut c_void),
+                std::mem::size_of::<f32>(),
+                6,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&is_neox_u32 as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                7,
+            );
+        }
+
+        let grid = MTLSize {
+            width: write_len as usize,
+            height: n_kv_heads as usize,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        Ok(())
     }
 
     pub fn dequantize_q4_k_f32(
@@ -3438,6 +3587,216 @@ mod tests {
                         got, want,
                         "cache_write mismatch at pos={}, kv={}, d={}",
                         pos, kv, d
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_add_rms_norm_f32_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+
+        let hidden = 2048usize;
+        let num_rows = 2usize;
+        let eps = 1e-5f32;
+
+        let mut x = vec![0.0f32; num_rows * hidden];
+        let mut residual = vec![0.0f32; num_rows * hidden];
+        let mut weight = vec![0.0f32; hidden];
+
+        for i in 0..x.len() {
+            x[i] = ((i as f32) * 0.02).sin();
+            residual[i] = ((i as f32) * 0.03).cos();
+        }
+        for i in 0..hidden {
+            weight[i] = 1.0 + ((i as f32) * 0.01).sin() * 0.1;
+        }
+
+        let mut expected_x = x.clone();
+        let mut expected_norm = vec![0.0f32; num_rows * hidden];
+
+        for r in 0..num_rows {
+            let offset = r * hidden;
+            let mut sum_sq = 0.0f32;
+            for i in 0..hidden {
+                let val = x[offset + i] + residual[offset + i];
+                expected_x[offset + i] = val;
+                sum_sq += val * val;
+            }
+            let mean_sq = sum_sq / (hidden as f32);
+            let scale = 1.0 / (mean_sq + eps).sqrt();
+            for i in 0..hidden {
+                expected_norm[offset + i] = expected_x[offset + i] * scale * weight[i];
+            }
+        }
+
+        let x_block = alloc.alloc(x.len() * 4, 256).unwrap();
+        let res_block = alloc.alloc(residual.len() * 4, 256).unwrap();
+        let w_block = alloc.alloc(weight.len() * 4, 256).unwrap();
+        let out_block = alloc.alloc(expected_norm.len() * 4, 256).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(x.as_ptr() as *const u8, x_block.ptr, x.len() * 4);
+            std::ptr::copy_nonoverlapping(
+                residual.as_ptr() as *const u8,
+                res_block.ptr,
+                residual.len() * 4,
+            );
+            std::ptr::copy_nonoverlapping(
+                weight.as_ptr() as *const u8,
+                w_block.ptr,
+                weight.len() * 4,
+            );
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .add_rms_norm_f32(
+                &encoder,
+                &alloc,
+                &x_block,
+                &res_block,
+                &w_block,
+                &out_block,
+                num_rows as u32,
+                hidden as u32,
+                eps,
+            )
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut got_x = vec![0.0f32; expected_x.len()];
+        let mut got_norm = vec![0.0f32; expected_norm.len()];
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                x_block.ptr,
+                got_x.as_mut_ptr() as *mut u8,
+                expected_x.len() * 4,
+            );
+            std::ptr::copy_nonoverlapping(
+                out_block.ptr,
+                got_norm.as_mut_ptr() as *mut u8,
+                expected_norm.len() * 4,
+            );
+        }
+
+        for i in 0..expected_x.len() {
+            let diff_x = (got_x[i] - expected_x[i]).abs();
+            assert!(
+                diff_x < 1e-5,
+                "add_rms_norm x mismatch at {}: got {}, want {}",
+                i,
+                got_x[i],
+                expected_x[i]
+            );
+            let diff_norm = (got_norm[i] - expected_norm[i]).abs();
+            assert!(
+                diff_norm < 1e-4,
+                "add_rms_norm norm mismatch at {}: got {}, want {}",
+                i,
+                got_norm[i],
+                expected_norm[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_cache_write_f32_to_f16_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+
+        let write_len = 2u32;
+        let n_kv_heads = 8u32;
+        let head_dim = 64u32;
+        let write_pos = 10u32;
+        let max_seq_len = 64u32;
+        let theta = 10000.0f32;
+
+        let num_src_elems = (write_len * n_kv_heads * head_dim) as usize;
+        let num_cache_elems = (max_seq_len * n_kv_heads * head_dim) as usize;
+
+        let mut src_f32 = vec![0.0f32; num_src_elems];
+        for (i, val) in src_f32.iter_mut().enumerate() {
+            *val = ((i as f32) * 0.05).sin();
+        }
+
+        let src_block = alloc.alloc(num_src_elems * 4, 256).unwrap();
+        let cache_block = alloc.alloc(num_cache_elems * 2, 256).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_f32.as_ptr() as *const u8,
+                src_block.ptr,
+                num_src_elems * 4,
+            );
+            std::ptr::write_bytes(cache_block.ptr, 0, num_cache_elems * 2);
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .rope_cache_write_f32_to_f16(
+                &encoder,
+                &alloc,
+                &src_block,
+                &cache_block,
+                write_pos,
+                n_kv_heads,
+                head_dim,
+                write_len,
+                theta,
+                false,
+            )
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut cache_f16 = vec![f16::ZERO; num_cache_elems];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cache_block.ptr,
+                cache_f16.as_mut_ptr() as *mut u8,
+                num_cache_elems * 2,
+            );
+        }
+
+        let half_dim = (head_dim / 2) as usize;
+        for pos in 0..write_len as usize {
+            let current_token = (write_pos as usize) + pos;
+            for kv in 0..n_kv_heads as usize {
+                let src_base = (pos * (n_kv_heads as usize) + kv) * (head_dim as usize);
+                let dst_base = (current_token * (n_kv_heads as usize) + kv) * (head_dim as usize);
+                for i in 0..half_dim {
+                    let freq = 1.0f32 / theta.powf((2 * i) as f32 / (head_dim as f32));
+                    let angle = (current_token as f32) * freq;
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+
+                    let x0 = src_f32[src_base + 2 * i];
+                    let x1 = src_f32[src_base + 2 * i + 1];
+
+                    let expected_rot0 = x0 * cos_a - x1 * sin_a;
+                    let expected_rot1 = x0 * sin_a + x1 * cos_a;
+
+                    let got0 = cache_f16[dst_base + 2 * i].to_f32();
+                    let got1 = cache_f16[dst_base + 2 * i + 1].to_f32();
+
+                    assert!(
+                        (got0 - expected_rot0).abs() < 1e-3,
+                        "rot0 mismatch: got {}, want {}",
+                        got0,
+                        expected_rot0
+                    );
+                    assert!(
+                        (got1 - expected_rot1).abs() < 1e-3,
+                        "rot1 mismatch: got {}, want {}",
+                        got1,
+                        expected_rot1
                     );
                 }
             }

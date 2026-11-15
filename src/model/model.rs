@@ -211,22 +211,41 @@ impl<B: Backend> LlamaModel<B> {
         let x_emb = self.embedding.forward(token_ids)?;
         let mut x = x_emb.unsqueeze(0)?; // [1, seq_len, hidden]
 
+        let mut residual: Option<B::Tensor> = None;
+
         for (i, block) in self.blocks.iter_mut().enumerate() {
-            use std::eprintln;
             let norm_out = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
-            runner.rms_norm(
-                x.as_metal()
-                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
-                block
-                    .attn_norm
-                    .weight()
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("attn_norm not Metal".into()))?,
-                norm_out
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("norm_out not Metal".into()))?,
-                eps,
-            )?;
+            if let Some(ref res) = residual {
+                runner.add_rms_norm(
+                    x.as_metal()
+                        .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                    res.as_metal()
+                        .ok_or_else(|| CoreError::Internal("res not Metal".into()))?,
+                    block
+                        .attn_norm
+                        .weight()
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("attn_norm not Metal".into()))?,
+                    norm_out
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("norm_out not Metal".into()))?,
+                    eps,
+                )?;
+            } else {
+                runner.rms_norm(
+                    x.as_metal()
+                        .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                    block
+                        .attn_norm
+                        .weight()
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("attn_norm not Metal".into()))?,
+                    norm_out
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("norm_out not Metal".into()))?,
+                    eps,
+                )?;
+            }
 
             let norm_2d = norm_out.reshape(&Shape::new(&[seq_len, hidden]))?;
 
@@ -376,8 +395,7 @@ impl<B: Backend> LlamaModel<B> {
             let k = k_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
             let v = v_2d.reshape(&Shape::new(&[1, seq_len, n_kv_heads, head_dim]))?;
 
-            // RoPE runs in place on the GPU tensors the matmuls just wrote.
-            // Dispatch rope_neox if the model is neox-style (e.g. Qwen), else standard rope.
+            // RoPE on Q (K RoPE is fused directly into rope_cache_write below)
             if block.attn.is_neox {
                 runner.rope_neox(
                     q.as_metal()
@@ -388,16 +406,17 @@ impl<B: Backend> LlamaModel<B> {
                     theta,
                     offset as u32,
                 )?;
-
-                runner.rope_neox(
-                    k.as_metal()
-                        .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
-                    seq_len as u32,
-                    n_kv_heads as u32,
-                    head_dim as u32,
-                    theta,
-                    offset as u32,
-                )?;
+                if kv_cache.is_none() {
+                    runner.rope_neox(
+                        k.as_metal()
+                            .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
+                        seq_len as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        theta,
+                        offset as u32,
+                    )?;
+                }
             } else {
                 runner.rope(
                     q.as_metal()
@@ -408,16 +427,17 @@ impl<B: Backend> LlamaModel<B> {
                     theta,
                     offset as u32,
                 )?;
-
-                runner.rope(
-                    k.as_metal()
-                        .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
-                    seq_len as u32,
-                    n_kv_heads as u32,
-                    head_dim as u32,
-                    theta,
-                    offset as u32,
-                )?;
+                if kv_cache.is_none() {
+                    runner.rope(
+                        k.as_metal()
+                            .ok_or_else(|| CoreError::Internal("k not Metal".into()))?,
+                        seq_len as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        theta,
+                        offset as u32,
+                    )?;
+                }
             }
 
             let q_rope = q;
@@ -494,7 +514,7 @@ impl<B: Backend> LlamaModel<B> {
                 }
 
                 let (k_cache, v_cache) = &cache[i];
-                runner.cache_write(
+                runner.rope_cache_write(
                     k_flat
                         .as_metal()
                         .ok_or_else(|| CoreError::Internal("k_flat not Metal".into()))?,
@@ -505,6 +525,8 @@ impl<B: Backend> LlamaModel<B> {
                     n_kv_heads as u32,
                     head_dim as u32,
                     seq_len as u32,
+                    theta,
+                    block.attn.is_neox,
                 )?;
                 runner.cache_write(
                     v_flat
@@ -610,23 +632,13 @@ impl<B: Backend> LlamaModel<B> {
                     .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
             )?;
 
-            let x_new = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
-            runner.add(
+            let ffn_norm_out = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
+            runner.add_rms_norm(
                 x.as_metal()
                     .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
                 attn_proj
                     .as_metal()
                     .ok_or_else(|| CoreError::Internal("attn_proj not Metal".into()))?,
-                x_new
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("x_new not Metal".into()))?,
-            )?;
-            x = x_new;
-
-            let ffn_norm_out = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
-            runner.rms_norm(
-                x.as_metal()
-                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
                 block
                     .ffn_norm
                     .weight()
@@ -741,33 +753,39 @@ impl<B: Backend> LlamaModel<B> {
                 }
             };
 
-            let x_new2 = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
-            runner.add(
-                x.as_metal()
-                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
-                down_2d
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("down_2d not Metal".into()))?,
-                x_new2
-                    .as_metal()
-                    .ok_or_else(|| CoreError::Internal("x_new2 not Metal".into()))?,
-            )?;
-            x = x_new2;
+            residual = Some(down_2d);
         }
 
         let final_norm = B::Tensor::uninit_pooled(&x.shape(), x.dtype(), x.device())?;
-        runner.rms_norm(
-            x.as_metal()
-                .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
-            self.norm
-                .weight()
-                .as_metal()
-                .ok_or_else(|| CoreError::Internal("norm weight not Metal".into()))?,
-            final_norm
-                .as_metal()
-                .ok_or_else(|| CoreError::Internal("final_norm not Metal".into()))?,
-            eps,
-        )?;
+        if let Some(ref res) = residual {
+            runner.add_rms_norm(
+                x.as_metal()
+                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                res.as_metal()
+                    .ok_or_else(|| CoreError::Internal("res not Metal".into()))?,
+                self.norm
+                    .weight()
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("norm weight not Metal".into()))?,
+                final_norm
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("final_norm not Metal".into()))?,
+                eps,
+            )?;
+        } else {
+            runner.rms_norm(
+                x.as_metal()
+                    .ok_or_else(|| CoreError::Internal("x not Metal".into()))?,
+                self.norm
+                    .weight()
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("norm weight not Metal".into()))?,
+                final_norm
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("final_norm not Metal".into()))?,
+                eps,
+            )?;
+        }
 
         let final_2d = final_norm.reshape(&Shape::new(&[seq_len, hidden]))?;
         let logits_2d = B::Tensor::zeros(
