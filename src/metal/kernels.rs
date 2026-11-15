@@ -35,6 +35,9 @@ const DEQUANTIZE_Q6_K_MSL: &str = include_str!("kernels/dequantize_q6_k.metal");
 const DEQUANTIZE_Q3_K_MSL: &str = include_str!("kernels/dequantize_q3_k.metal");
 const DEQUANTIZE_Q2_K_MSL: &str = include_str!("kernels/dequantize_q2_k.metal");
 const TRANSPOSE_F32_MSL: &str = include_str!("kernels/transpose_f32.metal");
+const GEMV_Q4_K_MSL: &str = include_str!("kernels/gemv_q4_k.metal");
+const GEMV_Q6_K_MSL: &str = include_str!("kernels/gemv_q6_k.metal");
+const GEMV_Q8_0_MSL: &str = include_str!("kernels/gemv_q8_0.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -62,6 +65,9 @@ pub struct MetalKernels {
     pub dequantize_q3_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub dequantize_q2_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub transpose_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub gemv_q4_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub gemv_q6_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub gemv_q8_0_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -132,6 +138,9 @@ impl MetalKernels {
             dequantize_q3_k_pipeline: build_pipeline(DEQUANTIZE_Q3_K_MSL, "dequantize_q3_k_f32")?,
             dequantize_q2_k_pipeline: build_pipeline(DEQUANTIZE_Q2_K_MSL, "dequantize_q2_k_f32")?,
             transpose_f32_pipeline: build_pipeline(TRANSPOSE_F32_MSL, "transpose_f32")?,
+            gemv_q4_k_pipeline: build_pipeline(GEMV_Q4_K_MSL, "gemv_q4_k_f32")?,
+            gemv_q6_k_pipeline: build_pipeline(GEMV_Q6_K_MSL, "gemv_q6_k_f32")?,
+            gemv_q8_0_pipeline: build_pipeline(GEMV_Q8_0_MSL, "gemv_q8_0_f32")?,
         })
     }
 
@@ -1530,6 +1539,165 @@ impl MetalKernels {
         encoder.dispatchThreads_threadsPerThreadgroup(grid_size, group_size);
         Ok(())
     }
+
+    pub fn gemv_q4_k(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        w: &BlockHandle,
+        x: &BlockHandle,
+        y: &BlockHandle,
+        k: u32,
+        n: u32,
+        m: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.gemv_q4_k_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(w.metal_buffer(allocator)), w.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(y.metal_buffer(allocator)), y.offset_bytes, 2);
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&k as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&m as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+        }
+
+        let threads_per_threadgroup = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroups_per_grid = MTLSize {
+            width: n as usize,
+            height: m as usize,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            threadgroups_per_grid,
+            threads_per_threadgroup,
+        );
+
+        Ok(())
+    }
+
+    pub fn gemv_q6_k(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        w: &BlockHandle,
+        x: &BlockHandle,
+        y: &BlockHandle,
+        k: u32,
+        n: u32,
+        m: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.gemv_q6_k_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(w.metal_buffer(allocator)), w.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(y.metal_buffer(allocator)), y.offset_bytes, 2);
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&k as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&m as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+        }
+
+        let threads_per_threadgroup = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroups_per_grid = MTLSize {
+            width: n as usize,
+            height: m as usize,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            threadgroups_per_grid,
+            threads_per_threadgroup,
+        );
+
+        Ok(())
+    }
+
+    pub fn gemv_q8_0(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        w: &BlockHandle,
+        x: &BlockHandle,
+        y: &BlockHandle,
+        k: u32,
+        n: u32,
+        m: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.gemv_q8_0_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(w.metal_buffer(allocator)), w.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer(allocator)), x.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(y.metal_buffer(allocator)), y.offset_bytes, 2);
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&k as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&m as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+        }
+
+        let threads_per_threadgroup = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroups_per_grid = MTLSize {
+            width: n as usize,
+            height: m as usize,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            threadgroups_per_grid,
+            threads_per_threadgroup,
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2479,6 +2647,266 @@ mod tests {
                 (got1 - 0.2474).abs() < 1e-2,
                 "channel 1 @ pos 1: got {}, want 0.2474",
                 got1
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_q4_k_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+        let k = 256u32;
+        let n = 4u32;
+        let m = 1u32;
+
+        let num_blocks = (n * (k / 256)) as usize;
+        let w_bytes_len = num_blocks * 144;
+        let mut w_bytes = vec![0u8; w_bytes_len];
+
+        // Fill with valid Q4_K blocks: d = 1.0 (0x3C00), scales[0]=1, qs=0x55
+        for b in 0..num_blocks {
+            let base = b * 144;
+            w_bytes[base] = 0x00;
+            w_bytes[base + 1] = 0x3C; // d = 1.0
+            w_bytes[base + 4] = 0x01; // scale 0
+            for i in 16..144 {
+                w_bytes[base + i] = 0x21; // nibble 1 = 1, nibble 2 = 2
+            }
+        }
+
+        // Dequantize on CPU as reference
+        let w_dequant = crate::weights::quantize::dequantize(
+            &w_bytes,
+            crate::weights::gguf::GgufDType::Q4_K,
+            (n * k) as usize,
+        );
+
+        let mut x_vals = vec![0.0f32; (m * k) as usize];
+        for i in 0..x_vals.len() {
+            x_vals[i] = (i as f32) * 0.01;
+        }
+
+        // CPU reference GEMV: y[row] = sum_j (w[row, j] * x[j])
+        let mut y_ref = vec![0.0f32; (m * n) as usize];
+        for r in 0..n as usize {
+            let mut sum = 0.0f32;
+            for j in 0..k as usize {
+                sum += w_dequant[r * (k as usize) + j] * x_vals[j];
+            }
+            y_ref[r] = sum;
+        }
+
+        let w_block = alloc.alloc(w_bytes_len, 256).unwrap();
+        let x_block = alloc.alloc(x_vals.len() * 4, 256).unwrap();
+        let y_block = alloc.alloc(y_ref.len() * 4, 256).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(w_bytes.as_ptr(), w_block.ptr, w_bytes_len);
+            std::ptr::copy_nonoverlapping(
+                x_vals.as_ptr() as *const u8,
+                x_block.ptr,
+                x_vals.len() * 4,
+            );
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .gemv_q4_k(&encoder, &alloc, &w_block, &x_block, &y_block, k, n, m)
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut y_got = vec![0.0f32; (m * n) as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_block.ptr,
+                y_got.as_mut_ptr() as *mut u8,
+                y_ref.len() * 4,
+            );
+        }
+
+        for r in 0..n as usize {
+            let diff = (y_got[r] - y_ref[r]).abs();
+            assert!(
+                diff < 1e-2,
+                "GEMV Q4_K mismatch at row {}: got {}, want {}, diff {}",
+                r,
+                y_got[r],
+                y_ref[r],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_q6_k_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+        let k = 256u32;
+        let n = 4u32;
+        let m = 1u32;
+
+        let num_blocks = (n * (k / 256)) as usize;
+        let w_bytes_len = num_blocks * 210;
+        let mut w_bytes = vec![0u8; w_bytes_len];
+
+        // Fill with valid Q6_K blocks: d = 1.0 (0x3C00) at 208..209
+        for b in 0..num_blocks {
+            let base = b * 210;
+            w_bytes[base + 208] = 0x00;
+            w_bytes[base + 209] = 0x3C; // d = 1.0
+                                        // scales: set scale 0 to 1
+            w_bytes[base + 192] = 1;
+            for i in 0..128 {
+                w_bytes[base + i] = 0x22;
+            }
+        }
+
+        let w_dequant = crate::weights::quantize::dequantize(
+            &w_bytes,
+            crate::weights::gguf::GgufDType::Q6_K,
+            (n * k) as usize,
+        );
+
+        let mut x_vals = vec![0.0f32; (m * k) as usize];
+        for i in 0..x_vals.len() {
+            x_vals[i] = (i as f32) * 0.01;
+        }
+
+        let mut y_ref = vec![0.0f32; (m * n) as usize];
+        for r in 0..n as usize {
+            let mut sum = 0.0f32;
+            for j in 0..k as usize {
+                sum += w_dequant[r * (k as usize) + j] * x_vals[j];
+            }
+            y_ref[r] = sum;
+        }
+
+        let w_block = alloc.alloc(w_bytes_len, 256).unwrap();
+        let x_block = alloc.alloc(x_vals.len() * 4, 256).unwrap();
+        let y_block = alloc.alloc(y_ref.len() * 4, 256).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(w_bytes.as_ptr(), w_block.ptr, w_bytes_len);
+            std::ptr::copy_nonoverlapping(
+                x_vals.as_ptr() as *const u8,
+                x_block.ptr,
+                x_vals.len() * 4,
+            );
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .gemv_q6_k(&encoder, &alloc, &w_block, &x_block, &y_block, k, n, m)
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut y_got = vec![0.0f32; (m * n) as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_block.ptr,
+                y_got.as_mut_ptr() as *mut u8,
+                y_ref.len() * 4,
+            );
+        }
+
+        for r in 0..n as usize {
+            let diff = (y_got[r] - y_ref[r]).abs();
+            assert!(
+                diff < 1e-2,
+                "GEMV Q6_K mismatch at row {}: got {}, want {}, diff {}",
+                r,
+                y_got[r],
+                y_ref[r],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemv_q8_0_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+        let k = 32u32;
+        let n = 4u32;
+        let m = 1u32;
+
+        let num_blocks = (n * (k / 32)) as usize;
+        let w_bytes_len = num_blocks * 34;
+        let mut w_bytes = vec![0u8; w_bytes_len];
+
+        // Fill with valid Q8_0 blocks: d = 1.0 (0x3C00) at 0..1, qs = 2
+        for b in 0..num_blocks {
+            let base = b * 34;
+            w_bytes[base] = 0x00;
+            w_bytes[base + 1] = 0x3C; // d = 1.0
+            for i in 2..34 {
+                w_bytes[base + i] = 2; // q = 2
+            }
+        }
+
+        let w_dequant = crate::weights::quantize::dequantize(
+            &w_bytes,
+            crate::weights::gguf::GgufDType::Q8_0,
+            (n * k) as usize,
+        );
+
+        let mut x_vals = vec![0.0f32; (m * k) as usize];
+        for i in 0..x_vals.len() {
+            x_vals[i] = (i as f32) * 0.05;
+        }
+
+        let mut y_ref = vec![0.0f32; (m * n) as usize];
+        for r in 0..n as usize {
+            let mut sum = 0.0f32;
+            for j in 0..k as usize {
+                sum += w_dequant[r * (k as usize) + j] * x_vals[j];
+            }
+            y_ref[r] = sum;
+        }
+
+        let w_block = alloc.alloc(w_bytes_len, 256).unwrap();
+        let x_block = alloc.alloc(x_vals.len() * 4, 256).unwrap();
+        let y_block = alloc.alloc(y_ref.len() * 4, 256).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(w_bytes.as_ptr(), w_block.ptr, w_bytes_len);
+            std::ptr::copy_nonoverlapping(
+                x_vals.as_ptr() as *const u8,
+                x_block.ptr,
+                x_vals.len() * 4,
+            );
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .gemv_q8_0(&encoder, &alloc, &w_block, &x_block, &y_block, k, n, m)
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut y_got = vec![0.0f32; (m * n) as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_block.ptr,
+                y_got.as_mut_ptr() as *mut u8,
+                y_ref.len() * 4,
+            );
+        }
+
+        for r in 0..n as usize {
+            let diff = (y_got[r] - y_ref[r]).abs();
+            assert!(
+                diff < 1e-2,
+                "GEMV Q8_0 mismatch at row {}: got {}, want {}, diff {}",
+                r,
+                y_got[r],
+                y_ref[r],
+                diff
             );
         }
     }

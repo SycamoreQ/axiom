@@ -40,9 +40,16 @@ impl<B: Backend> FeedForward<B> {
     }
 
     pub fn prepare_metal_weights(&mut self) -> Result<()> {
-        let gate_trans = self.gate_proj.weight().transpose(0, 1)?.contiguous()?;
-        let up_trans = self.up_proj.weight().transpose(0, 1)?.contiguous()?;
-        let down_trans = self.down_proj.weight().transpose(0, 1)?.contiguous()?;
+        let prep = |w: &B::Tensor| -> Result<B::Tensor> {
+            if w.dtype().is_quantized() {
+                Ok(w.clone())
+            } else {
+                w.transpose(0, 1)?.contiguous()
+            }
+        };
+        let gate_trans = prep(self.gate_proj.weight())?;
+        let up_trans = prep(self.up_proj.weight())?;
+        let down_trans = prep(self.down_proj.weight())?;
 
         let dev = self.gate_proj.weight().device();
         let dummy = B::Tensor::zeros(&Shape::new(&[1, 1]), DType::F32, &dev)?;

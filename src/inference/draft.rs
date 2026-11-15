@@ -57,18 +57,15 @@ impl<B: Backend> DraftModel<B> {
             self.offset = session.prompt_tokens.len();
         }
 
-        let target_len = session.prompt_tokens.len() + session.generated_tokens.len().saturating_sub(1);
+        let target_len =
+            session.prompt_tokens.len() + session.generated_tokens.len().saturating_sub(1);
         if self.offset < target_len {
             let start = self.offset.saturating_sub(session.prompt_tokens.len());
             let end = target_len - session.prompt_tokens.len();
             if start < end && end <= session.generated_tokens.len() {
                 let missing = &session.generated_tokens[start..end];
-                self.model.forward(
-                    missing,
-                    Some(&mut self.kv_cache),
-                    self.offset,
-                    max_seq_len,
-                )?;
+                self.model
+                    .forward(missing, Some(&mut self.kv_cache), self.offset, max_seq_len)?;
                 self.offset += missing.len();
             }
         }

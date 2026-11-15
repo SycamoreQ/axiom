@@ -43,7 +43,12 @@ impl EngineProfiler {
         self.step_start = Some(Instant::now());
     }
 
-    pub fn end_step(&mut self, token_id: u32, token_str: String, draft_tokens_count: Option<usize>) {
+    pub fn end_step(
+        &mut self,
+        token_id: u32,
+        token_str: String,
+        draft_tokens_count: Option<usize>,
+    ) {
         if let Some(start) = self.step_start.take() {
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             let is_prefill = self.step_counter == 0;
@@ -61,10 +66,7 @@ impl EngineProfiler {
         }
     }
 
-    pub fn finish(
-        self,
-        speculative: Option<SpeculativeStats>,
-    ) -> InferenceProfile {
+    pub fn finish(self, speculative: Option<SpeculativeStats>) -> InferenceProfile {
         let end_snapshot = SystemMonitor::snapshot();
         let resource_diff = SystemMonitor::diff(&self.start_snapshot, &end_snapshot);
 
@@ -157,4 +159,3 @@ impl EngineProfiler {
         }
     }
 }
-

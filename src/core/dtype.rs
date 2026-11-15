@@ -7,11 +7,15 @@ Types of quantizations and their implementations
 */
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
 pub enum DType {
     U32,
     F32,
     F16,
     BF16,
+    Q4_K,
+    Q6_K,
+    Q8_0,
 }
 
 pub trait Element: Debug + Copy + Send + Sync + 'static {
@@ -24,6 +28,20 @@ impl DType {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
             DType::U32 => 4,
+            _ => 1,
+        }
+    }
+
+    pub fn is_quantized(self) -> bool {
+        matches!(self, DType::Q4_K | DType::Q6_K | DType::Q8_0)
+    }
+
+    pub fn block_info(self) -> Option<(usize, usize)> {
+        match self {
+            DType::Q4_K => Some((256, 144)),
+            DType::Q6_K => Some((256, 210)),
+            DType::Q8_0 => Some((32, 34)),
+            _ => None,
         }
     }
 
@@ -38,6 +56,9 @@ impl DType {
             DType::F16 => "f16",
             DType::BF16 => "bf16",
             DType::U32 => "u32",
+            DType::Q4_K => "q4_k",
+            DType::Q6_K => "q6_k",
+            DType::Q8_0 => "q8_0",
         }
     }
 }
@@ -73,6 +94,7 @@ impl From<DType> for candle_core::DType {
             DType::F16 => candle_core::DType::F16,
             DType::BF16 => candle_core::DType::BF16,
             DType::U32 => candle_core::DType::U32,
+            other => panic!("candle does not support quantized dtype {:?}", other),
         }
     }
 }

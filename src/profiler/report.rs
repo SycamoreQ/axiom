@@ -63,9 +63,15 @@ impl ProfilerReport {
         );
 
         if let Some(ref spec) = profile.speculative {
-            println!("┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫");
-            println!("┃  SPECULATIVE DECODING METRICS                                            ┃");
-            println!("┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫");
+            println!(
+                "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫"
+            );
+            println!(
+                "┃  SPECULATIVE DECODING METRICS                                            ┃"
+            );
+            println!(
+                "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫"
+            );
             println!(
                 "┃  Tokens Drafted  : {:<10} Tokens Accepted: {:<10}                     ┃",
                 spec.drafted_total, spec.accepted_total
@@ -119,7 +125,10 @@ impl ProfilerReport {
         println!("==========================================================================");
         println!("                       PERFORMANCE COMPARISON REPORT                      ");
         println!("==========================================================================");
-        println!("Metric                           | {:<18} | {:<18} | Speedup/Delta", name_a, name_b);
+        println!(
+            "Metric                           | {:<18} | {:<18} | Speedup/Delta",
+            name_a, name_b
+        );
         println!("---------------------------------+--------------------+--------------------+--------------");
 
         let print_row_time = |label: &str, val_a: f64, val_b: f64| {
@@ -147,14 +156,34 @@ impl ProfilerReport {
         };
 
         print_row_time("Prefill Latency (TTFT)", a.ttft_ms, b.ttft_ms);
-        print_row_thru("Prefill Throughput", a.prefill_throughput_tok_s, b.prefill_throughput_tok_s);
+        print_row_thru(
+            "Prefill Throughput",
+            a.prefill_throughput_tok_s,
+            b.prefill_throughput_tok_s,
+        );
         print_row_time("Decode Time", a.decode_time_ms, b.decode_time_ms);
-        print_row_thru("Decode Throughput", a.decode_throughput_tok_s, b.decode_throughput_tok_s);
-        print_row_time("Mean Inter-Token Latency (ITL)", a.itl_stats.mean_ms, b.itl_stats.mean_ms);
-        print_row_time("Median ITL (P50)", a.itl_stats.median_ms, b.itl_stats.median_ms);
+        print_row_thru(
+            "Decode Throughput",
+            a.decode_throughput_tok_s,
+            b.decode_throughput_tok_s,
+        );
+        print_row_time(
+            "Mean Inter-Token Latency (ITL)",
+            a.itl_stats.mean_ms,
+            b.itl_stats.mean_ms,
+        );
+        print_row_time(
+            "Median ITL (P50)",
+            a.itl_stats.median_ms,
+            b.itl_stats.median_ms,
+        );
         print_row_time("P90 ITL", a.itl_stats.p90_ms, b.itl_stats.p90_ms);
         print_row_time("P99 ITL", a.itl_stats.p99_ms, b.itl_stats.p99_ms);
-        print_row_thru("Overall Generation Throughput", a.overall_throughput_tok_s, b.overall_throughput_tok_s);
+        print_row_thru(
+            "Overall Generation Throughput",
+            a.overall_throughput_tok_s,
+            b.overall_throughput_tok_s,
+        );
 
         println!("---------------------------------+--------------------+--------------------+--------------");
         println!(
@@ -183,4 +212,3 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         s.to_string()
     }
 }
-

@@ -39,7 +39,9 @@ fn main() {
 
     let mut gguf_path: Option<String> = None;
     let mut tokenizer_path = "testdata/tokenizer.json".to_string();
-    let mut prompt = "Explain the fundamental principles of quantum computing in three clear bullet points.".to_string();
+    let mut prompt =
+        "Explain the fundamental principles of quantum computing in three clear bullet points."
+            .to_string();
     let mut max_new_tokens: usize = 32;
     let mut temperature: f32 = 0.0;
     let mut draft_path: Option<String> = None;
@@ -130,7 +132,10 @@ fn main() {
 
     #[cfg(feature = "profile")]
     let _trace_guard = if let Some(ref tpath) = trace_out {
-        println!("Tracing enabled: writing Perfetto/Chrome trace to {}", tpath);
+        println!(
+            "Tracing enabled: writing Perfetto/Chrome trace to {}",
+            tpath
+        );
         Some(axiom::profiler::init_chrome_tracing(tpath))
     } else {
         None
@@ -179,7 +184,10 @@ fn main() {
         std::io::stdout().flush().unwrap();
         let load_start = Instant::now();
 
-        let mut model = if gguf_path.contains("moe") || gguf_path.contains("MoE") || gguf_path.contains("A3B") {
+        let mut model = if gguf_path.contains("moe")
+            || gguf_path.contains("MoE")
+            || gguf_path.contains("A3B")
+        {
             load_from_gguf_qwen3moe::<MetalBackend>(Path::new(&gguf_path), &device)
                 .expect("failed to load model")
         } else {
@@ -204,20 +212,24 @@ fn main() {
             no_repeat_ngram_size: Some(3),
         };
 
-        let mut engine = Engine::<MetalBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
+        let mut engine =
+            Engine::<MetalBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
 
         if let Some(ref dpath) = draft_path {
             print!("Loading draft model from {}... ", dpath);
             std::io::stdout().flush().unwrap();
             let d_load_start = Instant::now();
-            let mut draft_model = if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
-                load_from_gguf_qwen3moe::<MetalBackend>(Path::new(dpath), &device)
-                    .expect("failed to load draft model")
-            } else {
-                load_from_gguf::<MetalBackend>(Path::new(dpath), &device)
-                    .expect("failed to load draft model")
-            };
-            draft_model.prepare_metal().expect("failed to prepare draft metal weights");
+            let mut draft_model =
+                if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
+                    load_from_gguf_qwen3moe::<MetalBackend>(Path::new(dpath), &device)
+                        .expect("failed to load draft model")
+                } else {
+                    load_from_gguf::<MetalBackend>(Path::new(dpath), &device)
+                        .expect("failed to load draft model")
+                };
+            draft_model
+                .prepare_metal()
+                .expect("failed to prepare draft metal weights");
             println!("done in {:.2}s", d_load_start.elapsed().as_secs_f64());
 
             let draft_sampler = Sampler::new(SamplerConfig {
@@ -244,7 +256,10 @@ fn main() {
         std::io::stdout().flush().unwrap();
         let load_start = Instant::now();
 
-        let model = if gguf_path.contains("moe") || gguf_path.contains("MoE") || gguf_path.contains("A3B") {
+        let model = if gguf_path.contains("moe")
+            || gguf_path.contains("MoE")
+            || gguf_path.contains("A3B")
+        {
             load_from_gguf_qwen3moe::<CandleBackend>(Path::new(&gguf_path), &device)
                 .expect("failed to load model")
         } else {
@@ -265,18 +280,20 @@ fn main() {
             no_repeat_ngram_size: Some(3),
         };
 
-        let mut engine = Engine::<CandleBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
+        let mut engine =
+            Engine::<CandleBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
 
         if let Some(ref dpath) = draft_path {
             print!("Loading draft model from {}... ", dpath);
             std::io::stdout().flush().unwrap();
-            let draft_model = if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
-                load_from_gguf_qwen3moe::<CandleBackend>(Path::new(dpath), &device)
-                    .expect("failed to load draft model")
-            } else {
-                load_from_gguf::<CandleBackend>(Path::new(dpath), &device)
-                    .expect("failed to load draft model")
-            };
+            let draft_model =
+                if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
+                    load_from_gguf_qwen3moe::<CandleBackend>(Path::new(dpath), &device)
+                        .expect("failed to load draft model")
+                } else {
+                    load_from_gguf::<CandleBackend>(Path::new(dpath), &device)
+                        .expect("failed to load draft model")
+                };
             println!("done");
 
             let draft_sampler = Sampler::new(SamplerConfig {
@@ -418,4 +435,3 @@ fn main() {
         }
     }
 }
-

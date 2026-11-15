@@ -54,7 +54,8 @@ impl LatencyStats {
         let min_ms = sorted[0];
         let max_ms = sorted[count - 1];
 
-        let variance: f64 = sorted.iter().map(|&x| (x - mean_ms).powi(2)).sum::<f64>() / count as f64;
+        let variance: f64 =
+            sorted.iter().map(|&x| (x - mean_ms).powi(2)).sum::<f64>() / count as f64;
         let std_dev_ms = variance.sqrt();
 
         let total_time_sec = sum / 1000.0;
@@ -140,4 +141,3 @@ pub struct InferenceProfile {
     // Per-token breakdown
     pub token_timings: Vec<TokenTiming>,
 }
-

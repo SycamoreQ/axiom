@@ -226,6 +226,16 @@ pub trait TensorOps: Clone + Send + Sync + Sized {
     fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self>;
     fn ones(shape: &Shape, dtype: DType, device: &Device) -> crate::core::error::Result<Self>;
     fn from_slice<E: Element>(data: &[E], shape: &Shape, device: &Device) -> Result<Self>;
+    fn from_quantized_bytes(
+        _data: &[u8],
+        _shape: &Shape,
+        _dtype: DType,
+        _device: &Device,
+    ) -> Result<Self> {
+        Err(CoreError::Internal(
+            "from_quantized_bytes not supported on this backend".into(),
+        ))
+    }
 
     // movement
     fn to_device(&self, device: &Device) -> crate::core::error::Result<Self>;
@@ -1184,6 +1194,17 @@ impl TensorOps for MetalTensor {
         Ok(tensor)
     }
 
+    fn from_quantized_bytes(
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let state = global_metal_state()
+            .ok_or_else(|| CoreError::Internal("Metal state not initialized".into()))?;
+        Self::from_bytes_direct(state, data, shape.clone(), dtype, device.clone())
+    }
+
     fn from_u32_slice(data: &[u32], shape: &Shape, device: &Device) -> Result<Self> {
         Self::from_slice(data, shape, device)
     }
@@ -1888,18 +1909,62 @@ impl TensorOps for MetalTensor {
     }
 
     fn index_select(&self, indexes: &Self, dim: usize) -> Result<Self> {
-        // `self` is often a huge table (e.g. token_embd: ~1GB for a 128k-vocab
-        // model) but this only ever gathers a handful of rows (num tokens).
-        // The naive version calls self.to_vec_f32() — downloading the ENTIRE
-        // table — on every single call (every token, every step). Copy
-        // directly within unified memory instead, byte-range by byte-range,
-        // same approach `cat` already uses. Dtype-agnostic (byte copy)
-        // rather than assuming F32, so this stays correct for F16 too.
         let self_ = self.contiguous()?;
         let idx = indexes.to_vec_u32()?;
         let dims = self_.shape.dims();
         let slice_size: usize = dims[dim + 1..].iter().product();
         let outer_size: usize = dims[..dim].iter().product();
+
+        if self_.dtype.is_quantized() {
+            let (block_elems, block_bytes) = self_.dtype.block_info().ok_or_else(|| {
+                CoreError::Internal("missing block info for quantized dtype".into())
+            })?;
+            let row_len = slice_size;
+            let bytes_per_row = (row_len / block_elems) * block_bytes;
+            let mut out_dims = dims.to_vec();
+            out_dims[dim] = idx.len();
+            let mut all_floats = Vec::with_capacity(idx.len() * row_len);
+            let src_slice = unsafe {
+                std::slice::from_raw_parts(
+                    (self_.block.as_ref().ptr as *const u8).add(self_.offset_bytes),
+                    self_.block.size_bytes.saturating_sub(self_.offset_bytes),
+                )
+            };
+            for &token_id in &idx {
+                let start = (token_id as usize) * bytes_per_row;
+                let end = start + bytes_per_row;
+                if end > src_slice.len() {
+                    return Err(CoreError::Internal(format!(
+                        "index_select out of bounds: token {} with end byte {} exceeds buffer {}",
+                        token_id,
+                        end,
+                        src_slice.len()
+                    )));
+                }
+                let row_bytes = &src_slice[start..end];
+                let row_floats = match self_.dtype {
+                    DType::Q4_K => crate::weights::quantize::dequantize(
+                        row_bytes,
+                        crate::weights::gguf::GgufDType::Q4_K,
+                        row_len,
+                    ),
+                    DType::Q6_K => crate::weights::quantize::dequantize(
+                        row_bytes,
+                        crate::weights::gguf::GgufDType::Q6_K,
+                        row_len,
+                    ),
+                    DType::Q8_0 => crate::weights::quantize::dequantize(
+                        row_bytes,
+                        crate::weights::gguf::GgufDType::Q8_0,
+                        row_len,
+                    ),
+                    _ => unreachable!(),
+                };
+                all_floats.extend_from_slice(&row_floats);
+            }
+            return Self::from_slice(&all_floats, &Shape::new(&out_dims), &self_.device);
+        }
+
         let dtype_size = self_.dtype.size_in_bytes();
         let slice_bytes = slice_size * dtype_size;
 

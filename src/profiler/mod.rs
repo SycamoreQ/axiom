@@ -21,4 +21,3 @@ pub fn init_chrome_tracing(path: &str) -> tracing_chrome::FlushGuard {
     let _ = tracing_subscriber::registry().with(chrome_layer).try_init();
     guard
 }
-

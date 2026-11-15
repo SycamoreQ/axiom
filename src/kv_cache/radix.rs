@@ -1,6 +1,5 @@
 use std::{collections::HashMap, time::Instant};
 
-
 /*
 A radix tree keyed by token sequences. Enables O(prefix_len) lookup for shared prefix matching. This is the main
 data structure both caches are present in.

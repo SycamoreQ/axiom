@@ -3,13 +3,13 @@ use crate::core::device::Device;
 #[cfg(feature = "cuda")]
 use crate::cuda::{fork_manager::ForkManager, CudaContext};
 use crate::inference::batch::Batch;
+use crate::inference::draft::DraftModel;
 use crate::inference::generator::Generator;
 use crate::inference::sampler::{Sampler, SamplerConfig};
 use crate::inference::session::{Session, SessionId, SessionStatus};
+use crate::inference::speculative::SpeculativeDecoder;
 use crate::model::model::LlamaModel;
 use crate::tokenizer::tokenizer::{EncodeOptions, Tokenizer};
-use crate::inference::draft::DraftModel;
-use crate::inference::speculative::SpeculativeDecoder;
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
