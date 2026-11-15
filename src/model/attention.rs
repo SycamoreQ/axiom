@@ -87,10 +87,17 @@ impl<B: Backend> Attention<B> {
     }
 
     pub fn prepare_metal_weights(&mut self) -> Result<()> {
-        let q_trans = self.q_proj.weight().transpose(0, 1)?.contiguous()?;
-        let k_trans = self.k_proj.weight().transpose(0, 1)?.contiguous()?;
-        let v_trans = self.v_proj.weight().transpose(0, 1)?.contiguous()?;
-        let o_trans = self.o_proj.weight().transpose(0, 1)?.contiguous()?;
+        let prep = |w: &B::Tensor| -> Result<B::Tensor> {
+            if w.dtype().is_quantized() {
+                Ok(w.clone())
+            } else {
+                w.transpose(0, 1)?.contiguous()
+            }
+        };
+        let q_trans = prep(self.q_proj.weight())?;
+        let k_trans = prep(self.k_proj.weight())?;
+        let v_trans = prep(self.v_proj.weight())?;
+        let o_trans = prep(self.o_proj.weight())?;
 
         let dev = self.q_proj.weight().device();
         let dummy = B::Tensor::zeros(&Shape::new(&[1, 1]), DType::F32, &dev)?;

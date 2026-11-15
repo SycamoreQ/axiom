@@ -17,8 +17,14 @@ fn load_profile(path: &str) -> InferenceProfile {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        println!("Usage: {} <PROFILE_A_JSON> <PROFILE_B_JSON> [LABEL_A] [LABEL_B]", args[0]);
-        println!("Example: {} axiom_qwen.json vllm_qwen.json 'Axiom (Metal)' 'vLLM (Baseline)'", args[0]);
+        println!(
+            "Usage: {} <PROFILE_A_JSON> <PROFILE_B_JSON> [LABEL_A] [LABEL_B]",
+            args[0]
+        );
+        println!(
+            "Example: {} axiom_qwen.json vllm_qwen.json 'Axiom (Metal)' 'vLLM (Baseline)'",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -32,4 +38,3 @@ fn main() {
 
     ProfilerReport::compare(label_a, &profile_a, label_b, &profile_b);
 }
-

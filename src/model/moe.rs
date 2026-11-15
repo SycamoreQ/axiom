@@ -438,7 +438,8 @@ impl<B: Backend> LazyExpertBank<B> {
 
     pub fn prepare_metal(&mut self) -> Result<()> {
         if self.gate_exps_metal.is_none() && !self.gate_exps.data.is_empty() {
-            self.gate_exps_metal = Some(Self::upload_raw_bytes(&self.gate_exps.data, &self.device)?);
+            self.gate_exps_metal =
+                Some(Self::upload_raw_bytes(&self.gate_exps.data, &self.device)?);
             self.gate_exps.data = Vec::new();
         }
         if self.up_exps_metal.is_none() && !self.up_exps.data.is_empty() {
@@ -446,7 +447,8 @@ impl<B: Backend> LazyExpertBank<B> {
             self.up_exps.data = Vec::new();
         }
         if self.down_exps_metal.is_none() && !self.down_exps.data.is_empty() {
-            self.down_exps_metal = Some(Self::upload_raw_bytes(&self.down_exps.data, &self.device)?);
+            self.down_exps_metal =
+                Some(Self::upload_raw_bytes(&self.down_exps.data, &self.device)?);
             self.down_exps.data = Vec::new();
         }
         Ok(())
@@ -455,9 +457,8 @@ impl<B: Backend> LazyExpertBank<B> {
     pub fn upload_raw_bytes(data: &[u8], device: &Device) -> Result<B::Tensor> {
         assert_eq!(data.len() % 4, 0, "quantized blob must be 4-byte aligned");
         if (data.as_ptr() as usize) % std::mem::align_of::<u32>() == 0 {
-            let u32_slice = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4)
-            };
+            let u32_slice =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
             B::Tensor::from_u32_slice(u32_slice, &Shape::new(&[u32_slice.len()]), device)
         } else {
             let as_u32: Vec<u32> = data
@@ -511,8 +512,12 @@ impl<B: Backend> LazyExpertBank<B> {
         )?;
         let gate_w = B::Tensor::uninit_pooled(&Shape::new(&[h, i]), DType::F32, &self.device)?;
         runner.transpose(
-            gate_raw.as_metal().ok_or_else(|| CoreError::Internal("gate_raw not metal".into()))?,
-            gate_w.as_metal().ok_or_else(|| CoreError::Internal("gate_w not metal".into()))?,
+            gate_raw
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("gate_raw not metal".into()))?,
+            gate_w
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("gate_w not metal".into()))?,
         )?;
 
         let up_raw = self.dequant_one(
@@ -526,8 +531,11 @@ impl<B: Backend> LazyExpertBank<B> {
         )?;
         let up_w = B::Tensor::uninit_pooled(&Shape::new(&[h, i]), DType::F32, &self.device)?;
         runner.transpose(
-            up_raw.as_metal().ok_or_else(|| CoreError::Internal("up_raw not metal".into()))?,
-            up_w.as_metal().ok_or_else(|| CoreError::Internal("up_w not metal".into()))?,
+            up_raw
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("up_raw not metal".into()))?,
+            up_w.as_metal()
+                .ok_or_else(|| CoreError::Internal("up_w not metal".into()))?,
         )?;
 
         let down_raw = self.dequant_one(
@@ -541,8 +549,12 @@ impl<B: Backend> LazyExpertBank<B> {
         )?;
         let down_w = B::Tensor::uninit_pooled(&Shape::new(&[i, h]), DType::F32, &self.device)?;
         runner.transpose(
-            down_raw.as_metal().ok_or_else(|| CoreError::Internal("down_raw not metal".into()))?,
-            down_w.as_metal().ok_or_else(|| CoreError::Internal("down_w not metal".into()))?,
+            down_raw
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("down_raw not metal".into()))?,
+            down_w
+                .as_metal()
+                .ok_or_else(|| CoreError::Internal("down_w not metal".into()))?,
         )?;
 
         Ok(Expert::from_weights(gate_w, up_w, down_w, idx))
@@ -585,7 +597,13 @@ impl<B: Backend> LazyExpertBank<B> {
         let out_metal = out
             .as_metal()
             .ok_or_else(|| CoreError::Internal("out not Metal".into()))?;
-        runner.dequantize_raw(meta.dtype, &view_block, out_metal.block(), num_blocks, numel as u32)?;
+        runner.dequantize_raw(
+            meta.dtype,
+            &view_block,
+            out_metal.block(),
+            num_blocks,
+            numel as u32,
+        )?;
 
         Ok(out)
     }
@@ -926,16 +944,14 @@ impl<B: Backend> MoeLayer<B> {
 
         for (e, assignments) in &expert_assignments {
             let selected_indices: Vec<usize> = assignments.iter().map(|(tok, _)| *tok).collect();
-            let positions: Vec<TokenPos> = assignments.iter().map(|(tok, _)| TokenPos(*tok)).collect();
+            let positions: Vec<TokenPos> =
+                assignments.iter().map(|(tok, _)| TokenPos(*tok)).collect();
             let k_slots: Vec<usize> = assignments.iter().map(|(_, slot)| *slot).collect();
 
             let device = routed_input.device();
             let indices_u32: Vec<u32> = selected_indices.iter().map(|&i| i as u32).collect();
-            let indices_tensor = B::Tensor::from_u32_slice(
-                &indices_u32,
-                &Shape::new(&[indices_u32.len()]),
-                device,
-            )?;
+            let indices_tensor =
+                B::Tensor::from_u32_slice(&indices_u32, &Shape::new(&[indices_u32.len()]), device)?;
             let gathered = routed_input.index_select(&indices_tensor, 0)?;
 
             let expert_out = self.experts[*e].forward(&gathered)?;
@@ -1191,16 +1207,14 @@ impl<B: Backend> LazyMoeLayer<B> {
             // the pre-computed assignments, without calling dispatch()
             // (which would re-read expert_indices from GPU again).
             let selected_indices: Vec<usize> = assignments.iter().map(|(tok, _)| *tok).collect();
-            let positions: Vec<TokenPos> = assignments.iter().map(|(tok, _)| TokenPos(*tok)).collect();
+            let positions: Vec<TokenPos> =
+                assignments.iter().map(|(tok, _)| TokenPos(*tok)).collect();
             let k_slots: Vec<usize> = assignments.iter().map(|(_, slot)| *slot).collect();
 
             let device = routed_input.device();
             let indices_u32: Vec<u32> = selected_indices.iter().map(|&i| i as u32).collect();
-            let indices_tensor = B::Tensor::from_u32_slice(
-                &indices_u32,
-                &Shape::new(&[indices_u32.len()]),
-                device,
-            )?;
+            let indices_tensor =
+                B::Tensor::from_u32_slice(&indices_u32, &Shape::new(&[indices_u32.len()]), device)?;
             let gathered = routed_input.index_select(&indices_tensor, 0)?;
 
             let checkpoint = runner.as_deref().map(|r| r.allocator.checkpoint());

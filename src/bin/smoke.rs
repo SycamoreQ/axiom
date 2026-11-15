@@ -3,8 +3,8 @@ use axiom::core::backend::CandleBackend;
 #[cfg(feature = "metal")]
 use axiom::core::backend::MetalBackend;
 use axiom::core::device::Device;
-use axiom::inference::engine::Engine;
 use axiom::inference::draft::DraftModel;
+use axiom::inference::engine::Engine;
 use axiom::inference::sampler::{Sampler, SamplerConfig};
 use axiom::tokenizer::tokenizer::{EncodeOptions, Tokenizer};
 use axiom::weights::loader::load_from_gguf;
@@ -15,7 +15,10 @@ use std::path::Path;
 fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let quiet = raw_args.iter().any(|s| s == "--quiet" || s == "-q");
-    let positional: Vec<String> = raw_args.into_iter().filter(|s| !s.starts_with('-')).collect();
+    let positional: Vec<String> = raw_args
+        .into_iter()
+        .filter(|s| !s.starts_with('-'))
+        .collect();
 
     let gguf_path = positional
         .get(0)
@@ -29,10 +32,7 @@ fn main() {
         .get(2)
         .cloned()
         .unwrap_or_else(|| "The quick brown fox".to_string());
-    let max_new_tokens: usize = positional
-        .get(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
+    let max_new_tokens: usize = positional.get(3).and_then(|s| s.parse().ok()).unwrap_or(32);
     let temperature: f32 = positional
         .get(4)
         .and_then(|s| s.parse().ok())
@@ -41,11 +41,12 @@ fn main() {
         .get(5)
         .cloned()
         .filter(|s| Path::new(s).exists())
-        .or_else(|| std::env::var("AXIOM_DRAFT_MODEL").ok().filter(|s| Path::new(s).exists()));
-    let gamma: usize = positional
-        .get(6)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+        .or_else(|| {
+            std::env::var("AXIOM_DRAFT_MODEL")
+                .ok()
+                .filter(|s| Path::new(s).exists())
+        });
+    let gamma: usize = positional.get(6).and_then(|s| s.parse().ok()).unwrap_or(4);
 
     if !quiet {
         println!("Axiom Inference Engine");
@@ -84,7 +85,10 @@ fn main() {
         print!("Loading model... ");
         std::io::stdout().flush().unwrap();
 
-        let mut model = if gguf_path.contains("moe") || gguf_path.contains("MoE") || gguf_path.contains("A3B") {
+        let mut model = if gguf_path.contains("moe")
+            || gguf_path.contains("MoE")
+            || gguf_path.contains("A3B")
+        {
             load_from_gguf_qwen3moe::<MetalBackend>(Path::new(&gguf_path), &device)
                 .expect("failed to load model")
         } else {
@@ -109,18 +113,22 @@ fn main() {
             no_repeat_ngram_size: Some(3),
         };
 
-        let mut engine = Engine::<MetalBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
+        let mut engine =
+            Engine::<MetalBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
         if let Some(ref dpath) = draft_path {
             print!("Loading draft model from {}... ", dpath);
             std::io::stdout().flush().unwrap();
-            let mut draft_model = if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
-                load_from_gguf_qwen3moe::<MetalBackend>(Path::new(dpath), &device)
-                    .expect("failed to load draft model")
-            } else {
-                load_from_gguf::<MetalBackend>(Path::new(dpath), &device)
-                    .expect("failed to load draft model")
-            };
-            draft_model.prepare_metal().expect("failed to prepare draft metal weights");
+            let mut draft_model =
+                if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
+                    load_from_gguf_qwen3moe::<MetalBackend>(Path::new(dpath), &device)
+                        .expect("failed to load draft model")
+                } else {
+                    load_from_gguf::<MetalBackend>(Path::new(dpath), &device)
+                        .expect("failed to load draft model")
+                };
+            draft_model
+                .prepare_metal()
+                .expect("failed to prepare draft metal weights");
             println!("ok");
             let draft_sampler = Sampler::new(SamplerConfig {
                 temperature,
@@ -144,7 +152,10 @@ fn main() {
         print!("Loading model... ");
         std::io::stdout().flush().unwrap();
 
-        let model = if gguf_path.contains("moe") || gguf_path.contains("MoE") || gguf_path.contains("A3B") {
+        let model = if gguf_path.contains("moe")
+            || gguf_path.contains("MoE")
+            || gguf_path.contains("A3B")
+        {
             load_from_gguf_qwen3moe::<CandleBackend>(Path::new(&gguf_path), &device)
                 .expect("failed to load model")
         } else {
@@ -165,17 +176,19 @@ fn main() {
             no_repeat_ngram_size: Some(3),
         };
 
-        let mut engine = Engine::<CandleBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
+        let mut engine =
+            Engine::<CandleBackend>::new(model, tokenizer, sampler_config, 1, device.clone());
         if let Some(ref dpath) = draft_path {
             print!("Loading draft model from {}... ", dpath);
             std::io::stdout().flush().unwrap();
-            let draft_model = if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
-                load_from_gguf_qwen3moe::<CandleBackend>(Path::new(dpath), &device)
-                    .expect("failed to load draft model")
-            } else {
-                load_from_gguf::<CandleBackend>(Path::new(dpath), &device)
-                    .expect("failed to load draft model")
-            };
+            let draft_model =
+                if dpath.contains("moe") || dpath.contains("MoE") || dpath.contains("A3B") {
+                    load_from_gguf_qwen3moe::<CandleBackend>(Path::new(dpath), &device)
+                        .expect("failed to load draft model")
+                } else {
+                    load_from_gguf::<CandleBackend>(Path::new(dpath), &device)
+                        .expect("failed to load draft model")
+                };
             println!("ok");
             let draft_sampler = Sampler::new(SamplerConfig {
                 temperature: 0.0,

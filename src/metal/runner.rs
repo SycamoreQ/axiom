@@ -4,9 +4,9 @@ use crate::core::error::{CoreError, Result};
 use crate::core::tensor::TensorOps;
 use crate::metal::allocator::BlockHandle;
 use crate::metal::allocator::MetalAllocator;
-use crate::weights::gguf::GgufDType;
 use crate::metal::error::MetalError;
 use crate::metal::state::MetalState;
+use crate::weights::gguf::GgufDType;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLCommandEncoder;
@@ -311,7 +311,10 @@ impl<'a> MetalRunner<'a> {
             GgufDType::Q6_K => self.dequantize_q6k_raw(data, out, num_blocks, numel),
             GgufDType::Q3_K => self.dequantize_q3k_raw(data, out, num_blocks, numel),
             GgufDType::Q2_K => self.dequantize_q2k_raw(data, out, num_blocks, numel),
-            other => Err(CoreError::Internal(format!("unsupported metal dequant dtype: {:?}", other))),
+            other => Err(CoreError::Internal(format!(
+                "unsupported metal dequant dtype: {:?}",
+                other
+            ))),
         }
     }
 
@@ -386,7 +389,17 @@ impl<'a> MetalRunner<'a> {
         let rank_b = b.metal_shape().rank();
         let k = a.metal_shape().dims()[rank_a - 1];
 
-        let n = if rank_b == 2 {
+        let n = if b.metal_dtype().is_quantized() {
+            if b.metal_shape().dims()[1] != k {
+                return Err(MetalError::Internal(format!(
+                    "quantized weight inner dim mismatch: input inner {} vs weight in_features {}",
+                    k,
+                    b.metal_shape().dims()[1]
+                ))
+                .into());
+            }
+            b.metal_shape().dims()[0]
+        } else if rank_b == 2 {
             if b.metal_shape().dims()[0] != k {
                 return Err(MetalError::Internal(format!(
                     "inner dim mismatch: {} vs {}",
@@ -411,7 +424,12 @@ impl<'a> MetalRunner<'a> {
 
         let dtype_size = a.metal_dtype().size_in_bytes();
         let stride_a = m_per * k * dtype_size;
-        let stride_b = k * n * dtype_size;
+        let stride_b = if b.metal_dtype().is_quantized() {
+            let (block_elems, block_bytes) = b.metal_dtype().block_info().unwrap();
+            (n * k / block_elems) * block_bytes
+        } else {
+            k * n * dtype_size
+        };
         let stride_c = m_per * n * dtype_size;
 
         for batch_idx in 0..batch_out {
@@ -427,36 +445,75 @@ impl<'a> MetalRunner<'a> {
             let mut block_c = (*c.block()).clone();
             block_c.offset_bytes += c.metal_offset() + batch_idx * stride_c;
 
-            match a.metal_dtype() {
-                DType::F32 => {
-                    self.state.kernels.matmul_f32(
+            match b.metal_dtype() {
+                DType::Q4_K => {
+                    self.state.kernels.gemv_q4_k(
                         &self.encoder,
                         self.allocator,
-                        &block_a,
                         &block_b,
+                        &block_a,
                         &block_c,
-                        m_per as u32,
-                        n as u32,
                         k as u32,
+                        n as u32,
+                        m_per as u32,
                     )?;
                 }
-                DType::F16 => {
-                    self.state.kernels.matmul_f16(
+                DType::Q6_K => {
+                    self.state.kernels.gemv_q6_k(
                         &self.encoder,
                         self.allocator,
-                        &block_a,
                         &block_b,
+                        &block_a,
                         &block_c,
-                        m_per as u32,
-                        n as u32,
                         k as u32,
+                        n as u32,
+                        m_per as u32,
                     )?;
                 }
-                _ => {
-                    return Err(
-                        MetalError::Internal("broadcast_matmul: unsupported dtype".into()).into(),
-                    )
+                DType::Q8_0 => {
+                    self.state.kernels.gemv_q8_0(
+                        &self.encoder,
+                        self.allocator,
+                        &block_b,
+                        &block_a,
+                        &block_c,
+                        k as u32,
+                        n as u32,
+                        m_per as u32,
+                    )?;
                 }
+                _ => match a.metal_dtype() {
+                    DType::F32 => {
+                        self.state.kernels.matmul_f32(
+                            &self.encoder,
+                            self.allocator,
+                            &block_a,
+                            &block_b,
+                            &block_c,
+                            m_per as u32,
+                            n as u32,
+                            k as u32,
+                        )?;
+                    }
+                    DType::F16 => {
+                        self.state.kernels.matmul_f16(
+                            &self.encoder,
+                            self.allocator,
+                            &block_a,
+                            &block_b,
+                            &block_c,
+                            m_per as u32,
+                            n as u32,
+                            k as u32,
+                        )?;
+                    }
+                    _ => {
+                        return Err(MetalError::Internal(
+                            "broadcast_matmul: unsupported dtype".into(),
+                        )
+                        .into())
+                    }
+                },
             }
         }
         Ok(())

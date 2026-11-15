@@ -47,8 +47,12 @@ impl SystemMonitor {
         let peak_rss_mb = end.peak_rss_bytes as f64 / (1024.0 * 1024.0);
         let current_rss_mb = end.rss_bytes as f64 / (1024.0 * 1024.0);
 
-        let user_cpu_ms = (end.user_cpu_time_us.saturating_sub(start.user_cpu_time_us)) as f64 / 1000.0;
-        let system_cpu_ms = (end.system_cpu_time_us.saturating_sub(start.system_cpu_time_us)) as f64 / 1000.0;
+        let user_cpu_ms =
+            (end.user_cpu_time_us.saturating_sub(start.user_cpu_time_us)) as f64 / 1000.0;
+        let system_cpu_ms = (end
+            .system_cpu_time_us
+            .saturating_sub(start.system_cpu_time_us)) as f64
+            / 1000.0;
         let total_cpu_ms = user_cpu_ms + system_cpu_ms;
 
         let cpu_utilization_pct = if wall_time_ms > 0.0 {
@@ -73,8 +77,10 @@ impl SystemMonitor {
         unsafe {
             let mut usage: libc::rusage = std::mem::zeroed();
             if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
-                let user_us = (usage.ru_utime.tv_sec as u64) * 1_000_000 + (usage.ru_utime.tv_usec as u64);
-                let sys_us = (usage.ru_stime.tv_sec as u64) * 1_000_000 + (usage.ru_stime.tv_usec as u64);
+                let user_us =
+                    (usage.ru_utime.tv_sec as u64) * 1_000_000 + (usage.ru_utime.tv_usec as u64);
+                let sys_us =
+                    (usage.ru_stime.tv_sec as u64) * 1_000_000 + (usage.ru_stime.tv_usec as u64);
 
                 // On macOS, ru_maxrss is in bytes; on Linux, it's in kilobytes.
                 #[cfg(target_os = "macos")]
@@ -143,4 +149,3 @@ impl SystemMonitor {
         Some(resident_pages * page_size)
     }
 }
-

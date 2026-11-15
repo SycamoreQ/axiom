@@ -63,7 +63,11 @@ impl<B: Backend> LlamaModel<B> {
         for block in self.blocks.iter_mut() {
             block.prepare_metal()?;
         }
-        let lm_trans = self.lm_head.weight().transpose(0, 1)?.contiguous()?;
+        let lm_trans = if self.lm_head.weight().dtype().is_quantized() {
+            self.lm_head.weight().clone()
+        } else {
+            self.lm_head.weight().transpose(0, 1)?.contiguous()?
+        };
         let dev = self.lm_head.weight().device();
         let dummy = B::Tensor::zeros(&Shape::new(&[1, 1]), DType::F32, &dev)?;
         self.lm_head = Linear::new(dummy, None);
@@ -260,17 +264,25 @@ impl<B: Backend> LlamaModel<B> {
             if let Some(ref q_bias) = block.attn.metal_q_bias {
                 if seq_len == 1 {
                     runner.add(
-                        q_2d.as_metal().ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
-                        q_bias.as_metal().ok_or_else(|| CoreError::Internal("q_bias not Metal".into()))?,
-                        q_2d.as_metal().ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
+                        q_2d.as_metal()
+                            .ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
+                        q_bias
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("q_bias not Metal".into()))?,
+                        q_2d.as_metal()
+                            .ok_or_else(|| CoreError::Internal("q_2d not Metal".into()))?,
                     )?;
                 } else {
                     for s in 0..seq_len {
                         let row = q_2d.narrow(0, s, 1)?;
                         runner.add(
-                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
-                            q_bias.as_metal().ok_or_else(|| CoreError::Internal("q_bias not Metal".into()))?,
-                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            row.as_metal()
+                                .ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            q_bias
+                                .as_metal()
+                                .ok_or_else(|| CoreError::Internal("q_bias not Metal".into()))?,
+                            row.as_metal()
+                                .ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
                         )?;
                     }
                 }
@@ -294,17 +306,25 @@ impl<B: Backend> LlamaModel<B> {
             if let Some(ref k_bias) = block.attn.metal_k_bias {
                 if seq_len == 1 {
                     runner.add(
-                        k_2d.as_metal().ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
-                        k_bias.as_metal().ok_or_else(|| CoreError::Internal("k_bias not Metal".into()))?,
-                        k_2d.as_metal().ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
+                        k_2d.as_metal()
+                            .ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
+                        k_bias
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("k_bias not Metal".into()))?,
+                        k_2d.as_metal()
+                            .ok_or_else(|| CoreError::Internal("k_2d not Metal".into()))?,
                     )?;
                 } else {
                     for s in 0..seq_len {
                         let row = k_2d.narrow(0, s, 1)?;
                         runner.add(
-                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
-                            k_bias.as_metal().ok_or_else(|| CoreError::Internal("k_bias not Metal".into()))?,
-                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            row.as_metal()
+                                .ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            k_bias
+                                .as_metal()
+                                .ok_or_else(|| CoreError::Internal("k_bias not Metal".into()))?,
+                            row.as_metal()
+                                .ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
                         )?;
                     }
                 }
@@ -328,17 +348,25 @@ impl<B: Backend> LlamaModel<B> {
             if let Some(ref v_bias) = block.attn.metal_v_bias {
                 if seq_len == 1 {
                     runner.add(
-                        v_2d.as_metal().ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
-                        v_bias.as_metal().ok_or_else(|| CoreError::Internal("v_bias not Metal".into()))?,
-                        v_2d.as_metal().ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
+                        v_2d.as_metal()
+                            .ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
+                        v_bias
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("v_bias not Metal".into()))?,
+                        v_2d.as_metal()
+                            .ok_or_else(|| CoreError::Internal("v_2d not Metal".into()))?,
                     )?;
                 } else {
                     for s in 0..seq_len {
                         let row = v_2d.narrow(0, s, 1)?;
                         runner.add(
-                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
-                            v_bias.as_metal().ok_or_else(|| CoreError::Internal("v_bias not Metal".into()))?,
-                            row.as_metal().ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            row.as_metal()
+                                .ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
+                            v_bias
+                                .as_metal()
+                                .ok_or_else(|| CoreError::Internal("v_bias not Metal".into()))?,
+                            row.as_metal()
+                                .ok_or_else(|| CoreError::Internal("row not Metal".into()))?,
                         )?;
                     }
                 }

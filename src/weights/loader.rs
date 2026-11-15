@@ -193,13 +193,11 @@ pub fn config_from_gguf(gguf: &GgufFile) -> Result<ModelConfig, LoaderError> {
     };
 
     let get_arch_u32 = |prop: &str| -> Result<usize, LoaderError> {
-        get_u32(&format!("{arch}.{prop}"))
-            .or_else(|_| get_u32(&format!("llama.{prop}")))
+        get_u32(&format!("{arch}.{prop}")).or_else(|_| get_u32(&format!("llama.{prop}")))
     };
 
     let get_arch_f32 = |prop: &str| -> Result<f32, LoaderError> {
-        get_f32(&format!("{arch}.{prop}"))
-            .or_else(|_| get_f32(&format!("llama.{prop}")))
+        get_f32(&format!("{arch}.{prop}")).or_else(|_| get_f32(&format!("llama.{prop}")))
     };
 
     let rope_freqs = gguf.tensors.get("rope_freqs.weight").and_then(|info| {
@@ -396,8 +394,25 @@ pub fn load_bytes_as_tensor<B: Backend>(
             B::Tensor::from_slice(&floats, &shape, device)
                 .map_err(|e| LoaderError::Backend(e.to_string()))
         }
+        GgufDType::Q4_K | GgufDType::Q6_K | GgufDType::Q8_0 => {
+            let target_dt = match info.dtype {
+                GgufDType::Q4_K => DType::Q4_K,
+                GgufDType::Q6_K => DType::Q6_K,
+                GgufDType::Q8_0 => DType::Q8_0,
+                _ => unreachable!(),
+            };
+            if matches!(device, Device::Metal(_)) {
+                B::Tensor::from_quantized_bytes(data, &shape, target_dt, device)
+                    .map_err(|e| LoaderError::Backend(e.to_string()))
+            } else {
+                let floats =
+                    crate::weights::quantize::dequantize(data, info.dtype, info.numel() as usize);
+                B::Tensor::from_slice(&floats, &shape, device)
+                    .map_err(|e| LoaderError::Backend(e.to_string()))
+            }
+        }
         dtype => {
-            // For quantized types, dequantize
+            // For other quantized types, dequantize
             let floats = crate::weights::quantize::dequantize(data, dtype, info.numel() as usize);
             B::Tensor::from_slice(&floats, &shape, device)
                 .map_err(|e| LoaderError::Backend(e.to_string()))
