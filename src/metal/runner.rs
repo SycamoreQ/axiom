@@ -700,6 +700,73 @@ impl<'a> MetalRunner<'a> {
         Ok(())
     }
 
+    pub fn add_rms_norm(
+        &self,
+        x: &MetalTensor,
+        residual: &MetalTensor,
+        weight: &MetalTensor,
+        norm_out: &MetalTensor,
+        eps: f32,
+    ) -> Result<()> {
+        let shape = x.metal_shape();
+        let hidden = *shape.dims().last().unwrap();
+        let num_rows = shape.numel() / hidden;
+
+        let mut block_x = (*x.block()).clone();
+        block_x.offset_bytes += x.metal_offset();
+        let mut block_res = (*residual.block()).clone();
+        block_res.offset_bytes += residual.metal_offset();
+        let mut block_w = (*weight.block()).clone();
+        block_w.offset_bytes += weight.metal_offset();
+        let mut block_out = (*norm_out.block()).clone();
+        block_out.offset_bytes += norm_out.metal_offset();
+
+        self.state.kernels.add_rms_norm_f32(
+            &self.encoder,
+            self.allocator,
+            &block_x,
+            &block_res,
+            &block_w,
+            &block_out,
+            num_rows as u32,
+            hidden as u32,
+            eps,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_cache_write(
+        &self,
+        k_src: &MetalTensor,
+        k_cache: &MetalTensor,
+        write_pos: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        write_len: u32,
+        theta: f32,
+        is_neox: bool,
+    ) -> Result<()> {
+        let mut block_src = (*k_src.block()).clone();
+        block_src.offset_bytes += k_src.metal_offset();
+        let mut block_cache = (*k_cache.block()).clone();
+        block_cache.offset_bytes += k_cache.metal_offset();
+
+        self.state.kernels.rope_cache_write_f32_to_f16(
+            &self.encoder,
+            self.allocator,
+            &block_src,
+            &block_cache,
+            write_pos,
+            n_kv_heads,
+            head_dim,
+            write_len,
+            theta,
+            is_neox,
+        )?;
+        Ok(())
+    }
+
     pub fn swiglu(
         &self,
         gate: &MetalTensor,
