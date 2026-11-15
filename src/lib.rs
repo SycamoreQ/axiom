@@ -7,6 +7,7 @@ pub mod lora;
 #[cfg(feature = "metal")]
 pub mod metal;
 pub mod model;
+pub mod profiler;
 pub mod server;
 #[cfg(test)]
 pub mod tests;

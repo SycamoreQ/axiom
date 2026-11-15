@@ -35,10 +35,22 @@ pub struct FreeBlock {
     pub size: usize,
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct MetalAllocStats {
+    pub capacity_bytes: usize,
+    pub current_offset: usize,
+    pub peak_offset: usize,
+    pub active_bytes: usize,
+    pub free_list_bytes: usize,
+    pub free_blocks_count: usize,
+    pub fragmentation_ratio: f32,
+}
+
 pub struct MetalAllocator {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     capacity: usize,
     current_offset: Cell<usize>,
+    peak_offset: Cell<usize>,
     free_list: RefCell<Vec<FreeBlock>>,
 }
 
@@ -69,6 +81,7 @@ impl MetalAllocator {
             buffer,
             capacity: total_size_bytes,
             current_offset: Cell::new(0),
+            peak_offset: Cell::new(0),
             free_list: RefCell::new(Vec::new()),
         })
     }
@@ -126,7 +139,11 @@ impl MetalAllocator {
             });
         }
 
-        self.current_offset.set(start_offset + size);
+        let new_offset = start_offset + size;
+        self.current_offset.set(new_offset);
+        if new_offset > self.peak_offset.get() {
+            self.peak_offset.set(new_offset);
+        }
 
         let base_ptr = self.buffer.contents().as_ptr() as *mut u8;
         let block_ptr = unsafe { base_ptr.add(start_offset) };
@@ -198,6 +215,42 @@ impl MetalAllocator {
 
     pub fn buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn peak_bytes(&self) -> usize {
+        self.peak_offset.get()
+    }
+
+    pub fn reset_peak(&self) {
+        self.peak_offset.set(self.current_offset.get());
+    }
+
+    pub fn stats(&self) -> MetalAllocStats {
+        let current_offset = self.current_offset.get();
+        let peak_offset = self.peak_offset.get();
+        let free_list = self.free_list.borrow();
+        let free_list_bytes: usize = free_list.iter().map(|b| b.size).sum();
+        let free_blocks_count = free_list.len();
+        let active_bytes = current_offset.saturating_sub(free_list_bytes);
+        let fragmentation_ratio = if current_offset > 0 {
+            free_list_bytes as f32 / current_offset as f32
+        } else {
+            0.0
+        };
+
+        MetalAllocStats {
+            capacity_bytes: self.capacity,
+            current_offset,
+            peak_offset,
+            active_bytes,
+            free_list_bytes,
+            free_blocks_count,
+            fragmentation_ratio,
+        }
     }
 }
 
