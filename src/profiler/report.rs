@@ -62,6 +62,24 @@ impl ProfilerReport {
             profile.itl_stats.max_ms, profile.itl_stats.std_dev_ms
         );
 
+        if profile.step_timings.len() > 1 {
+            println!("┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫");
+            println!("┃  BATCH STEP LATENCY DISTRIBUTION (Step duration for multi-token emits)   ┃");
+            println!("┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫");
+            println!(
+                "┃  Mean: {:>6.2} ms  │  Median (P50): {:>6.2} ms  │  P90: {:>6.2} ms         ┃",
+                profile.step_latency_stats.mean_ms,
+                profile.step_latency_stats.median_ms,
+                profile.step_latency_stats.p90_ms
+            );
+            println!(
+                "┃  Steps:{:>6}     │  Min:          {:>6.2} ms  │  Max: {:>6.2} ms         ┃",
+                profile.step_latency_stats.count,
+                profile.step_latency_stats.min_ms,
+                profile.step_latency_stats.max_ms
+            );
+        }
+
         if let Some(ref spec) = profile.speculative {
             println!(
                 "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫"
@@ -109,6 +127,44 @@ impl ProfilerReport {
             profile.resource_diff.cpu_utilization_pct
         );
         println!("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛");
+        println!();
+
+        if let Some(ref mr) = profile.multi_run {
+            Self::print_multi_run_summary(mr);
+        }
+    }
+
+    pub fn print_multi_run_summary(summary: &crate::profiler::metrics::MultiRunSummary) {
+        println!("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓");
+        println!(
+            "┃              MULTI-RUN REPEATABILITY SUMMARY (N = {:<2} runs)              ┃",
+            summary.num_runs
+        );
+        println!("┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫");
+        println!("┃  Metric                   │    Min    │  Median   │    Max    │   StdDev ┃");
+        println!("┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┿━━━━━━━━━━━┿━━━━━━━━━━━┿━━━━━━━━━━━┿━━━━━━━━━━┫");
+        println!(
+            "┃  TTFT (ms)                │ {:>9.2} │ {:>9.2} │ {:>9.2} │ {:>8.2} ┃",
+            summary.ttft_ms_min,
+            summary.ttft_ms_median,
+            summary.ttft_ms_max,
+            summary.ttft_ms_std_dev
+        );
+        println!(
+            "┃  Decode Throughput(tok/s) │ {:>9.1} │ {:>9.1} │ {:>9.1} │ {:>8.2} ┃",
+            summary.decode_tok_s_min,
+            summary.decode_tok_s_median,
+            summary.decode_tok_s_max,
+            summary.decode_tok_s_std_dev
+        );
+        println!(
+            "┃  Total Inference (ms)     │ {:>9.2} │ {:>9.2} │ {:>9.2} │ {:>8.2} ┃",
+            summary.total_ms_min,
+            summary.total_ms_median,
+            summary.total_ms_max,
+            summary.total_ms_std_dev
+        );
+        println!("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┷━━━━━━━━━━━┷━━━━━━━━━━━┷━━━━━━━━━━━┷━━━━━━━━━━┛");
         println!();
     }
 

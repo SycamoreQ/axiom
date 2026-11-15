@@ -91,6 +91,15 @@ pub struct TokenTiming {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepTiming {
+    pub step: usize,
+    pub duration_ms: f64,
+    pub tokens_emitted: usize,
+    pub is_prefill: bool,
+    pub draft_tokens_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeculativeStats {
     pub drafted_total: usize,
     pub accepted_total: usize,
@@ -108,6 +117,23 @@ pub struct MemoryStats {
     pub metal_pool_peak_mb: Option<f64>,
     #[cfg(feature = "metal")]
     pub metal_pool_active_mb: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiRunSummary {
+    pub num_runs: usize,
+    pub ttft_ms_min: f64,
+    pub ttft_ms_median: f64,
+    pub ttft_ms_max: f64,
+    pub ttft_ms_std_dev: f64,
+    pub decode_tok_s_min: f64,
+    pub decode_tok_s_median: f64,
+    pub decode_tok_s_max: f64,
+    pub decode_tok_s_std_dev: f64,
+    pub total_ms_min: f64,
+    pub total_ms_median: f64,
+    pub total_ms_max: f64,
+    pub total_ms_std_dev: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +156,7 @@ pub struct InferenceProfile {
 
     // Detailed decode ITL distributions
     pub itl_stats: LatencyStats,
+    pub step_latency_stats: LatencyStats,
 
     // Speculative stats
     pub speculative: Option<SpeculativeStats>,
@@ -140,4 +167,9 @@ pub struct InferenceProfile {
 
     // Per-token breakdown
     pub token_timings: Vec<TokenTiming>,
+    // Per-step breakdown
+    pub step_timings: Vec<StepTiming>,
+
+    // Multi-run statistics (if multiple runs were evaluated)
+    pub multi_run: Option<MultiRunSummary>,
 }

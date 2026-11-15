@@ -8,7 +8,10 @@ use crate::model::model::LlamaModel;
 pub struct DraftModel<B: Backend> {
     model: LlamaModel<B>,
     sampler: Sampler,
-    gamma: usize,
+    pub gamma: usize,
+    pub min_gamma: usize,
+    pub max_gamma: usize,
+    pub rolling_acceptance: f32,
     pub kv_cache: Vec<(B::Tensor, B::Tensor)>,
     pub offset: usize,
 }
@@ -19,8 +22,32 @@ impl<B: Backend> DraftModel<B> {
             model,
             sampler,
             gamma,
+            min_gamma: 2,
+            max_gamma: 6,
+            rolling_acceptance: 0.8,
             kv_cache: Vec::new(),
             offset: 0,
+        }
+    }
+
+    pub fn with_gamma_bounds(mut self, min: usize, max: usize) -> Self {
+        self.min_gamma = min;
+        self.max_gamma = max;
+        self.gamma = self.gamma.clamp(min, max);
+        self
+    }
+
+    pub fn adapt_gamma(&mut self, accepted: usize, drafted: usize) {
+        if drafted == 0 {
+            return;
+        }
+        let rate = accepted as f32 / drafted as f32;
+        self.rolling_acceptance = 0.8 * self.rolling_acceptance + 0.2 * rate;
+
+        if self.rolling_acceptance >= 0.75 && accepted == drafted {
+            self.gamma = (self.gamma + 1).min(self.max_gamma);
+        } else if rate < 0.5 || self.rolling_acceptance < 0.5 {
+            self.gamma = self.gamma.saturating_sub(1).max(self.min_gamma);
         }
     }
 
@@ -74,7 +101,7 @@ impl<B: Backend> DraftModel<B> {
 
     pub fn rollback_to(&mut self, new_offset: usize) -> Result<()> {
         for (k, v) in &mut self.kv_cache {
-            if k.shape().dims().len() > 1 && k.shape().dims()[1] > new_offset {
+            if k.shape().dims().len() == 4 && k.shape().dims()[1] > new_offset {
                 *k = k.narrow(1, 0, new_offset)?;
                 *v = v.narrow(1, 0, new_offset)?;
             }
@@ -110,28 +137,48 @@ impl<B: Backend> DraftModel<B> {
         let max_seq_len = session.prompt_tokens.len() + session.max_new_tokens;
 
         for _i in 0..self.gamma {
-            let logits_tensor = self.model.forward(
-                &current_input,
-                Some(&mut self.kv_cache),
-                draft_offset,
-                max_seq_len,
-            )?;
-
-            let seq_len = logits_tensor.shape().dims()[1];
-            let last_logits_tensor = logits_tensor
-                .narrow(1, seq_len - 1, 1)?
-                .squeeze(0)?
-                .squeeze(0)?;
-
-            let last_logits_vec = last_logits_tensor.to_vec_f32()?;
-
             // Build the all-tokens list including draft tokens for repetition penalty
             let mut all_tokens = session.all_tokens();
             for (t, _) in &results {
                 all_tokens.push(*t);
             }
 
-            let next_token = self.sampler.sample(&last_logits_vec, &all_tokens);
+            let is_greedy = self.sampler.config().temperature < 1e-5;
+            let (next_token, last_logits_vec) = if is_greedy
+                && self.model.embedding.weight().device().is_metal()
+                && current_input.len() == 1
+            {
+                let (penalized, banned) = self.sampler.get_penalized_and_banned(&all_tokens);
+                let penalty = self.sampler.config().repetition_penalty;
+                let token = self.model.forward_decode_and_sample(
+                    current_input[0],
+                    Some(&mut self.kv_cache),
+                    draft_offset,
+                    max_seq_len,
+                    &penalized,
+                    penalty,
+                    &banned,
+                )?;
+                (token, Vec::new())
+            } else {
+                let logits_tensor = self.model.forward(
+                    &current_input,
+                    Some(&mut self.kv_cache),
+                    draft_offset,
+                    max_seq_len,
+                )?;
+
+                let seq_len = logits_tensor.shape().dims()[1];
+                let last_logits_tensor = logits_tensor
+                    .narrow(1, seq_len - 1, 1)?
+                    .squeeze(0)?
+                    .squeeze(0)?;
+
+                let last_logits_vec = last_logits_tensor.to_vec_f32()?;
+                let next_token = self.sampler.sample(&last_logits_vec, &all_tokens);
+                (next_token, last_logits_vec)
+            };
+
             results.push((next_token, last_logits_vec));
 
             draft_offset += current_input.len();

@@ -401,7 +401,7 @@ pub fn load_bytes_as_tensor<B: Backend>(
                 GgufDType::Q8_0 => DType::Q8_0,
                 _ => unreachable!(),
             };
-            if matches!(device, Device::Metal(_)) {
+            if device.is_metal() {
                 B::Tensor::from_quantized_bytes(data, &shape, target_dt, device)
                     .map_err(|e| LoaderError::Backend(e.to_string()))
             } else {

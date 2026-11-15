@@ -211,6 +211,16 @@ impl<B: Backend> Engine<B> {
         self.generator.tokenizer()
     }
 
+    pub fn reset(&mut self) {
+        self.batch.drain_finished();
+        self.batch.sessions.clear();
+        self.accepted_total = 0;
+        self.drafted_total = 0;
+        if let Some(ref mut draft) = self.draft_model {
+            draft.reset();
+        }
+    }
+
     #[cfg(feature = "cuda")]
     pub fn fork_session(
         &mut self,

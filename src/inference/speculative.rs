@@ -144,10 +144,12 @@ pub fn speculative_step<B: Backend>(
 where
     B::Tensor: Clone,
 {
+    let _step_span = tracing::info_span!("speculative_step", offset = session.offset).entered();
     let max_seq_len = session.prompt_tokens.len() + session.max_new_tokens;
 
     // 1. Prefill step if no tokens have been generated yet
     if session.generated_tokens.is_empty() {
+        let _prefill_span = tracing::info_span!("speculative_prefill").entered();
         let logits = target.forward(
             &session.prompt_tokens,
             Some(&mut session.kv_cache),
@@ -165,7 +167,10 @@ where
     }
 
     // 2. Draft candidate generation
-    let drafted_pairs = draft.draft(session)?;
+    let drafted_pairs = {
+        let _draft_span = tracing::info_span!("draft_generation", gamma = draft.gamma).entered();
+        draft.draft(session)?
+    };
     *drafted_total += drafted_pairs.len();
 
     if drafted_pairs.is_empty() {
@@ -196,41 +201,78 @@ where
         verify_tokens.push(*t);
     }
 
-    let target_logits_tensor = target.forward(
-        &verify_tokens,
-        Some(&mut session.kv_cache),
-        session.offset,
-        max_seq_len,
-    )?;
+    let target_logits_tensor = {
+        let _verify_span = tracing::info_span!("target_verification_forward", count = verify_tokens.len()).entered();
+        target.forward(
+            &verify_tokens,
+            Some(&mut session.kv_cache),
+            session.offset,
+            max_seq_len,
+        )?
+    };
 
     let gamma = drafted_pairs.len();
     let mut accepted_tokens: Vec<u32> = Vec::new();
     let mut rng = rand::thread_rng();
     let mut num_accepted_draft = 0;
     let mut all_accepted = true;
+    let is_greedy = target_sampler.config().temperature <= 0.0;
+
+    let vocab_size = *target_logits_tensor
+        .shape()
+        .dims()
+        .last()
+        .ok_or_else(|| crate::core::error::CoreError::Internal("empty shape".into()))?;
+    let all_logits_vec = target_logits_tensor.to_vec_f32()?;
 
     // 4. Accept / reject loop
     for i in 0..gamma {
         let (draft_token, ref draft_logits) = drafted_pairs[i];
+        let pos_logits = &all_logits_vec[i * vocab_size..(i + 1) * vocab_size];
 
-        let pos_logits = target_logits_tensor
-            .narrow(1, i, 1)?
-            .squeeze(0)?
-            .squeeze(0)?
-            .to_vec_f32()?;
-        let is_greedy = target_sampler.config().temperature <= 0.0;
-        let accept = if is_greedy {
-            let target_token = target_sampler.sample(&pos_logits, &session.all_tokens());
-            target_token == draft_token
+        let (target_token, accept) = if is_greedy {
+            let tok = target_sampler.sample(pos_logits, &session.all_tokens());
+            (tok, tok == draft_token)
         } else {
-            let p_target = Sampler::softmax(&pos_logits);
+            let mut adj_target = pos_logits.to_vec();
+            if let Some(vs) = target_sampler.config().vocab_size {
+                if adj_target.len() > vs {
+                    for v in &mut adj_target[vs..] {
+                        *v = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            if target_sampler.config().repetition_penalty != 1.0 {
+                Sampler::apply_repetition_penalty(
+                    &mut adj_target,
+                    &session.all_tokens(),
+                    target_sampler.config().repetition_penalty,
+                );
+            }
+            if let Some(n) = target_sampler.config().no_repeat_ngram_size {
+                if n >= 2 {
+                    Sampler::apply_no_repeat_ngram(
+                        &mut adj_target,
+                        &session.all_tokens(),
+                        n,
+                    );
+                }
+            }
+            if target_sampler.config().temperature != 1.0 && target_sampler.config().temperature > 0.0 {
+                let inv_temp = 1.0 / target_sampler.config().temperature;
+                for l in adj_target.iter_mut() {
+                    *l *= inv_temp;
+                }
+            }
+            let p_target = Sampler::softmax(&adj_target);
             let p_draft = Sampler::softmax(draft_logits);
             let r: f32 = rng.gen();
-            acceptance_criterion(
-                p_target[draft_token as usize],
-                p_draft[draft_token as usize],
+            let acc = acceptance_criterion(
+                p_target.get(draft_token as usize).copied().unwrap_or(0.0),
+                p_draft.get(draft_token as usize).copied().unwrap_or(0.0),
                 r,
-            )
+            );
+            (draft_token, acc)
         };
 
         if accept {
@@ -242,11 +284,41 @@ where
                 break;
             }
         } else {
-            // Rejection: sample correction token
+            // Rejection: sample correction token applying identical constraints
             let correction = if is_greedy {
-                target_sampler.sample(&pos_logits, &session.all_tokens())
+                target_token
             } else {
-                let p_target = Sampler::softmax(&pos_logits);
+                let mut adj_target = pos_logits.to_vec();
+                if let Some(vs) = target_sampler.config().vocab_size {
+                    if adj_target.len() > vs {
+                        for v in &mut adj_target[vs..] {
+                            *v = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                if target_sampler.config().repetition_penalty != 1.0 {
+                    Sampler::apply_repetition_penalty(
+                        &mut adj_target,
+                        &session.all_tokens(),
+                        target_sampler.config().repetition_penalty,
+                    );
+                }
+                if let Some(n) = target_sampler.config().no_repeat_ngram_size {
+                    if n >= 2 {
+                        Sampler::apply_no_repeat_ngram(
+                            &mut adj_target,
+                            &session.all_tokens(),
+                            n,
+                        );
+                    }
+                }
+                if target_sampler.config().temperature != 1.0 && target_sampler.config().temperature > 0.0 {
+                    let inv_temp = 1.0 / target_sampler.config().temperature;
+                    for l in adj_target.iter_mut() {
+                        *l *= inv_temp;
+                    }
+                }
+                let p_target = Sampler::softmax(&adj_target);
                 let p_draft = Sampler::softmax(draft_logits);
                 let adj = adjusted_distribution(&p_target, &p_draft);
                 target_sampler.sample(&adj, &session.all_tokens())
@@ -260,17 +332,14 @@ where
 
     // 5. Bonus token if all draft tokens accepted
     if all_accepted && !session.is_finished() {
-        let bonus_logits = target_logits_tensor
-            .narrow(1, gamma, 1)?
-            .squeeze(0)?
-            .squeeze(0)?
-            .to_vec_f32()?;
-        let bonus_token = target_sampler.sample(&bonus_logits, &session.all_tokens());
+        let bonus_logits = &all_logits_vec[gamma * vocab_size..(gamma + 1) * vocab_size];
+        let bonus_token = target_sampler.sample(bonus_logits, &session.all_tokens());
         accepted_tokens.push(bonus_token);
         session.push_token(bonus_token);
     }
 
     *accepted_total += num_accepted_draft;
+    draft.adapt_gamma(num_accepted_draft, gamma);
 
     // 6. Update KV cache states
     session.offset += 1 + num_accepted_draft;
@@ -477,5 +546,290 @@ mod tests {
         let mut session = Session::new(SessionId(0), vec![1u32, 2], 5, None);
         dec.step_to_completion(&mut session).unwrap();
         assert!(session.num_generated() <= 5);
+    }
+
+    #[test]
+    fn test_adaptive_gamma_scaling() {
+        let mut dec = make_decoder();
+        assert_eq!(dec.draft.gamma, 4);
+
+        // High acceptance step: 4 accepted out of 4 drafted -> gamma should expand
+        dec.draft.adapt_gamma(4, 4);
+        assert_eq!(dec.draft.gamma, 5);
+
+        // Another perfect step -> gamma expands up to max_gamma (6)
+        dec.draft.adapt_gamma(5, 5);
+        assert_eq!(dec.draft.gamma, 6);
+
+        // Low acceptance step: 0 accepted out of 6 drafted -> rolling acceptance drops and gamma contracts
+        dec.draft.adapt_gamma(0, 6);
+        dec.draft.adapt_gamma(0, 6);
+        assert!(dec.draft.gamma < 6);
+    }
+
+    fn run_normal_decoding<B: Backend>(
+        model: &mut LlamaModel<B>,
+        sampler: &mut Sampler,
+        prompt: &[u32],
+        max_tokens: usize,
+        eos_token_id: Option<u32>,
+    ) -> Vec<u32>
+    where
+        B::Tensor: Clone,
+    {
+        let mut session = Session::<B>::new(SessionId(0), prompt.to_vec(), max_tokens, eos_token_id);
+        let max_seq_len = prompt.len() + max_tokens;
+        let logits = model
+            .forward(prompt, Some(&mut session.kv_cache), 0, max_seq_len)
+            .unwrap();
+        session.offset = prompt.len();
+        let seq_len = logits.shape().dim(1).unwrap();
+        let last = logits
+            .narrow(1, seq_len - 1, 1)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap();
+        let logits_vec = last.to_vec_f32().unwrap();
+        let first = sampler.sample(&logits_vec, &session.all_tokens());
+        session.push_token(first);
+
+        while !session.is_finished() {
+            let last_token = *session.generated_tokens.last().unwrap();
+            let logits = model
+                .forward(
+                    &[last_token],
+                    Some(&mut session.kv_cache),
+                    session.offset,
+                    max_seq_len,
+                )
+                .unwrap();
+            session.offset += 1;
+            let last = logits.squeeze(0).unwrap().squeeze(0).unwrap();
+            let logits_vec = last.to_vec_f32().unwrap();
+            let token = sampler.sample(&logits_vec, &session.all_tokens());
+            session.push_token(token);
+        }
+        session.generated_tokens
+    }
+
+    #[test]
+    fn test_speculative_exact_parity_greedy() {
+        let config = make_config(256);
+        let mut normal_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+        let target_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+        let draft_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+
+        let prompt = vec![12u32, 34, 56];
+        let max_tokens = 15;
+
+        let mut normal_sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        });
+        let normal_tokens = run_normal_decoding(
+            &mut normal_model,
+            &mut normal_sampler,
+            &prompt,
+            max_tokens,
+            None,
+        );
+
+        let draft_sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        });
+        let target_sampler = Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            seed: Some(42),
+            ..Default::default()
+        });
+        let draft = DraftModel::new(draft_model, draft_sampler, 3);
+        let mut dec = SpeculativeDecoder::new(target_model, draft, target_sampler);
+
+        let mut spec_session = Session::new(SessionId(0), prompt.clone(), max_tokens, None);
+        let spec_tokens = dec.step_to_completion(&mut spec_session).unwrap();
+
+        assert_eq!(
+            normal_tokens, spec_tokens,
+            "Speculative decoding must match normal decoding 100% token-for-token"
+        );
+        assert_eq!(
+            dec.acceptance_rate(),
+            1.0,
+            "Identical draft model must have 100% acceptance rate"
+        );
+    }
+
+    #[test]
+    fn test_speculative_exact_parity_repetition_penalty() {
+        let config = make_config(256);
+        let mut normal_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+        let target_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+        let draft_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+
+        let prompt = vec![5u32, 10, 15, 20];
+        let max_tokens = 15;
+
+        let sampler_cfg = SamplerConfig {
+            temperature: 0.0,
+            repetition_penalty: 1.3,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let mut normal_sampler = Sampler::new(sampler_cfg.clone());
+        let normal_tokens = run_normal_decoding(
+            &mut normal_model,
+            &mut normal_sampler,
+            &prompt,
+            max_tokens,
+            None,
+        );
+
+        let draft_sampler = Sampler::new(sampler_cfg.clone());
+        let target_sampler = Sampler::new(sampler_cfg);
+        let draft = DraftModel::new(draft_model, draft_sampler, 3);
+        let mut dec = SpeculativeDecoder::new(target_model, draft, target_sampler);
+
+        let mut spec_session = Session::new(SessionId(0), prompt.clone(), max_tokens, None);
+        let spec_tokens = dec.step_to_completion(&mut spec_session).unwrap();
+
+        assert_eq!(
+            normal_tokens, spec_tokens,
+            "Speculative decoding with repetition penalty must match normal decoding 100%"
+        );
+        assert_eq!(
+            dec.acceptance_rate(),
+            1.0,
+            "Identical draft model with repetition penalty must have 100% acceptance rate"
+        );
+    }
+
+    #[test]
+    fn test_speculative_exact_parity_no_repeat_ngram() {
+        let config = make_config(256);
+        let mut normal_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+        let target_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+        let draft_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+
+        let prompt = vec![7u32, 8, 9];
+        let max_tokens = 15;
+
+        let sampler_cfg = SamplerConfig {
+            temperature: 0.0,
+            no_repeat_ngram_size: Some(2),
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let mut normal_sampler = Sampler::new(sampler_cfg.clone());
+        let normal_tokens = run_normal_decoding(
+            &mut normal_model,
+            &mut normal_sampler,
+            &prompt,
+            max_tokens,
+            None,
+        );
+
+        let draft_sampler = Sampler::new(sampler_cfg.clone());
+        let target_sampler = Sampler::new(sampler_cfg);
+        let draft = DraftModel::new(draft_model, draft_sampler, 3);
+        let mut dec = SpeculativeDecoder::new(target_model, draft, target_sampler);
+
+        let mut spec_session = Session::new(SessionId(0), prompt.clone(), max_tokens, None);
+        let spec_tokens = dec.step_to_completion(&mut spec_session).unwrap();
+
+        assert_eq!(
+            normal_tokens, spec_tokens,
+            "Speculative decoding with no-repeat ngram must match normal decoding 100%"
+        );
+        assert_eq!(
+            dec.acceptance_rate(),
+            1.0,
+            "Identical draft model with no-repeat ngram must have 100% acceptance rate"
+        );
+    }
+
+    #[test]
+    fn test_speculative_rejection_recovery_and_rollback() {
+        let config = make_config(256);
+        let target_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+
+        // Intentionally mismatched draft model with hidden_size 64 vs 64 but different seed/layer
+        let mut draft_config = config.clone();
+        draft_config.num_hidden_layers = 1; // 1 layer vs 2 layers -> different outputs!
+        let draft_model = LlamaModel::<CandleBackend>::new(&draft_config, &cpu()).unwrap();
+
+        let prompt = vec![1u32, 2, 3];
+        let max_tokens = 10;
+
+        let sampler_cfg = SamplerConfig {
+            temperature: 0.0,
+            no_repeat_ngram_size: Some(2),
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let draft_sampler = Sampler::new(sampler_cfg.clone());
+        let target_sampler = Sampler::new(sampler_cfg);
+        let draft = DraftModel::new(draft_model, draft_sampler, 4);
+        let mut dec = SpeculativeDecoder::new(target_model, draft, target_sampler);
+
+        let mut spec_session = Session::new(SessionId(0), prompt.clone(), max_tokens, None);
+        let spec_tokens = dec.step_to_completion(&mut spec_session).unwrap();
+
+        // Even with rejections, generation must complete valid tokens within max_tokens
+        assert!(!spec_tokens.is_empty());
+        assert!(spec_tokens.len() <= max_tokens);
+        // KV cache must be consistent with session offset
+        assert_eq!(spec_session.offset, prompt.len() + spec_tokens.len());
+        assert_eq!(spec_session.all_tokens().len(), prompt.len() + spec_tokens.len());
+    }
+
+    #[test]
+    fn test_speculative_eos_handling_terminates_immediately() {
+        let config = make_config(256);
+        let target_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+        let draft_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+
+        let prompt = vec![10u32, 20];
+        let max_tokens = 20;
+
+        let sampler_cfg = SamplerConfig {
+            temperature: 0.0,
+            no_repeat_ngram_size: Some(2),
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        // Determine what the first or second token would be:
+        let mut probe_model = LlamaModel::<CandleBackend>::new(&config, &cpu()).unwrap();
+        let mut probe_sampler = Sampler::new(sampler_cfg.clone());
+        let normal_tokens = run_normal_decoding(
+            &mut probe_model,
+            &mut probe_sampler,
+            &prompt,
+            max_tokens,
+            None,
+        );
+
+        // Pick a token that appears later in generation as the EOS token ID
+        let eos_id = normal_tokens[2]; // 254 (first distinct non-255 token)
+
+        let draft_sampler = Sampler::new(sampler_cfg.clone());
+        let target_sampler = Sampler::new(sampler_cfg);
+        let draft = DraftModel::new(draft_model, draft_sampler, 3);
+        let mut dec = SpeculativeDecoder::new(target_model, draft, target_sampler);
+
+        let mut spec_session = Session::new(SessionId(0), prompt.clone(), max_tokens, Some(eos_id));
+        let spec_tokens = dec.step_to_completion(&mut spec_session).unwrap();
+
+        assert!(spec_session.is_finished());
+        assert_eq!(*spec_tokens.last().unwrap(), eos_id);
+        assert_eq!(spec_tokens.len(), 3);
     }
 }

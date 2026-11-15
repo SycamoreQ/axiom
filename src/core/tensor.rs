@@ -1,10 +1,14 @@
+#[cfg(feature = "metal")]
 use crate::core::backend::MetalTensor;
+#[cfg(not(feature = "metal"))]
+pub struct MetalTensor;
 use crate::core::backend::{CandleTensor, CudarcTensor};
 use crate::core::device::Device;
 use crate::core::dtype::{DType, Element};
 use crate::core::error::{CoreError, Result};
 use crate::core::shape::Shape;
 use crate::core::tensor;
+#[cfg(feature = "metal")]
 use crate::metal::{allocator::BlockHandle, state::global_metal_state, MetalState};
 use candle_core::{self, Tensor};
 use candle_nn;
