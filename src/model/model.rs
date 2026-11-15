@@ -1,4 +1,5 @@
 use crate::core::backend::Backend;
+#[cfg(feature = "metal")]
 use crate::core::backend::MetalTensor;
 use crate::core::device::Device;
 use crate::core::dtype::DType;
@@ -108,6 +109,7 @@ impl<B: Backend> LlamaModel<B> {
         offset: usize,
         max_seq_len: usize,
     ) -> Result<B::Tensor> {
+        let _span = tracing::info_span!("model_forward", seq_len = token_ids.len(), offset = offset).entered();
         // Use the Metal fast path only for single‑token decode (seq_len == 1)
         if self.embedding.weight().device().is_metal() {
             #[cfg(feature = "metal")]
@@ -888,6 +890,7 @@ impl<B: Backend> LlamaModel<B> {
         penalty: f32,
         banned_tokens: &[u32],
     ) -> Result<u32> {
+        let _span = tracing::info_span!("forward_decode_and_sample", offset = offset).entered();
         if self.embedding.weight().device().is_metal() {
             #[cfg(feature = "metal")]
             {

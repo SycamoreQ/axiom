@@ -101,7 +101,7 @@ impl<B: Backend> DraftModel<B> {
 
     pub fn rollback_to(&mut self, new_offset: usize) -> Result<()> {
         for (k, v) in &mut self.kv_cache {
-            if k.shape().dims().len() > 1 && k.shape().dims()[1] > new_offset {
+            if k.shape().dims().len() == 4 && k.shape().dims()[1] > new_offset {
                 *k = k.narrow(1, 0, new_offset)?;
                 *v = v.narrow(1, 0, new_offset)?;
             }

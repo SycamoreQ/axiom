@@ -8,8 +8,14 @@ use crate::core::error::Result;
 use crate::core::shape::Shape;
 use crate::core::tensor::TensorOps;
 use crate::core::tensor::TopKLastDimOp;
+#[cfg(feature = "metal")]
 use crate::metal::allocator::BlockHandle;
+#[cfg(feature = "metal")]
 use crate::metal::runner::MetalRunner;
+#[cfg(not(feature = "metal"))]
+pub struct MetalRunner;
+#[cfg(not(feature = "metal"))]
+pub struct BlockHandle;
 use crate::model::config::ModelConfig;
 use crate::model::linear::Linear;
 use crate::model::moe_loss::{compute_aux_loss, AuxLossConfig, MoeLossOutput};
@@ -493,6 +499,7 @@ impl<B: Backend> LazyExpertBank<B> {
         Ok(Expert::from_weights(gate_w, up_w, down_w, idx))
     }
 
+    #[cfg(feature = "metal")]
     fn dequantize_expert_via_runner(
         &self,
         idx: ExpertIndex,
@@ -560,6 +567,7 @@ impl<B: Backend> LazyExpertBank<B> {
         Ok(Expert::from_weights(gate_w, up_w, down_w, idx))
     }
 
+    #[cfg(feature = "metal")]
     fn dequant_one(
         &self,
         meta: &QuantizedWeight,
@@ -1217,20 +1225,27 @@ impl<B: Backend> LazyMoeLayer<B> {
                 B::Tensor::from_u32_slice(&indices_u32, &Shape::new(&[indices_u32.len()]), device)?;
             let gathered = routed_input.index_select(&indices_tensor, 0)?;
 
+            #[cfg(feature = "metal")]
             let checkpoint = runner.as_deref().map(|r| r.allocator.checkpoint());
 
+            #[cfg(feature = "metal")]
             let expert = if let Some(r) = runner.as_deref_mut() {
                 self.expert_bank
                     .dequantize_expert_via_runner(ExpertIndex(*e), r)?
             } else {
                 self.expert_bank.materialize(ExpertIndex(*e))?
             };
+            #[cfg(not(feature = "metal"))]
+            let expert = self.expert_bank.materialize(ExpertIndex(*e))?;
 
+            #[cfg(feature = "metal")]
             let expert_out = if let Some(r) = runner.as_deref_mut() {
                 Self::expert_forward_via_runner(&expert, &gathered, r)?
             } else {
                 expert.forward(&gathered)?
             };
+            #[cfg(not(feature = "metal"))]
+            let expert_out = expert.forward(&gathered)?;
 
             combine::<B>(
                 &expert_out,
@@ -1240,6 +1255,7 @@ impl<B: Backend> LazyMoeLayer<B> {
                 &mut accumulator,
             )?;
 
+            #[cfg(feature = "metal")]
             if let (Some(r), Some(cp)) = (runner.as_deref_mut(), checkpoint) {
                 r.allocator.reset_to(cp);
             }
@@ -1278,6 +1294,7 @@ impl<B: Backend> LazyMoeLayer<B> {
         })
     }
 
+    #[cfg(feature = "metal")]
     fn expert_forward_via_runner(
         expert: &Expert<B>,
         gathered: &B::Tensor,

@@ -178,7 +178,7 @@ impl Sampler {
         }
     }
 
-    fn apply_repetition_penalty(logits: &mut Vec<f32>, previous: &[u32], penalty: f32) {
+    pub fn apply_repetition_penalty(logits: &mut Vec<f32>, previous: &[u32], penalty: f32) {
         let mut seen = HashSet::new();
         for &id in previous {
             if seen.insert(id) {
@@ -201,7 +201,7 @@ impl Sampler {
     // -inf) — it would recreate that exact trigram. Standard technique from
     // Holtzman et al.'s "neural text degeneration" work; same mechanism
     // HF transformers' NoRepeatNGramLogitsProcessor and llama.cpp use.
-    fn apply_no_repeat_ngram(logits: &mut [f32], previous: &[u32], ngram_size: usize) {
+    pub fn apply_no_repeat_ngram(logits: &mut [f32], previous: &[u32], ngram_size: usize) {
         let prefix_len = ngram_size - 1;
         if previous.len() < ngram_size {
             return; // not enough history yet to have completed one n-gram

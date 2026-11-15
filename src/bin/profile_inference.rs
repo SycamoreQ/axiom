@@ -22,10 +22,31 @@ fn print_usage(prog: &str) {
     println!("  --temperature <T>      Sampling temperature (default: 0.0)");
     println!("  --draft <MODEL_GGUF>   Draft model path for speculative decoding");
     println!("  --gamma <N>            Draft speculative lookahead tokens (default: 4)");
+    println!("  --warmup <N>           Number of warmup passes before profiling (default: 1)");
+    println!("  --runs <N>             Number of repeated profiling trials (default: 1)");
     println!("  --json <PATH>          Export profiling report to JSON file (for vLLM comparison)");
     println!("  --trace <PATH>         Export Chrome / Perfetto trace to file");
     println!("  --quiet, -q            Suppress streaming token text");
     println!("  --help, -h             Show this help message");
+}
+
+fn compute_stats(mut values: Vec<f64>) -> (f64, f64, f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len();
+    let min = values[0];
+    let max = values[n - 1];
+    let median = if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    };
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let var = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+    let std_dev = var.sqrt();
+    (min, median, max, mean, std_dev)
 }
 
 fn main() {
@@ -46,6 +67,8 @@ fn main() {
     let mut temperature: f32 = 0.0;
     let mut draft_path: Option<String> = None;
     let mut gamma: usize = 4;
+    let mut warmup: usize = 1;
+    let mut runs: usize = 1;
     let mut json_out: Option<String> = None;
     #[allow(unused_mut)]
     let mut trace_out: Option<String> = None;
@@ -81,6 +104,18 @@ fn main() {
             "--gamma" => {
                 if i + 1 < args.len() {
                     gamma = args[i + 1].parse().unwrap_or(4);
+                    i += 1;
+                }
+            }
+            "--warmup" => {
+                if i + 1 < args.len() {
+                    warmup = args[i + 1].parse().unwrap_or(1);
+                    i += 1;
+                }
+            }
+            "--runs" => {
+                if i + 1 < args.len() {
+                    runs = args[i + 1].parse().unwrap_or(1);
                     i += 1;
                 }
             }
@@ -155,6 +190,7 @@ fn main() {
     println!("Tokenizer:  {}", tokenizer_path);
     println!("Tokens:     target {} tokens", max_new_tokens);
     println!("Sampling:   temperature={}", temperature);
+    println!("Trials:     {} run(s) (warmup: {})", runs, warmup);
 
     #[cfg(feature = "metal")]
     let device_name = "Metal (Apple Silicon GPU)";
@@ -313,8 +349,6 @@ fn main() {
         (engine, "CPU (Candle)")
     };
 
-    let mut profiler = EngineProfiler::new(&gguf_path, device_str);
-
     // Prompt formatting & Tokenization
     let im_end_id: Option<u32> = engine
         .tokenizer()
@@ -342,93 +376,192 @@ fn main() {
         prompt.clone()
     };
 
-    let tok_start = Instant::now();
-    let prompt_tokens = engine.tokenizer().encode(
-        &formatted_prompt,
-        EncodeOptions {
-            add_bos: false,
-            add_eos: false,
-        },
-    );
-    let tok_duration = tok_start.elapsed();
-    profiler.record_tokenization(prompt_tokens.len(), tok_duration);
+    if warmup > 0 {
+        print!("Running {} warmup pass(es)... ", warmup);
+        std::io::stdout().flush().unwrap();
+        let w_start = Instant::now();
+        for _ in 0..warmup {
+            let session_id = engine
+                .submit_text(
+                    &formatted_prompt,
+                    max_new_tokens,
+                    EncodeOptions {
+                        add_bos: false,
+                        add_eos: false,
+                    },
+                )
+                .expect("failed to submit warmup prompt");
 
-    let session_id = engine
-        .submit_text(
+            let mut w_generated = 0;
+            loop {
+                let results = engine.step().expect("warmup step failed");
+                let mut should_stop = false;
+                for (sid, token) in &results {
+                    if *sid == session_id {
+                        let t = *token as u32;
+                        w_generated += 1;
+                        if Some(t) == im_end_id || Some(t) == eot_id || Some(t) == eos_id {
+                            should_stop = true;
+                            break;
+                        }
+                    }
+                }
+                if should_stop
+                    || engine.batch.active_sessions().is_empty()
+                    || w_generated >= max_new_tokens
+                {
+                    break;
+                }
+            }
+            engine.reset();
+        }
+        println!("done in {:.2}ms", w_start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let mut profiles: Vec<axiom::profiler::InferenceProfile> = Vec::new();
+
+    for r in 0..runs {
+        if runs > 1 && !quiet {
+            println!("\n>>> Trial {} / {} <<<", r + 1, runs);
+        }
+
+        let mut profiler = EngineProfiler::new(&gguf_path, device_str);
+
+        let tok_start = Instant::now();
+        let prompt_tokens = engine.tokenizer().encode(
             &formatted_prompt,
-            max_new_tokens,
             EncodeOptions {
                 add_bos: false,
                 add_eos: false,
             },
-        )
-        .expect("failed to submit prompt");
+        );
+        let tok_duration = tok_start.elapsed();
+        profiler.record_tokenization(prompt_tokens.len(), tok_duration);
 
-    if !quiet {
-        println!();
-        println!("Prompt: \"{}\"", prompt);
-        println!("Output Generation:");
-        print!("  ");
-        std::io::stdout().flush().unwrap();
-    }
+        let session_id = engine
+            .submit_text(
+                &formatted_prompt,
+                max_new_tokens,
+                EncodeOptions {
+                    add_bos: false,
+                    add_eos: false,
+                },
+            )
+            .expect("failed to submit prompt");
 
-    let mut steps = 0;
-    let mut stop_reason = None;
+        if !quiet && (runs == 1 || r == 0) {
+            println!();
+            println!("Prompt: \"{}\"", prompt);
+            println!("Output Generation:");
+            print!("  ");
+            std::io::stdout().flush().unwrap();
+        }
 
-    loop {
-        profiler.start_step();
-        let results = engine.step().expect("step failed");
+        let mut total_generated = 0;
+        let mut stop_reason = None;
 
-        for (sid, token) in &results {
-            if *sid == session_id {
-                let t = *token as u32;
-                let text = engine.tokenizer().decode(&[*token as usize]);
-                if !quiet {
-                    print!("{}", text);
-                    std::io::stdout().flush().unwrap();
+        loop {
+            profiler.start_step();
+            let results = engine.step().expect("step failed");
+
+            let mut step_tokens = Vec::new();
+            for (sid, token) in &results {
+                if *sid == session_id {
+                    let t = *token as u32;
+                    let text = engine.tokenizer().decode(&[*token as usize]);
+                    if !quiet && (runs == 1 || r == 0) {
+                        print!("{}", text);
+                        std::io::stdout().flush().unwrap();
+                    }
+
+                    step_tokens.push((*token, text));
+                    total_generated += 1;
+
+                    if Some(t) == im_end_id || Some(t) == eot_id || Some(t) == eos_id {
+                        stop_reason = Some("EOS / Stop Token");
+                        break;
+                    }
                 }
+            }
 
-                profiler.end_step(*token, text, None);
-                steps += 1;
+            if !step_tokens.is_empty() {
+                profiler.record_batch_step(&step_tokens, None);
+            }
 
-                if Some(t) == im_end_id || Some(t) == eot_id || Some(t) == eos_id {
-                    stop_reason = Some("EOS / Stop Token");
-                    break;
+            if stop_reason.is_some()
+                || engine.batch.active_sessions().is_empty()
+                || total_generated >= max_new_tokens
+            {
+                if !quiet && (runs == 1 || r == 0) {
+                    if let Some(reason) = stop_reason {
+                        println!("\n  [{}]", reason);
+                    }
                 }
+                break;
             }
         }
 
-        if stop_reason.is_some()
-            || engine.batch.active_sessions().is_empty()
-            || steps >= max_new_tokens
-        {
-            if !quiet {
-                if let Some(reason) = stop_reason {
-                    println!("\n  [{}]", reason);
-                }
-            }
-            break;
-        }
+        let speculative_stats = if engine.draft_model().is_some() {
+            Some(axiom::profiler::metrics::SpeculativeStats {
+                drafted_total: engine.drafted_total,
+                accepted_total: engine.accepted_total,
+                acceptance_rate_pct: (engine.acceptance_rate() * 100.0) as f64,
+            })
+        } else {
+            None
+        };
+
+        let profile = profiler.finish(speculative_stats);
+        profiles.push(profile);
+        engine.reset();
     }
 
-    let speculative_stats = if engine.draft_model().is_some() {
-        Some(axiom::profiler::metrics::SpeculativeStats {
-            drafted_total: engine.drafted_total,
-            accepted_total: engine.accepted_total,
-            acceptance_rate_pct: (engine.acceptance_rate() * 100.0) as f64,
-        })
+    let final_profile = if runs > 1 {
+        let ttfts: Vec<f64> = profiles.iter().map(|p| p.ttft_ms).collect();
+        let decode_tok_s: Vec<f64> = profiles.iter().map(|p| p.decode_throughput_tok_s).collect();
+        let total_times: Vec<f64> = profiles.iter().map(|p| p.total_inference_time_ms).collect();
+
+        let (ttft_min, ttft_med, ttft_max, _, ttft_sd) = compute_stats(ttfts);
+        let (dec_min, dec_med, dec_max, _, dec_sd) = compute_stats(decode_tok_s);
+        let (tot_min, tot_med, tot_max, _, tot_sd) = compute_stats(total_times);
+
+        let summary = axiom::profiler::metrics::MultiRunSummary {
+            num_runs: runs,
+            ttft_ms_min: ttft_min,
+            ttft_ms_median: ttft_med,
+            ttft_ms_max: ttft_max,
+            ttft_ms_std_dev: ttft_sd,
+            decode_tok_s_min: dec_min,
+            decode_tok_s_median: dec_med,
+            decode_tok_s_max: dec_max,
+            decode_tok_s_std_dev: dec_sd,
+            total_ms_min: tot_min,
+            total_ms_median: tot_med,
+            total_ms_max: tot_max,
+            total_ms_std_dev: tot_sd,
+        };
+
+        // Pick median run based on decode_throughput_tok_s closest to dec_med
+        let mut sorted_profiles = profiles;
+        sorted_profiles.sort_by(|a, b| {
+            let diff_a = (a.decode_throughput_tok_s - dec_med).abs();
+            let diff_b = (b.decode_throughput_tok_s - dec_med).abs();
+            diff_a.partial_cmp(&diff_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut med_profile = sorted_profiles.into_iter().next().unwrap();
+        med_profile.multi_run = Some(summary);
+        med_profile
     } else {
-        None
+        profiles.into_iter().next().unwrap()
     };
 
-    let profile = profiler.finish(speculative_stats);
-
     // Print the full structured report
-    ProfilerReport::print_summary(&profile);
+    ProfilerReport::print_summary(&final_profile);
 
     // Save JSON if requested
     if let Some(ref json_path) = json_out {
-        if let Err(e) = ProfilerReport::export_json(&profile, json_path) {
+        if let Err(e) = ProfilerReport::export_json(&final_profile, json_path) {
             eprintln!("Failed to export JSON report to {}: {}", json_path, e);
         } else {
             println!("Exported profile report to JSON: {}", json_path);
