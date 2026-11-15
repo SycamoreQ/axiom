@@ -624,6 +624,82 @@ impl<'a> MetalRunner<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_decode(
+        &self,
+        q: &MetalTensor,
+        k_cache: &MetalTensor,
+        v_cache: &MetalTensor,
+        out: &MetalTensor,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+    ) -> Result<()> {
+        let mut block_q = (*q.block()).clone();
+        block_q.offset_bytes += q.metal_offset();
+        let mut block_k = (*k_cache.block()).clone();
+        block_k.offset_bytes += k_cache.metal_offset();
+        let mut block_v = (*v_cache.block()).clone();
+        block_v.offset_bytes += v_cache.metal_offset();
+        let mut block_out = (*out.block()).clone();
+        block_out.offset_bytes += out.metal_offset();
+
+        match (q.metal_dtype(), k_cache.metal_dtype()) {
+            (DType::F32, DType::F16) => {
+                self.state.kernels.attention_decode_f32_kv_f16(
+                    &self.encoder,
+                    self.allocator,
+                    &block_q,
+                    &block_k,
+                    &block_v,
+                    &block_out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cache_len,
+                )?;
+            }
+            (DType::F16, DType::F16) => {
+                self.state.kernels.attention_decode_f16(
+                    &self.encoder,
+                    self.allocator,
+                    &block_q,
+                    &block_k,
+                    &block_v,
+                    &block_out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cache_len,
+                )?;
+            }
+            (DType::F32, DType::F32) => {
+                self.state.kernels.attention_decode_f32(
+                    &self.encoder,
+                    self.allocator,
+                    &block_q,
+                    &block_k,
+                    &block_v,
+                    &block_out,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cache_len,
+                )?;
+            }
+            _ => {
+                return Err(MetalError::Internal(format!(
+                    "attention_decode: unsupported dtype combination: Q={:?}, KV={:?}",
+                    q.metal_dtype(),
+                    k_cache.metal_dtype()
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn swiglu(
         &self,
         gate: &MetalTensor,
@@ -686,8 +762,8 @@ impl<'a> MetalRunner<'a> {
         head_dim: u32,
         write_len: u32,
     ) -> Result<()> {
-        match src.metal_dtype() {
-            DType::F32 => self.state.kernels.cache_write_f32(
+        match (src.metal_dtype(), cache.metal_dtype()) {
+            (DType::F32, DType::F32) => self.state.kernels.cache_write_f32(
                 &self.encoder,
                 self.allocator,
                 src.block(),
@@ -697,7 +773,7 @@ impl<'a> MetalRunner<'a> {
                 head_dim,
                 write_len,
             )?,
-            DType::F16 => self.state.kernels.cache_write_f16(
+            (DType::F16, DType::F16) => self.state.kernels.cache_write_f16(
                 &self.encoder,
                 self.allocator,
                 src.block(),
@@ -707,7 +783,24 @@ impl<'a> MetalRunner<'a> {
                 head_dim,
                 write_len,
             )?,
-            _ => return Err(MetalError::Internal("cache_write: unsupported dtype".into()).into()),
+            (DType::F32, DType::F16) => self.state.kernels.cache_write_f32_to_f16(
+                &self.encoder,
+                self.allocator,
+                src.block(),
+                cache.block(),
+                write_pos,
+                n_kv_heads,
+                head_dim,
+                write_len,
+            )?,
+            _ => {
+                return Err(MetalError::Internal(format!(
+                    "cache_write: unsupported dtype combination: src={:?}, cache={:?}",
+                    src.metal_dtype(),
+                    cache.metal_dtype()
+                ))
+                .into())
+            }
         }
         Ok(())
     }

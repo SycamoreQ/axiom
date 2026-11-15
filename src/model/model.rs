@@ -445,8 +445,8 @@ impl<B: Backend> LlamaModel<B> {
                     // called directly with no prior prefill). Allocate the
                     // full max_seq_len buffer up front.
                     let cache_shape = Shape::new(&[max_seq_len, n_kv_heads, head_dim]);
-                    let k_persist = B::Tensor::zeros(&cache_shape, x.dtype(), x.device())?;
-                    let v_persist = B::Tensor::zeros(&cache_shape, x.dtype(), x.device())?;
+                    let k_persist = B::Tensor::zeros(&cache_shape, DType::F16, x.device())?;
+                    let v_persist = B::Tensor::zeros(&cache_shape, DType::F16, x.device())?;
                     cache.push((k_persist, v_persist));
                 } else if cache[i].0.shape().dims()[0] != max_seq_len {
                     // Cache exists but is still the tightly-sized
@@ -457,8 +457,8 @@ impl<B: Backend> LlamaModel<B> {
                     // instead of reallocating on every call.
                     let filled_len = offset;
                     let cache_shape = Shape::new(&[max_seq_len, n_kv_heads, head_dim]);
-                    let k_persist = B::Tensor::zeros(&cache_shape, x.dtype(), x.device())?;
-                    let v_persist = B::Tensor::zeros(&cache_shape, x.dtype(), x.device())?;
+                    let k_persist = B::Tensor::zeros(&cache_shape, DType::F16, x.device())?;
+                    let v_persist = B::Tensor::zeros(&cache_shape, DType::F16, x.device())?;
                     if filled_len > 0 {
                         let (old_k, old_v) = &cache[i];
                         let old_k_flat =
@@ -524,70 +524,59 @@ impl<B: Backend> LlamaModel<B> {
                 Some(cache) => (&cache[i].0, &cache[i].1),
                 None => (&k_flat, &v_flat),
             };
-            let cache_len = match &kv_cache {
-                Some(_) => (offset + seq_len) as u32,
-                None => seq_len as u32,
-            };
 
             // One shared output buffer for the whole batch of query positions --
-            // attention_pv writes directly into row p via narrow(0, p, 1) instead of
-            // each position getting its own tiny allocation that then has to be
-            // reassembled.
+            // FlashDecoding writes directly into row p via narrow(0, p, 1) during prefill,
+            // or directly into attn_out_all during single-token decode.
             let attn_out_all = B::Tensor::uninit_pooled(
                 &Shape::new(&[seq_len, n_heads, head_dim]),
                 x.dtype(),
                 x.device(),
             )?;
 
-            for p in 0..seq_len {
-                // No .squeeze() here -- narrow() alone correctly accumulates the
-                // view's byte offset (row p's position within q_rope); squeeze/reshape
-                // would reset that offset back to 0 (see new_contiguous). The kernel
-                // only cares about the flat memory layout, not the tensor's declared
-                // rank, so the leftover size-1 dims are harmless.
-                let q_p = q_rope.narrow(1, p, 1)?;
-                let current_pos = (offset + p) as u32;
-                let scores = B::Tensor::uninit_pooled(
-                    &Shape::new(&[n_heads, cache_len as usize]),
-                    x.dtype(),
-                    x.device(),
-                )?;
-
-                runner.attention_qk(
-                    q_p.as_metal()
-                        .ok_or_else(|| CoreError::Internal("q_p not Metal".into()))?,
+            if seq_len == 1 {
+                let valid_len = (offset + 1) as u32;
+                runner.attention_decode(
+                    q_rope
+                        .as_metal()
+                        .ok_or_else(|| CoreError::Internal("q_rope not Metal".into()))?,
                     k_for_attn
                         .as_metal()
                         .ok_or_else(|| CoreError::Internal("k_for_attn not Metal".into()))?,
-                    scores
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
-                    n_heads as u32,
-                    n_kv_heads as u32,
-                    head_dim as u32,
-                    cache_len,
-                    current_pos,
-                )?;
-
-                // Same deal: narrow (no squeeze) so attention_pv writes into row p of
-                // the shared buffer instead of a fresh allocation.
-                let attn_out_p = attn_out_all.narrow(0, p, 1)?;
-                runner.attention_pv(
-                    scores
-                        .as_metal()
-                        .ok_or_else(|| CoreError::Internal("scores not Metal".into()))?,
                     v_for_attn
                         .as_metal()
                         .ok_or_else(|| CoreError::Internal("v_for_attn not Metal".into()))?,
-                    attn_out_p
+                    attn_out_all
                         .as_metal()
-                        .ok_or_else(|| CoreError::Internal("attn_out_p not Metal".into()))?,
+                        .ok_or_else(|| CoreError::Internal("attn_out_all not Metal".into()))?,
                     n_heads as u32,
                     n_kv_heads as u32,
-                    cache_len,
                     head_dim as u32,
-                    current_pos,
+                    valid_len,
                 )?;
+            } else {
+                for p in 0..seq_len {
+                    let q_p = q_rope.narrow(1, p, 1)?;
+                    let valid_len = (offset + p + 1) as u32;
+                    let attn_out_p = attn_out_all.narrow(0, p, 1)?;
+                    runner.attention_decode(
+                        q_p.as_metal()
+                            .ok_or_else(|| CoreError::Internal("q_p not Metal".into()))?,
+                        k_for_attn
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("k_for_attn not Metal".into()))?,
+                        v_for_attn
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("v_for_attn not Metal".into()))?,
+                        attn_out_p
+                            .as_metal()
+                            .ok_or_else(|| CoreError::Internal("attn_out_p not Metal".into()))?,
+                        n_heads as u32,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        valid_len,
+                    )?;
+                }
             }
 
             let attn_reshaped =
