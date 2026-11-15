@@ -41,6 +41,7 @@ const GEMV_Q8_0_MSL: &str = include_str!("kernels/gemv_q8_0.metal");
 const ATTN_DECODE_MSL: &str = include_str!("kernels/attention_decode.metal");
 const ADD_RMS_NORM_MSL: &str = include_str!("kernels/add_rms_norm.metal");
 const ROPE_CACHE_WRITE_MSL: &str = include_str!("kernels/rope_cache_write.metal");
+const ARGMAX_MSL: &str = include_str!("kernels/argmax.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -77,6 +78,8 @@ pub struct MetalKernels {
     pub cache_write_f32_to_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub add_rms_norm_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rope_cache_write_f32_to_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub argmax_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub apply_penalties_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -165,6 +168,8 @@ impl MetalKernels {
                 ROPE_CACHE_WRITE_MSL,
                 "rope_cache_write_f32_to_f16",
             )?,
+            argmax_f32_pipeline: build_pipeline(ARGMAX_MSL, "argmax_f32")?,
+            apply_penalties_f32_pipeline: build_pipeline(ARGMAX_MSL, "apply_penalties_f32")?,
         })
     }
 
@@ -1655,6 +1660,151 @@ impl MetalKernels {
         };
         let threadgroup = MTLSize {
             width: 32,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        Ok(())
+    }
+
+    pub fn apply_penalties_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        logits: &BlockHandle,
+        penalized_tokens: &[u32],
+        penalty: f32,
+        banned_tokens: &[u32],
+        vocab_size: u32,
+    ) -> Result<()> {
+        let num_penalized = penalized_tokens.len() as u32;
+        let num_banned = banned_tokens.len() as u32;
+        let total_threads = (num_penalized + num_banned) as usize;
+        if total_threads == 0 {
+            return Ok(());
+        }
+
+        encoder.setComputePipelineState(&self.apply_penalties_f32_pipeline);
+
+        let dummy: u32 = 0;
+        let pen_ptr = if !penalized_tokens.is_empty() {
+            penalized_tokens.as_ptr()
+        } else {
+            &dummy as *const u32
+        };
+        let pen_len = if !penalized_tokens.is_empty() {
+            penalized_tokens.len() * std::mem::size_of::<u32>()
+        } else {
+            std::mem::size_of::<u32>()
+        };
+
+        let ban_ptr = if !banned_tokens.is_empty() {
+            banned_tokens.as_ptr()
+        } else {
+            &dummy as *const u32
+        };
+        let ban_len = if !banned_tokens.is_empty() {
+            banned_tokens.len() * std::mem::size_of::<u32>()
+        } else {
+            std::mem::size_of::<u32>()
+        };
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(logits.metal_buffer(allocator)),
+                logits.offset_bytes,
+                0,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(pen_ptr as *mut c_void),
+                pen_len,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&penalty as *const f32 as *mut c_void),
+                std::mem::size_of::<f32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&num_penalized as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(ban_ptr as *mut c_void),
+                ban_len,
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&num_banned as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&vocab_size as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                6,
+            );
+        }
+
+        let grid = MTLSize {
+            width: total_threads,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: total_threads.min(256),
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        Ok(())
+    }
+
+    pub fn argmax_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        logits: &BlockHandle,
+        output_idx: &BlockHandle,
+        num_rows: u32,
+        vocab_size: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.argmax_f32_pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(logits.metal_buffer(allocator)),
+                logits.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(output_idx.metal_buffer(allocator)),
+                output_idx.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&vocab_size as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+        }
+
+        let grid = MTLSize {
+            width: 1,
+            height: num_rows as usize,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 256,
             height: 1,
             depth: 1,
         };
@@ -3801,5 +3951,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_argmax_f32_execution() {
+        let (ctx, alloc, kernels) = setup();
+
+        let vocab_size = 128256;
+        let mut logits = vec![0.0f32; vocab_size];
+        for i in 0..vocab_size {
+            logits[i] = (i as f32 * 0.001).sin();
+        }
+        let target_max_idx = 42137;
+        logits[target_max_idx] = 999.0;
+
+        let logits_block = alloc.alloc(vocab_size * 4, 16).unwrap();
+        let out_block = alloc.alloc(4, 16).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                logits.as_ptr() as *const u8,
+                logits_block.ptr,
+                vocab_size * 4,
+            );
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .argmax_f32(
+                &encoder,
+                &alloc,
+                &logits_block,
+                &out_block,
+                1,
+                vocab_size as u32,
+            )
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut got_idx = 0u32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(out_block.ptr, &mut got_idx as *mut u32 as *mut u8, 4);
+        }
+
+        assert_eq!(got_idx, target_max_idx as u32);
+    }
+
+    #[test]
+    fn test_apply_penalties_and_argmax_f32_execution() {
+        let (ctx, alloc, kernels) = setup();
+
+        let vocab_size = 1000;
+        let mut logits = vec![1.0f32; vocab_size];
+        let original_winner = 100;
+        let second_winner = 200;
+        logits[original_winner] = 10.0;
+        logits[second_winner] = 8.0;
+
+        let penalized = vec![original_winner as u32];
+        let banned = vec![];
+
+        let logits_block = alloc.alloc(vocab_size * 4, 16).unwrap();
+        let out_block = alloc.alloc(4, 16).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                logits.as_ptr() as *const u8,
+                logits_block.ptr,
+                vocab_size * 4,
+            );
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .apply_penalties_f32(
+                &encoder,
+                &alloc,
+                &logits_block,
+                &penalized,
+                2.0,
+                &banned,
+                vocab_size as u32,
+            )
+            .unwrap();
+        kernels
+            .argmax_f32(
+                &encoder,
+                &alloc,
+                &logits_block,
+                &out_block,
+                1,
+                vocab_size as u32,
+            )
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut got_idx = 0u32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(out_block.ptr, &mut got_idx as *mut u32 as *mut u8, 4);
+        }
+
+        assert_eq!(got_idx, second_winner as u32);
     }
 }

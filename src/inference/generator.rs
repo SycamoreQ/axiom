@@ -45,21 +45,45 @@ impl<B: Backend> Generator<B> {
     pub fn step(&mut self, session: &mut Session<B>) -> Result<u32, GeneratorError> {
         let session_tokens = session.next_input_tokens().to_vec();
         let max_seq_len = session.prompt_tokens.len() + session.max_new_tokens;
-        let logits = self.model.forward(
-            &session_tokens,
-            Some(&mut session.kv_cache),
-            session.offset,
-            max_seq_len,
-        )?;
 
-        session.offset += session_tokens.len();
+        if session_tokens.is_empty() {
+            session.status = SessionStatus::Finished;
+            return Err(GeneratorError::SessionFinished);
+        }
 
-        let seq_len: usize = logits.shape().dim(1)?;
-        let last_token_logits = logits.narrow(1, seq_len - 1, 1)?;
-        let flattened_logits = last_token_logits.squeeze(0)?.squeeze(0)?;
-        let logits_vec: Vec<f32> = flattened_logits.to_vec_f32()?;
+        let is_greedy = self.sampler.config().temperature < 1e-5;
 
-        let next_token = self.sampler.sample(&logits_vec, &session.all_tokens());
+        let next_token = if session_tokens.len() == 1 && is_greedy {
+            let (penalized, banned) = self.sampler.get_penalized_and_banned(&session.all_tokens());
+            let penalty = self.sampler.config().repetition_penalty;
+            let token = self.model.forward_decode_and_sample(
+                session_tokens[0],
+                Some(&mut session.kv_cache),
+                session.offset,
+                max_seq_len,
+                &penalized,
+                penalty,
+                &banned,
+            )?;
+            session.offset += 1;
+            token
+        } else {
+            let logits = self.model.forward(
+                &session_tokens,
+                Some(&mut session.kv_cache),
+                session.offset,
+                max_seq_len,
+            )?;
+
+            session.offset += session_tokens.len();
+
+            let seq_len: usize = logits.shape().dim(1)?;
+            let last_token_logits = logits.narrow(1, seq_len - 1, 1)?;
+            let flattened_logits = last_token_logits.squeeze(0)?.squeeze(0)?;
+            let logits_vec: Vec<f32> = flattened_logits.to_vec_f32()?;
+
+            self.sampler.sample(&logits_vec, &session.all_tokens())
+        };
 
         session.push_token(next_token);
         Ok(next_token)

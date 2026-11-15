@@ -872,6 +872,45 @@ impl<'a> MetalRunner<'a> {
         Ok(())
     }
 
+    pub fn sample_argmax(
+        &self,
+        logits: &MetalTensor,
+        output_token: &MetalTensor,
+        penalized_tokens: &[u32],
+        penalty: f32,
+        banned_tokens: &[u32],
+    ) -> Result<()> {
+        let shape = logits.metal_shape();
+        let vocab_size = *shape
+            .dims()
+            .last()
+            .ok_or_else(|| MetalError::Internal("empty shape".into()))? as u32;
+        let num_rows = (shape.numel() / vocab_size as usize) as u32;
+
+        if penalty != 1.0 || !banned_tokens.is_empty() {
+            self.state.kernels.apply_penalties_f32(
+                &self.encoder,
+                self.allocator,
+                logits.block(),
+                penalized_tokens,
+                penalty,
+                banned_tokens,
+                vocab_size,
+            )?;
+        }
+
+        self.state.kernels.argmax_f32(
+            &self.encoder,
+            self.allocator,
+            logits.block(),
+            output_token.block(),
+            num_rows,
+            vocab_size,
+        )?;
+
+        Ok(())
+    }
+
     pub fn free_tensor(&self, t: &MetalTensor) {
         let block = t.block();
         let handle = BlockHandle {
@@ -882,6 +921,12 @@ impl<'a> MetalRunner<'a> {
             owned_buffer: block.owned_buffer.clone(),
         };
         self.allocator.free(handle);
+    }
+
+    pub fn commit_async(self) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        self.encoder.endEncoding();
+        self.cmd_buf.commit();
+        Ok(self.cmd_buf)
     }
 
     pub fn finish(self) -> Result<()> {
