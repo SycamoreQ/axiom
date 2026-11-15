@@ -23,6 +23,12 @@ pub struct LlamaModel<B: Backend> {
     pub metal_lm_head_weight: Option<B::Tensor>,
 }
 
+#[derive(Debug)]
+pub enum ForwardResult<T> {
+    Logits(T),
+    Token(u32),
+}
+
 impl<B: Backend> LlamaModel<B> {
     pub fn new(config: &ModelConfig, device: &Device) -> Result<Self> {
         let embedding = Embedding::new(B::Tensor::zeros(
@@ -176,10 +182,25 @@ impl<B: Backend> LlamaModel<B> {
     fn forward_metal(
         &mut self,
         token_ids: &[u32],
-        mut kv_cache: Option<&mut Vec<(B::Tensor, B::Tensor)>>,
+        kv_cache: Option<&mut Vec<(B::Tensor, B::Tensor)>>,
         offset: usize,
         max_seq_len: usize,
     ) -> Result<B::Tensor> {
+        match self.forward_metal_internal(token_ids, kv_cache, offset, max_seq_len, None)? {
+            ForwardResult::Logits(t) => Ok(t),
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn forward_metal_internal(
+        &mut self,
+        token_ids: &[u32],
+        mut kv_cache: Option<&mut Vec<(B::Tensor, B::Tensor)>>,
+        offset: usize,
+        max_seq_len: usize,
+        sample_params: Option<(&[u32], f32, &[u32])>,
+    ) -> Result<ForwardResult<B::Tensor>> {
         use std::eprintln;
 
         use crate::core::tensor::TensorOps;
@@ -788,30 +809,130 @@ impl<B: Backend> LlamaModel<B> {
         }
 
         let final_2d = final_norm.reshape(&Shape::new(&[seq_len, hidden]))?;
-        let logits_2d = B::Tensor::zeros(
-            &Shape::new(&[seq_len, self.config.vocab_size]),
-            x.dtype(),
-            x.device(),
-        )?;
         let lm_weight = self.metal_lm_head_weight.as_ref().ok_or_else(|| {
             CoreError::Internal("metal weights not prepared — call model.prepare_metal()".into())
         })?;
-        runner.broadcast_matmul(
-            final_2d
-                .as_metal()
-                .ok_or_else(|| CoreError::Internal("final_2d not Metal".into()))?,
-            lm_weight
-                .as_metal()
-                .ok_or_else(|| CoreError::Internal("lm_weight not Metal".into()))?,
-            logits_2d
-                .as_metal()
-                .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
-        )?;
 
-        runner.finish()?;
+        if let Some((penalized_tokens, penalty, banned_tokens)) = sample_params {
+            let logits_2d = B::Tensor::uninit_pooled(
+                &Shape::new(&[seq_len, self.config.vocab_size]),
+                x.dtype(),
+                x.device(),
+            )?;
+            runner.broadcast_matmul(
+                final_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("final_2d not Metal".into()))?,
+                lm_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("lm_weight not Metal".into()))?,
+                logits_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
+            )?;
 
-        let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
-        Ok(logits)
+            let token_out = B::Tensor::zeros(
+                &Shape::new(&[1]),
+                DType::U32,
+                x.device(),
+            )?;
+
+            runner.sample_argmax(
+                logits_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
+                token_out
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("token_out not Metal".into()))?,
+                penalized_tokens,
+                penalty,
+                banned_tokens,
+            )?;
+
+            runner.finish()?;
+
+            let next_token = token_out.to_vec_u32()?[0];
+            Ok(ForwardResult::Token(next_token))
+        } else {
+            let logits_2d = B::Tensor::zeros(
+                &Shape::new(&[seq_len, self.config.vocab_size]),
+                x.dtype(),
+                x.device(),
+            )?;
+            runner.broadcast_matmul(
+                final_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("final_2d not Metal".into()))?,
+                lm_weight
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("lm_weight not Metal".into()))?,
+                logits_2d
+                    .as_metal()
+                    .ok_or_else(|| CoreError::Internal("logits_2d not Metal".into()))?,
+            )?;
+
+            runner.finish()?;
+
+            let logits = logits_2d.reshape(&Shape::new(&[1, seq_len, self.config.vocab_size]))?;
+            Ok(ForwardResult::Logits(logits))
+        }
+    }
+
+    pub fn forward_decode_and_sample(
+        &mut self,
+        token_id: u32,
+        kv_cache: Option<&mut Vec<(B::Tensor, B::Tensor)>>,
+        offset: usize,
+        max_seq_len: usize,
+        penalized_tokens: &[u32],
+        penalty: f32,
+        banned_tokens: &[u32],
+    ) -> Result<u32> {
+        if self.embedding.weight().device().is_metal() {
+            #[cfg(feature = "metal")]
+            {
+                match self.forward_metal_internal(
+                    &[token_id],
+                    kv_cache,
+                    offset,
+                    max_seq_len,
+                    Some((penalized_tokens, penalty, banned_tokens)),
+                )? {
+                    ForwardResult::Token(tok) => return Ok(tok),
+                    _ => unreachable!(),
+                }
+            }
+            #[cfg(not(feature = "metal"))]
+            return Err(CoreError::Internal("Metal feature not enabled".into()));
+        }
+
+        let logits = self.forward(&[token_id], kv_cache, offset, max_seq_len)?;
+        let mut logits_vec = logits.to_vec_f32()?;
+        if penalty != 1.0 {
+            for &t in penalized_tokens {
+                let idx = t as usize;
+                if idx < logits_vec.len() {
+                    if logits_vec[idx] > 0.0 {
+                        logits_vec[idx] /= penalty;
+                    } else {
+                        logits_vec[idx] *= penalty;
+                    }
+                }
+            }
+        }
+        for &t in banned_tokens {
+            let idx = t as usize;
+            if idx < logits_vec.len() {
+                logits_vec[idx] = f32::NEG_INFINITY;
+            }
+        }
+        let best = logits_vec
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+        Ok(best)
     }
 
     pub fn set_tensor(

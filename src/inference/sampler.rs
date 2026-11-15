@@ -56,6 +56,39 @@ impl Sampler {
         &self.config
     }
 
+    pub fn get_penalized_and_banned(&self, previous_tokens: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        let mut penalized = Vec::new();
+        if self.config.repetition_penalty != 1.0 {
+            let mut seen = HashSet::new();
+            for &id in previous_tokens {
+                if seen.insert(id) {
+                    penalized.push(id);
+                }
+            }
+        }
+
+        let mut banned = Vec::new();
+        if let Some(ngram_size) = self.config.no_repeat_ngram_size {
+            if ngram_size >= 2 && previous_tokens.len() >= ngram_size {
+                let prefix_len = ngram_size - 1;
+                let mut following: std::collections::HashMap<&[u32], HashSet<u32>> =
+                    std::collections::HashMap::new();
+                for window in previous_tokens.windows(ngram_size) {
+                    let prefix = &window[..prefix_len];
+                    let next = window[prefix_len];
+                    following.entry(prefix).or_default().insert(next);
+                }
+
+                let current_prefix = &previous_tokens[previous_tokens.len() - prefix_len..];
+                if let Some(banned_set) = following.get(current_prefix) {
+                    banned = banned_set.iter().copied().collect();
+                }
+            }
+        }
+
+        (penalized, banned)
+    }
+
     pub fn sample(&mut self, logits: &[f32], previous_tokens: &[u32]) -> u32 {
         let mut logits_vec = logits.to_vec();
 
