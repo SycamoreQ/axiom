@@ -7,6 +7,11 @@ use crate::inference::session::Session;
 use crate::model::model::LlamaModel;
 use rand::Rng;
 
+#[cfg(feature = "metal")]
+use crate::metal::runner::MetalRunner;
+#[cfg(feature = "metal")]
+use crate::metal::state::global_metal_state;
+
 //Accept or reject a draft token using the speculative sampling criterion.
 pub fn acceptance_criterion(p_target: f32, p_draft: f32, r: f32) -> bool {
     if p_draft <= 0.0 {
@@ -208,29 +213,63 @@ where
     let mut rng = rand::thread_rng();
     let mut num_accepted_draft = 0;
     let mut all_accepted = true;
+    let is_greedy = target_sampler.config().temperature <= 0.0;
+
+    #[cfg(feature = "metal")]
+    let gpu_predicted = if is_greedy && target_logits_tensor.device().is_metal() {
+        if let Some(state) = global_metal_state() {
+            let num_positions = gamma + 1;
+            let token_out = B::Tensor::zeros(
+                &crate::core::shape::Shape::new(&[num_positions]),
+                crate::core::dtype::DType::U32,
+                target_logits_tensor.device(),
+            )?;
+            let runner = MetalRunner::new(&state, &state.alloc)?;
+            runner.sample_argmax(
+                target_logits_tensor.as_metal().unwrap(),
+                token_out.as_metal().unwrap(),
+                &[],
+                1.0,
+                &[],
+            )?;
+            runner.finish()?;
+            Some(token_out.to_vec_u32()?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "metal"))]
+    let gpu_predicted: Option<Vec<u32>> = None;
 
     // 4. Accept / reject loop
     for i in 0..gamma {
         let (draft_token, ref draft_logits) = drafted_pairs[i];
 
-        let pos_logits = target_logits_tensor
-            .narrow(1, i, 1)?
-            .squeeze(0)?
-            .squeeze(0)?
-            .to_vec_f32()?;
-        let is_greedy = target_sampler.config().temperature <= 0.0;
-        let accept = if is_greedy {
-            let target_token = target_sampler.sample(&pos_logits, &session.all_tokens());
-            target_token == draft_token
+        let (target_token, accept) = if let Some(ref predicted) = gpu_predicted {
+            let tok = predicted[i];
+            (tok, tok == draft_token)
         } else {
-            let p_target = Sampler::softmax(&pos_logits);
-            let p_draft = Sampler::softmax(draft_logits);
-            let r: f32 = rng.gen();
-            acceptance_criterion(
-                p_target[draft_token as usize],
-                p_draft[draft_token as usize],
-                r,
-            )
+            let pos_logits = target_logits_tensor
+                .narrow(1, i, 1)?
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_vec_f32()?;
+            if is_greedy {
+                let tok = target_sampler.sample(&pos_logits, &session.all_tokens());
+                (tok, tok == draft_token)
+            } else {
+                let p_target = Sampler::softmax(&pos_logits);
+                let p_draft = Sampler::softmax(draft_logits);
+                let r: f32 = rng.gen();
+                let acc = acceptance_criterion(
+                    p_target[draft_token as usize],
+                    p_draft[draft_token as usize],
+                    r,
+                );
+                (draft_token, acc)
+            }
         };
 
         if accept {
@@ -243,9 +282,16 @@ where
             }
         } else {
             // Rejection: sample correction token
-            let correction = if is_greedy {
-                target_sampler.sample(&pos_logits, &session.all_tokens())
+            let correction = if let Some(ref predicted) = gpu_predicted {
+                predicted[i]
+            } else if is_greedy {
+                target_token
             } else {
+                let pos_logits = target_logits_tensor
+                    .narrow(1, i, 1)?
+                    .squeeze(0)?
+                    .squeeze(0)?
+                    .to_vec_f32()?;
                 let p_target = Sampler::softmax(&pos_logits);
                 let p_draft = Sampler::softmax(draft_logits);
                 let adj = adjusted_distribution(&p_target, &p_draft);
@@ -260,17 +306,22 @@ where
 
     // 5. Bonus token if all draft tokens accepted
     if all_accepted && !session.is_finished() {
-        let bonus_logits = target_logits_tensor
-            .narrow(1, gamma, 1)?
-            .squeeze(0)?
-            .squeeze(0)?
-            .to_vec_f32()?;
-        let bonus_token = target_sampler.sample(&bonus_logits, &session.all_tokens());
+        let bonus_token = if let Some(ref predicted) = gpu_predicted {
+            predicted[gamma]
+        } else {
+            let bonus_logits = target_logits_tensor
+                .narrow(1, gamma, 1)?
+                .squeeze(0)?
+                .squeeze(0)?
+                .to_vec_f32()?;
+            target_sampler.sample(&bonus_logits, &session.all_tokens())
+        };
         accepted_tokens.push(bonus_token);
         session.push_token(bonus_token);
     }
 
     *accepted_total += num_accepted_draft;
+    draft.adapt_gamma(num_accepted_draft, gamma);
 
     // 6. Update KV cache states
     session.offset += 1 + num_accepted_draft;
@@ -477,5 +528,24 @@ mod tests {
         let mut session = Session::new(SessionId(0), vec![1u32, 2], 5, None);
         dec.step_to_completion(&mut session).unwrap();
         assert!(session.num_generated() <= 5);
+    }
+
+    #[test]
+    fn test_adaptive_gamma_scaling() {
+        let mut dec = make_decoder();
+        assert_eq!(dec.draft.gamma, 4);
+
+        // High acceptance step: 4 accepted out of 4 drafted -> gamma should expand
+        dec.draft.adapt_gamma(4, 4);
+        assert_eq!(dec.draft.gamma, 5);
+
+        // Another perfect step -> gamma expands up to max_gamma (6)
+        dec.draft.adapt_gamma(5, 5);
+        assert_eq!(dec.draft.gamma, 6);
+
+        // Low acceptance step: 0 accepted out of 6 drafted -> rolling acceptance drops and gamma contracts
+        dec.draft.adapt_gamma(0, 6);
+        dec.draft.adapt_gamma(0, 6);
+        assert!(dec.draft.gamma < 6);
     }
 }
