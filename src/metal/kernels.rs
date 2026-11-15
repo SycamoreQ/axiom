@@ -38,6 +38,7 @@ const TRANSPOSE_F32_MSL: &str = include_str!("kernels/transpose_f32.metal");
 const GEMV_Q4_K_MSL: &str = include_str!("kernels/gemv_q4_k.metal");
 const GEMV_Q6_K_MSL: &str = include_str!("kernels/gemv_q6_k.metal");
 const GEMV_Q8_0_MSL: &str = include_str!("kernels/gemv_q8_0.metal");
+const ATTN_DECODE_MSL: &str = include_str!("kernels/attention_decode.metal");
 
 pub struct MetalKernels {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -68,6 +69,10 @@ pub struct MetalKernels {
     pub gemv_q4_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub gemv_q6_k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub gemv_q8_0_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attention_decode_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attention_decode_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attention_decode_f32_kv_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub cache_write_f32_to_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl std::fmt::Debug for MetalKernels {
@@ -141,6 +146,16 @@ impl MetalKernels {
             gemv_q4_k_pipeline: build_pipeline(GEMV_Q4_K_MSL, "gemv_q4_k_f32")?,
             gemv_q6_k_pipeline: build_pipeline(GEMV_Q6_K_MSL, "gemv_q6_k_f32")?,
             gemv_q8_0_pipeline: build_pipeline(GEMV_Q8_0_MSL, "gemv_q8_0_f32")?,
+            attention_decode_f16_pipeline: build_pipeline(ATTN_DECODE_MSL, "attention_decode_f16")?,
+            attention_decode_f32_pipeline: build_pipeline(ATTN_DECODE_MSL, "attention_decode_f32")?,
+            attention_decode_f32_kv_f16_pipeline: build_pipeline(
+                ATTN_DECODE_MSL,
+                "attention_decode_f32_kv_f16",
+            )?,
+            cache_write_f32_to_f16_pipeline: build_pipeline(
+                CACHE_WRITE_F16_MSL,
+                "cache_write_f32_to_f16",
+            )?,
         })
     }
 
@@ -1290,6 +1305,216 @@ impl MetalKernels {
             encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
         }
         Ok(())
+    }
+
+    pub fn cache_write_f32_to_f16(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        src: &BlockHandle,
+        cache: &BlockHandle,
+        write_pos: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        write_len: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(&self.cache_write_f32_to_f16_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(src.metal_buffer(allocator)),
+                src.offset_bytes,
+                0,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(cache.metal_buffer(allocator)),
+                cache.offset_bytes,
+                1,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&write_pos as *const u32 as *mut c_void),
+                4,
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_kv_heads as *const u32 as *mut c_void),
+                4,
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&head_dim as *const u32 as *mut c_void),
+                4,
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&write_len as *const u32 as *mut c_void),
+                4,
+                5,
+            );
+        }
+        let grid = MTLSize {
+            width: write_len as usize,
+            height: n_kv_heads as usize,
+            depth: head_dim as usize,
+        };
+        let threadgroup = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        unsafe {
+            encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_attention_decode(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        q: &BlockHandle,
+        k_cache: &BlockHandle,
+        v_cache: &BlockHandle,
+        output: &BlockHandle,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+    ) -> Result<()> {
+        encoder.setComputePipelineState(pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(q.metal_buffer(allocator)), q.offset_bytes, 0);
+            encoder.setBuffer_offset_atIndex(Some(k_cache.metal_buffer(allocator)), k_cache.offset_bytes, 1);
+            encoder.setBuffer_offset_atIndex(Some(v_cache.metal_buffer(allocator)), v_cache.offset_bytes, 2);
+            encoder.setBuffer_offset_atIndex(Some(output.metal_buffer(allocator)), output.offset_bytes, 3);
+
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_heads as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&n_kv_heads as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&head_dim as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                6,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new_unchecked(&cache_len as *const u32 as *mut c_void),
+                std::mem::size_of::<u32>(),
+                7,
+            );
+        }
+
+        let grid = MTLSize {
+            width: n_heads as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+
+        unsafe {
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_decode_f16(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        q: &BlockHandle,
+        k_cache: &BlockHandle,
+        v_cache: &BlockHandle,
+        output: &BlockHandle,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+    ) -> Result<()> {
+        self.dispatch_attention_decode(
+            &self.attention_decode_f16_pipeline,
+            encoder,
+            allocator,
+            q,
+            k_cache,
+            v_cache,
+            output,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            cache_len,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_decode_f32(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        q: &BlockHandle,
+        k_cache: &BlockHandle,
+        v_cache: &BlockHandle,
+        output: &BlockHandle,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+    ) -> Result<()> {
+        self.dispatch_attention_decode(
+            &self.attention_decode_f32_pipeline,
+            encoder,
+            allocator,
+            q,
+            k_cache,
+            v_cache,
+            output,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            cache_len,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_decode_f32_kv_f16(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        allocator: &MetalAllocator,
+        q: &BlockHandle,
+        k_cache: &BlockHandle,
+        v_cache: &BlockHandle,
+        output: &BlockHandle,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        cache_len: u32,
+    ) -> Result<()> {
+        self.dispatch_attention_decode(
+            &self.attention_decode_f32_kv_f16_pipeline,
+            encoder,
+            allocator,
+            q,
+            k_cache,
+            v_cache,
+            output,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            cache_len,
+        )
     }
 
     pub fn dequantize_q4_k_f32(
@@ -2908,6 +3133,314 @@ mod tests {
                 y_ref[r],
                 diff
             );
+        }
+    }
+
+    fn attention_decode_cpu_ref(
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_len: usize,
+    ) -> Vec<f32> {
+        let repeat_factor = n_heads / n_kv_heads;
+        let kv_stride = n_kv_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; n_heads * head_dim];
+
+        for h in 0..n_heads {
+            let kv_head = h / repeat_factor;
+            let mut scores = vec![0.0f32; cache_len];
+            let mut max_score = f32::NEG_INFINITY;
+
+            for t in 0..cache_len {
+                let base_kv = t * kv_stride + kv_head * head_dim;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q[h * head_dim + d] * k_cache[base_kv + d];
+                }
+                let s = dot * scale;
+                scores[t] = s;
+                if s > max_score {
+                    max_score = s;
+                }
+            }
+
+            let mut sum_exp = 0.0f32;
+            let mut weights = vec![0.0f32; cache_len];
+            for t in 0..cache_len {
+                let w = (scores[t] - max_score).exp();
+                weights[t] = w;
+                sum_exp += w;
+            }
+
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for t in 0..cache_len {
+                    let base_kv = t * kv_stride + kv_head * head_dim;
+                    acc += (weights[t] / sum_exp) * v_cache[base_kv + d];
+                }
+                out[h * head_dim + d] = acc;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_attention_decode_f32_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+
+        let n_heads = 16usize;
+        let n_kv_heads = 8usize;
+        let head_dim = 64usize;
+        let cache_len = 32usize;
+
+        let mut q = vec![0.0f32; n_heads * head_dim];
+        for (i, val) in q.iter_mut().enumerate() {
+            *val = ((i as f32) * 0.03).sin() * 0.5;
+        }
+
+        let mut k_cache = vec![0.0f32; cache_len * n_kv_heads * head_dim];
+        let mut v_cache = vec![0.0f32; cache_len * n_kv_heads * head_dim];
+        for (i, val) in k_cache.iter_mut().enumerate() {
+            *val = ((i as f32) * 0.07).cos() * 0.5;
+        }
+        for (i, val) in v_cache.iter_mut().enumerate() {
+            *val = ((i as f32) * 0.05).sin() * 0.5;
+        }
+
+        let expected = attention_decode_cpu_ref(
+            &q, &k_cache, &v_cache, n_heads, n_kv_heads, head_dim, cache_len,
+        );
+
+        let q_block = alloc.alloc(q.len() * 4, 256).unwrap();
+        let k_block = alloc.alloc(k_cache.len() * 4, 256).unwrap();
+        let v_block = alloc.alloc(v_cache.len() * 4, 256).unwrap();
+        let out_block = alloc.alloc(expected.len() * 4, 256).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(q.as_ptr() as *const u8, q_block.ptr, q.len() * 4);
+            std::ptr::copy_nonoverlapping(
+                k_cache.as_ptr() as *const u8,
+                k_block.ptr,
+                k_cache.len() * 4,
+            );
+            std::ptr::copy_nonoverlapping(
+                v_cache.as_ptr() as *const u8,
+                v_block.ptr,
+                v_cache.len() * 4,
+            );
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .attention_decode_f32(
+                &encoder,
+                &alloc,
+                &q_block,
+                &k_block,
+                &v_block,
+                &out_block,
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                cache_len as u32,
+            )
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut got = vec![0.0f32; expected.len()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_block.ptr,
+                got.as_mut_ptr() as *mut u8,
+                expected.len() * 4,
+            );
+        }
+
+        for i in 0..expected.len() {
+            let diff = (got[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "attention_decode_f32 mismatch at {}: got {}, want {}, diff {}",
+                i,
+                got[i],
+                expected[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_attention_decode_f32_kv_f16_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+
+        let n_heads = 16usize;
+        let n_kv_heads = 8usize;
+        let head_dim = 64usize;
+        let cache_len = 32usize;
+
+        let mut q = vec![0.0f32; n_heads * head_dim];
+        for (i, val) in q.iter_mut().enumerate() {
+            *val = ((i as f32) * 0.03).sin() * 0.5;
+        }
+
+        let mut k_f32 = vec![0.0f32; cache_len * n_kv_heads * head_dim];
+        let mut v_f32 = vec![0.0f32; cache_len * n_kv_heads * head_dim];
+        let mut k_f16 = vec![f16::ZERO; cache_len * n_kv_heads * head_dim];
+        let mut v_f16 = vec![f16::ZERO; cache_len * n_kv_heads * head_dim];
+
+        for (i, val) in k_f32.iter_mut().enumerate() {
+            *val = ((i as f32) * 0.07).cos() * 0.5;
+            k_f16[i] = f16::from_f32(*val);
+            *val = k_f16[i].to_f32(); // match f16 quantization in ref
+        }
+        for (i, val) in v_f32.iter_mut().enumerate() {
+            *val = ((i as f32) * 0.05).sin() * 0.5;
+            v_f16[i] = f16::from_f32(*val);
+            *val = v_f16[i].to_f32();
+        }
+
+        let expected =
+            attention_decode_cpu_ref(&q, &k_f32, &v_f32, n_heads, n_kv_heads, head_dim, cache_len);
+
+        let q_block = alloc.alloc(q.len() * 4, 256).unwrap();
+        let k_block = alloc.alloc(k_f16.len() * 2, 256).unwrap();
+        let v_block = alloc.alloc(v_f16.len() * 2, 256).unwrap();
+        let out_block = alloc.alloc(expected.len() * 4, 256).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(q.as_ptr() as *const u8, q_block.ptr, q.len() * 4);
+            std::ptr::copy_nonoverlapping(
+                k_f16.as_ptr() as *const u8,
+                k_block.ptr,
+                k_f16.len() * 2,
+            );
+            std::ptr::copy_nonoverlapping(
+                v_f16.as_ptr() as *const u8,
+                v_block.ptr,
+                v_f16.len() * 2,
+            );
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .attention_decode_f32_kv_f16(
+                &encoder,
+                &alloc,
+                &q_block,
+                &k_block,
+                &v_block,
+                &out_block,
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                cache_len as u32,
+            )
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut got = vec![0.0f32; expected.len()];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_block.ptr,
+                got.as_mut_ptr() as *mut u8,
+                expected.len() * 4,
+            );
+        }
+
+        for i in 0..expected.len() {
+            let diff = (got[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "attention_decode_f32_kv_f16 mismatch at {}: got {}, want {}, diff {}",
+                i,
+                got[i],
+                expected[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_write_f32_to_f16_execution() {
+        let (ctx, mut alloc, kernels) = setup();
+
+        let write_len = 4u32;
+        let n_kv_heads = 8u32;
+        let head_dim = 64u32;
+        let write_pos = 12u32;
+        let max_seq_len = 64u32;
+
+        let num_src_elems = (write_len * n_kv_heads * head_dim) as usize;
+        let num_cache_elems = (max_seq_len * n_kv_heads * head_dim) as usize;
+
+        let mut src_f32 = vec![0.0f32; num_src_elems];
+        for (i, val) in src_f32.iter_mut().enumerate() {
+            *val = (i as f32) * 0.125;
+        }
+
+        let src_block = alloc.alloc(num_src_elems * 4, 256).unwrap();
+        let cache_block = alloc.alloc(num_cache_elems * 2, 256).unwrap();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_f32.as_ptr() as *const u8,
+                src_block.ptr,
+                num_src_elems * 4,
+            );
+            std::ptr::write_bytes(cache_block.ptr, 0, num_cache_elems * 2);
+        }
+
+        let cmd_buf = ctx.command_buffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        kernels
+            .cache_write_f32_to_f16(
+                &encoder,
+                &alloc,
+                &src_block,
+                &cache_block,
+                write_pos,
+                n_kv_heads,
+                head_dim,
+                write_len,
+            )
+            .unwrap();
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let mut cache_f16 = vec![f16::ZERO; num_cache_elems];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cache_block.ptr,
+                cache_f16.as_mut_ptr() as *mut u8,
+                num_cache_elems * 2,
+            );
+        }
+
+        for pos in 0..write_len {
+            for kv in 0..n_kv_heads {
+                for d in 0..head_dim {
+                    let src_idx = ((pos * n_kv_heads + kv) * head_dim + d) as usize;
+                    let dst_idx = (((write_pos + pos) * n_kv_heads + kv) * head_dim + d) as usize;
+                    let got = cache_f16[dst_idx].to_f32();
+                    let want = f16::from_f32(src_f32[src_idx]).to_f32();
+                    assert_eq!(
+                        got, want,
+                        "cache_write mismatch at pos={}, kv={}, d={}",
+                        pos, kv, d
+                    );
+                }
+            }
         }
     }
 }
